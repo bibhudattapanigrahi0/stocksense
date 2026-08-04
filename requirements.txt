@@ -1,0 +1,40 @@
+# MCP server
+fastmcp>=2.11
+mcp>=1.12
+
+# Web framework (REST surface)
+fastapi
+uvicorn[standard]
+
+# Market data
+yfinance
+pandas
+numpy
+
+# News
+feedparser
+requests
+
+# LLM providers (optional — pipeline runs rules-only without them)
+openai
+anthropic
+
+# Caching & storage
+diskcache
+aiosqlite
+
+# HTTP client (Ollama provider)
+httpx
+
+# Utilities
+pydantic
+pydantic-settings
+python-dotenv
+
+# Tests
+pytest
+pytest-asyncio
+
+# Notebook smoke tests
+jupyter
+ipykernel

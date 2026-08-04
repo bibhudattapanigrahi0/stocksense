@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#0a0e17" media="(prefers-color-scheme: dark)">
+    <meta name="theme-color" content="#f4f6fb" media="(prefers-color-scheme: light)">
+    <title>StockSense — Agentic Stock Screening</title>
+    <!-- Set the theme before first paint to avoid a flash of the wrong theme. -->
+    <script>
+    (function () {
+        try {
+            var stored = localStorage.getItem("ss-theme");
+            var theme = stored || "system";
+            var sysDark = !window.matchMedia || window.matchMedia("(prefers-color-scheme: dark)").matches;
+            var dark = theme === "dark" || (theme === "system" && sysDark);
+            document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+        } catch (e) { document.documentElement.setAttribute("data-theme", "dark"); }
+    })();
+    </script>
+    <link rel="stylesheet" href="/static/css/style.css?v=3.2.0">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js" defer></script>
+</head>
+<body>
+    <!-- ══════════ AUTH (login / sign up) ══════════ -->
+    <div id="auth-screen" class="auth-screen hidden">
+        <div class="auth-card">
+            <div class="auth-brand">
+                <span class="brand-mark">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <rect x="3"  y="13" width="4" height="8"  rx="1.4" fill="currentColor"/>
+                        <rect x="10" y="9"  width="4" height="12" rx="1.4" fill="currentColor" opacity=".82"/>
+                        <rect x="17" y="4"  width="4" height="17" rx="1.4" fill="currentColor"/>
+                    </svg>
+                </span>
+                <span class="brand-name">Stock<em>Sense</em></span>
+            </div>
+            <h1 id="auth-title" class="auth-title">Welcome back</h1>
+            <p id="auth-sub" class="auth-sub">Log in to your StockSense account.</p>
+            <form id="auth-form" class="auth-form" novalidate>
+                <label class="field auth-name hidden"><span class="field-label">Name</span>
+                    <input id="auth-name-input" class="input" autocomplete="name" placeholder="Your name"></label>
+                <label class="field"><span class="field-label">Email</span>
+                    <input id="auth-email" class="input" type="email" autocomplete="email" placeholder="you@example.com" required></label>
+                <label class="field"><span class="field-label">Password</span>
+                    <input id="auth-password" class="input" type="password" autocomplete="current-password" placeholder="••••••••" required></label>
+                <div id="auth-error" class="auth-error hidden"></div>
+                <button id="auth-submit" type="submit" class="btn btn-primary btn-block">Log in</button>
+            </form>
+            <p class="auth-toggle">
+                <span id="auth-toggle-text">New to StockSense?</span>
+                <button id="auth-toggle-btn" type="button" class="linkbtn">Create an account</button>
+            </p>
+        </div>
+        <p class="auth-foot">Decision-support research — not investment advice.</p>
+    </div>
+
+    <div class="appbar">
+    <header class="topbar">
+        <div class="brand" id="brand-home" role="button" tabindex="0" title="Home">
+            <span class="brand-mark">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="3"  y="13" width="4" height="8"  rx="1.4" fill="currentColor"/>
+                    <rect x="10" y="9"  width="4" height="12" rx="1.4" fill="currentColor" opacity=".82"/>
+                    <rect x="17" y="4"  width="4" height="17" rx="1.4" fill="currentColor"/>
+                </svg>
+            </span>
+            <span class="brand-text">
+                <span class="brand-name">Stock<em>Sense</em></span>
+                <span id="brand-sub" class="brand-sub">NSE / BSE · agentic pipeline</span>
+            </span>
+        </div>
+        <div class="topbar-right">
+            <label class="market-switch" title="Select market / asset class">
+                <span class="market-switch-label">Market</span>
+                <select id="market-select" class="input input-slim">
+                    <option value="IN">India (NSE)</option>
+                </select>
+            </label>
+            <button id="theme-toggle" class="icon-btn" title="Toggle light / dark theme" aria-label="Toggle theme">
+                <span id="theme-icon">☾</span>
+            </button>
+            <div class="notif" id="notif">
+                <button id="notif-bell" class="notif-bell" title="Alerts" aria-haspopup="true" aria-expanded="false">🔔<span id="notif-badge" class="notif-badge hidden">0</span></button>
+                <div id="notif-panel" class="notif-panel hidden" role="dialog" aria-label="Alerts">
+                    <div class="notif-head"><b>Alerts</b>
+                        <span class="row gap-s">
+                            <button id="notif-read" class="btn btn-ghost btn-s" title="Mark all read">Mark read</button>
+                            <button id="notif-clear" class="btn btn-ghost btn-s" title="Clear all alerts">Clear</button>
+                        </span>
+                    </div>
+                    <div id="notif-list" class="notif-list"><p class="muted small">No alerts yet.</p></div>
+                </div>
+            </div>
+            <span id="llm-mode" class="pill pill-muted" title="LLM provider mode">…</span>
+            <span id="health-dot" class="dot" title="API status"></span>
+            <div class="user-menu" id="user-menu">
+                <button id="user-avatar" class="avatar" title="Account" aria-haspopup="true" aria-expanded="false">··</button>
+                <div id="user-dropdown" class="menu hidden" role="menu">
+                    <div class="menu-head">
+                        <div class="mh-name" id="um-name">—</div>
+                        <div class="mh-mail" id="um-mail">—</div>
+                    </div>
+                    <button class="menu-item" id="um-settings" role="menuitem">⚙️ Settings &amp; preferences</button>
+                    <button class="menu-item danger" id="um-logout" role="menuitem">⎋ Log out</button>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <nav class="tabs" role="tablist" aria-label="Sections">
+        <button class="tab active" data-tab="home">Home</button>
+        <button class="tab" data-tab="screener">Screener</button>
+        <button class="tab" data-tab="strategies">Strategies</button>
+        <button class="tab" data-tab="lab">Strategy Lab</button>
+        <button class="tab" data-tab="ideas">Trade Ideas</button>
+        <button class="tab" data-tab="watchlist">Watchlist</button>
+        <button class="tab" data-tab="portfolio">Portfolio</button>
+        <button class="tab" data-tab="paper">Paper</button>
+        <button class="tab" data-tab="bots">Bots</button>
+        <button class="tab" data-tab="pipeline">Pipeline</button>
+        <button class="tab" data-tab="analyze">Analyze Stock</button>
+        <button class="tab" data-tab="reports">Reports</button>
+        <button class="tab" data-tab="history">History</button>
+    </nav>
+    </div>
+
+    <main>
+        <!-- ══════════ HOME ══════════ -->
+        <section id="tab-home" class="tab-panel active">
+            <div id="home-content"><p class="muted">Loading your dashboard…</p></div>
+        </section>
+
+        <!-- ══════════ SCREENER ══════════ -->
+        <section id="tab-screener" class="tab-panel">
+            <div class="layout-2col">
+                <div class="card">
+                    <div class="card-head">
+                        <h2>Filters</h2>
+                        <div class="row gap-s">
+                            <select id="preset-select" class="input input-slim" title="Load a saved preset">
+                                <option value="">Presets…</option>
+                            </select>
+                            <button id="preset-save" class="btn btn-ghost btn-s" title="Save current filters as preset">Save</button>
+                        </div>
+                    </div>
+
+                    <label class="field">
+                        <span class="field-label">Natural language query <span class="hint">(needs LLM provider)</span></span>
+                        <textarea id="f-query" class="input" rows="2" placeholder="e.g. quality IT stocks, ROE above 15%, P/E under 25, low debt"></textarea>
+                    </label>
+
+                    <details class="fgroup" open>
+                        <summary>Universe</summary>
+                        <div class="grid-2">
+                            <label class="field"><span class="field-label">Universe</span>
+                                <select id="f-index" class="input">
+                                    <option>NIFTY 50</option>
+                                </select>
+                            </label>
+                            <label class="field" data-mkind="equity"><span class="field-label">Sector contains</span>
+                                <input id="f-sector" class="input" placeholder="e.g. Technology"></label>
+                            <label class="field" data-mcap><span class="field-label">Market cap ≥ (<span class="mcap-unit">Cr</span>)</span>
+                                <input id="f-mcap-min" type="number" class="input" placeholder="100000"></label>
+                            <label class="field" data-mcap><span class="field-label">Market cap ≤ (<span class="mcap-unit">Cr</span>)</span>
+                                <input id="f-mcap-max" type="number" class="input"></label>
+                        </div>
+                    </details>
+
+                    <details class="fgroup" open data-mkind="equity">
+                        <summary>Valuation &amp; Growth</summary>
+                        <div class="grid-2">
+                            <label class="field"><span class="field-label">P/E ≤</span>
+                                <input id="f-pe-max" type="number" step="any" class="input" placeholder="25"></label>
+                            <label class="field"><span class="field-label">P/B ≤</span>
+                                <input id="f-pb-max" type="number" step="any" class="input"></label>
+                            <label class="field"><span class="field-label">EV/EBITDA ≤</span>
+                                <input id="f-ev-max" type="number" step="any" class="input"></label>
+                            <label class="field"><span class="field-label">Dividend yield ≥ (%)</span>
+                                <input id="f-div-min" type="number" step="any" class="input"></label>
+                            <label class="field"><span class="field-label">Revenue growth ≥ (%)</span>
+                                <input id="f-rev-min" type="number" step="any" class="input"></label>
+                            <label class="field"><span class="field-label">Profit growth ≥ (%)</span>
+                                <input id="f-profit-min" type="number" step="any" class="input"></label>
+                        </div>
+                    </details>
+
+                    <details class="fgroup" data-mkind="equity">
+                        <summary>Profitability &amp; Health</summary>
+                        <div class="grid-2">
+                            <label class="field"><span class="field-label">ROE ≥ (%)</span>
+                                <input id="f-roe-min" type="number" step="any" class="input" placeholder="15"></label>
+                            <label class="field"><span class="field-label">ROCE ≥ (%)</span>
+                                <input id="f-roce-min" type="number" step="any" class="input"></label>
+                            <label class="field"><span class="field-label">Debt/Equity ≤ (x)</span>
+                                <input id="f-de-max" type="number" step="any" class="input" placeholder="0.5"></label>
+                            <label class="field"><span class="field-label">Interest coverage ≥ (x)</span>
+                                <input id="f-ic-min" type="number" step="any" class="input"></label>
+                            <label class="field"><span class="field-label">Piotroski F ≥ (0–9)</span>
+                                <input id="f-piotroski-min" type="number" min="0" max="9" class="input"></label>
+                        </div>
+                    </details>
+
+                    <details class="fgroup" data-market="IN">
+                        <summary>India-specific</summary>
+                        <div class="grid-2">
+                            <label class="field"><span class="field-label">Promoter holding ≥ (%)</span>
+                                <input id="f-prom-min" type="number" step="any" class="input"></label>
+                            <label class="field"><span class="field-label">Promoter pledge ≤ (%)</span>
+                                <input id="f-pledge-max" type="number" step="any" class="input"></label>
+                            <label class="field"><span class="field-label">Delivery % ≥</span>
+                                <input id="f-delivery-min" type="number" step="any" class="input"></label>
+                        </div>
+                    </details>
+
+                    <details class="fgroup">
+                        <summary>Technicals</summary>
+                        <div class="grid-2">
+                            <label class="field"><span class="field-label">RSI ≥</span>
+                                <input id="f-rsi-min" type="number" step="any" class="input"></label>
+                            <label class="field"><span class="field-label">RSI ≤</span>
+                                <input id="f-rsi-max" type="number" step="any" class="input"></label>
+                            <label class="field"><span class="field-label">Above 200-DMA</span>
+                                <select id="f-above-200" class="input">
+                                    <option value="">Any</option><option value="true">Yes</option><option value="false">No</option>
+                                </select></label>
+                            <label class="field"><span class="field-label">MACD bullish</span>
+                                <select id="f-macd" class="input">
+                                    <option value="">Any</option><option value="true">Yes</option><option value="false">No</option>
+                                </select></label>
+                            <label class="field"><span class="field-label">Within % of 52w high</span>
+                                <input id="f-near-high" type="number" step="any" class="input"></label>
+                            <label class="field"><span class="field-label">Volume spike ≥ (×)</span>
+                                <input id="f-vol-spike" type="number" step="any" class="input"></label>
+                        </div>
+                    </details>
+
+                    <div class="row gap-s mt">
+                        <label class="field flex-1"><span class="field-label">Max candidates</span>
+                            <input id="f-max" type="number" class="input" value="10" min="1" max="50"></label>
+                        <button id="btn-screen" class="btn btn-primary flex-2">Run Screen →</button>
+                    </div>
+                    <div class="row gap-s">
+                        <button id="btn-pipeline-from-screen" class="btn btn-accent flex-1">Full Pipeline (analyze + report)</button>
+                        <button id="btn-clear" class="btn btn-ghost">Clear</button>
+                    </div>
+                </div>
+
+                <div class="results-col">
+                    <div id="screen-status" class="status-line"></div>
+                    <div id="screen-results"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ══════════ STRATEGIES ══════════ -->
+        <section id="tab-strategies" class="tab-panel">
+            <p class="muted" style="margin-bottom:16px">
+                Curated filter strategies — run the full pipeline in one click, or load one into the Screener to customize it.
+            </p>
+            <div id="strategies-status" class="status-line"></div>
+            <div id="strategies-grid" class="strategy-grid"></div>
+        </section>
+
+        <!-- ══════════ STRATEGY LAB ══════════ -->
+        <section id="tab-lab" class="tab-panel">
+            <div class="card lab-controls">
+                <div class="row gap-s" style="flex-wrap: wrap;">
+                    <div style="flex:1; min-width: 220px;">
+                        <h2 style="font-size:16px;">Strategy Lab — 10-Year Backtests</h2>
+                        <p class="muted small" id="lab-run-info">38 strategies · Nifty 500 · next-open execution · 25 bps costs</p>
+                    </div>
+                    <select id="lab-sort" class="input input-slim" title="Sort leaderboard">
+                        <option value="sharpe">Sort: Sharpe</option>
+                        <option value="win_rate">Sort: Win rate</option>
+                        <option value="cagr">Sort: CAGR</option>
+                        <option value="max_drawdown">Sort: Max drawdown</option>
+                        <option value="profit_factor">Sort: Profit factor</option>
+                        <option value="expectancy">Sort: Expectancy</option>
+                        <option value="calmar">Sort: Calmar</option>
+                        <option value="alpha">Sort: Alpha vs Nifty</option>
+                    </select>
+                    <button id="btn-lab-discover" class="btn" title="Generate new strategies, validate them out-of-sample, and keep only survivors">🔬 Discover</button>
+                    <button id="btn-run-backtest" class="btn btn-primary">⟳ Run Backtests</button>
+                </div>
+                <div id="lab-progress" class="progress-wrap hidden">
+                    <div class="progress-meta">
+                        <span id="lab-progress-stage">Starting…</span>
+                        <span id="lab-progress-pct">0%</span>
+                    </div>
+                    <div class="progress-bar"><div id="lab-progress-fill" class="progress-fill" style="width:0%"></div></div>
+                </div>
+            </div>
+
+            <div id="lab-discover" class="card" style="display:none; margin-top:16px;"></div>
+
+            <div id="lab-leaderboard" class="card" style="margin-top:16px;">
+                <p class="muted">Loading leaderboard…</p>
+            </div>
+
+            <div id="lab-detail" class="hidden" style="margin-top:16px;"></div>
+
+            <div id="lab-disclaimer" class="muted small" style="margin-top:14px; max-width: 1100px;"></div>
+        </section>
+
+        <!-- ══════════ TRADE IDEAS ══════════ -->
+        <section id="tab-ideas" class="tab-panel">
+            <div class="card lab-controls">
+                <div class="row gap-s" style="flex-wrap: wrap;">
+                    <div style="flex:1; min-width: 240px;">
+                        <h2 style="font-size:16px;">Trade Ideas — by Time Horizon</h2>
+                        <p class="muted small" id="ideas-run-info">Highest-conviction buys from the 38-strategy backtest, split into short / medium / long term.</p>
+                    </div>
+                    <select id="ideas-topn" class="input input-slim" title="Candidates per horizon">
+                        <option value="10">Top 10 each</option>
+                        <option value="7">Top 7 each</option>
+                        <option value="5">Top 5 each</option>
+                    </select>
+                    <button id="btn-refresh-signals" class="btn btn-ghost" title="Fast: re-scan every strategy's current buy signals on fresh prices (seconds) — surfaces new ideas without a full backtest">⚡ Refresh signals</button>
+                    <button id="btn-refresh-ideas" class="btn" title="Reload the board (re-prices ideas live)">⟳ Refresh</button>
+                    <label class="auto-toggle small" title="Auto-refresh the board while this tab is open (live re-price + regenerate stale signals)"><input type="checkbox" id="ideas-auto"> Auto</label>
+                </div>
+            </div>
+
+            <div id="ideas-tracker" class="card" style="margin-top:16px;">
+                <div class="card-head">
+                    <h2 style="font-size:16px;">📊 Idea Tracker <span class="muted small">— how past ideas are doing</span></h2>
+                    <div class="row gap-s">
+                        <button id="btn-track-ideas" class="btn btn-s" title="Snapshot the current ideas below to track their outcome">＋ Track current</button>
+                        <button id="btn-refresh-tracked" class="btn btn-s" title="Re-price tracked ideas">⟳ Refresh P&amp;L</button>
+                        <button id="btn-reset-tracked" class="btn btn-ghost btn-s" title="Forget all tracked ideas">Reset</button>
+                    </div>
+                </div>
+                <div id="ideas-scoreboard"><p class="muted small">Loading tracker…</p></div>
+                <div id="ideas-equity-wrap" class="hidden" style="margin-top:14px;">
+                    <div class="muted small" style="margin-bottom:6px;">Idea-book equity — cumulative realized P&amp;L of closed trades (equal-weight).</div>
+                    <div class="chart-wrap" style="height:180px;"><canvas id="ideas-equity-chart"></canvas></div>
+                </div>
+                <details id="ideas-tracked-details" class="hidden" style="margin-top:12px;">
+                    <summary class="muted small">Open positions</summary>
+                    <div id="ideas-tracked-list" class="table-scroll" style="margin-top:10px;"></div>
+                </details>
+                <details id="ideas-past-details" class="hidden" style="margin-top:10px;">
+                    <summary class="muted small">Past trades</summary>
+                    <div id="ideas-past-list" class="table-scroll" style="margin-top:10px;"></div>
+                </details>
+            </div>
+
+            <div id="ideas-buckets" class="ideas-grid" style="margin-top:16px;">
+                <p class="muted">Loading trade ideas…</p>
+            </div>
+
+            <div id="ideas-disclaimer" class="muted small" style="margin-top:14px; max-width: 1100px;"></div>
+        </section>
+
+        <!-- ══════════ PORTFOLIO ══════════ -->
+        <section id="tab-portfolio" class="tab-panel">
+            <div class="layout-2col">
+                <div class="card pf-form">
+                    <div class="card-head"><h2>Build a Portfolio</h2></div>
+                    <p class="muted small">Turn the screening &amp; backtest strategies into a weighted, risk-constrained model basket. Preview it, then save it to track and rebalance over time.</p>
+
+                    <label class="field"><span class="field-label">Name</span>
+                        <input id="pf-name" class="input" placeholder="e.g. Quality Core" value="My Portfolio"></label>
+
+                    <div class="grid-2">
+                        <label class="field"><span class="field-label">Basis
+                            <span class="help" data-tip="Fundamental = screening strategies · Systematic = the 35 trading strategies' live buys · Blend = both (overlap boosts conviction).">?</span></span>
+                            <select id="pf-basis" class="input"></select></label>
+                        <label class="field"><span class="field-label">Risk appetite
+                            <span class="help" data-tip="Sets the universe tier, position count, per-name &amp; sector caps, cash buffer, and fallback stop.">?</span></span>
+                            <select id="pf-risk" class="input"></select></label>
+                        <label class="field"><span class="field-label">Theme tilt
+                            <span class="help" data-tip="Optional: restrict the basket to a curated thematic universe (AI, green energy, EV, …).">?</span></span>
+                            <select id="pf-theme" class="input"></select></label>
+                        <label class="field"><span class="field-label">Weighting
+                            <span class="help" data-tip="Equal = 1/N · Score = ∝ ranking score · Conviction = ∝ number of strategies flagging the name.">?</span></span>
+                            <select id="pf-weighting" class="input"></select></label>
+                    </div>
+
+                    <label class="field"><span class="field-label">Max positions <span class="hint">(blank = risk preset)</span></span>
+                        <input id="pf-max" type="number" class="input" min="1" max="100" placeholder="15"></label>
+
+                    <details class="fgroup">
+                        <summary>Advanced: strategies <span class="muted small" id="pf-strats-count"></span></summary>
+                        <p class="muted small mt">All strategies for the chosen basis are included by default. Uncheck to narrow.</p>
+                        <div id="pf-strats" class="pf-strats"></div>
+                    </details>
+
+                    <div class="row gap-s mt">
+                        <button id="btn-pf-preview" class="btn btn-primary">Preview →</button>
+                        <button id="btn-pf-save" class="btn btn-accent">Save ⤓</button>
+                    </div>
+                    <div id="pf-status" class="status-line"></div>
+                </div>
+
+                <div class="results-col">
+                    <div id="pf-result"><p class="muted">Configure a basket on the left, then <b>Preview</b> to construct it. Nothing is saved until you hit <b>Save</b>.</p></div>
+                </div>
+            </div>
+
+            <div class="card" style="margin-top:16px;">
+                <div class="card-head">
+                    <h2 style="font-size:16px;">💼 Saved Portfolios</h2>
+                    <button id="btn-pf-refresh-saved" class="btn btn-ghost btn-s">↻ Refresh</button>
+                </div>
+                <div id="pf-saved"><p class="muted small">Loading saved portfolios…</p></div>
+            </div>
+
+            <div id="pf-disclaimer" class="muted small" style="margin-top:14px; max-width: 1100px;"></div>
+        </section>
+
+        <!-- ══════════ BOTS ══════════ -->
+        <section id="tab-bots" class="tab-panel">
+            <div class="card lab-controls">
+                <div class="row gap-s" style="flex-wrap: wrap; align-items: center;">
+                    <div style="flex:1; min-width: 240px;">
+                        <h2 style="font-size:16px;">🤖 Trading Bots</h2>
+                        <p class="muted small" id="bot-desc">Intraday Trade Ideas aggregate every bot into ranked long &amp; short setups; signal bots scan one strategy; the momentum bot builds a daily basket.</p>
+                    </div>
+                    <select id="bot-select" class="input input-slim" title="Bot"></select>
+                    <select id="bot-tf" class="input input-slim" title="Timeframe"></select>
+                    <select id="bot-conviction" class="input input-slim" title="Minimum bots that must agree" style="display:none">
+                        <option value="1">Any bot</option><option value="2">≥2 agree</option><option value="3">≥3 agree</option>
+                    </select>
+                    <label id="bot-strict-wrap" class="row gap-s" style="align-items:center; display:none;" title="Show only edge-backed ideas — a bot with positive measured edge in the current regime agrees. Needs a bot backtest.">
+                        <input type="checkbox" id="bot-strict"> <span class="small">Edge-backed only</span></label>
+                    <select id="bot-universe" class="input input-slim" title="Universe">
+                        <option>Top 50</option><option>Top 100</option>
+                    </select>
+                    <select id="bot-topn" class="input input-slim bot-basket-only" title="Basket size">
+                        <option value="8">Top 8</option><option value="10" selected>Top 10</option><option value="15">Top 15</option>
+                    </select>
+                    <label class="row gap-s bot-basket-only" style="align-items:center;" title="Attach an LLM risk review (rules-only template when no LLM is configured)">
+                        <input type="checkbox" id="bot-ai"> <span class="small">AI review</span></label>
+                    <label class="row gap-s bot-basket-only" style="align-items:center;" title="Down-weight AI-flagged high-risk names to cash">
+                        <input type="checkbox" id="bot-apply"> <span class="small">Apply de-risk</span></label>
+                    <button id="btn-bot-run" class="btn btn-primary">Run →</button>
+                    <button id="btn-bot-deploy" class="btn btn-accent bot-basket-only" title="Save the basket as a NAV-tracked portfolio">Deploy ⤓</button>
+                    <button id="btn-bot-edge" class="btn" title="Backtested edge (win-rate / expectancy) of the signal bots">Edge ⚙</button>
+                </div>
+            </div>
+            <div id="bot-status" class="status-line" style="margin-top:12px;"></div>
+            <div id="bot-result"></div>
+            <div id="bot-edge" style="display:none; margin-top:14px;"></div>
+            <div id="bot-disclaimer" class="muted small" style="margin-top:14px; max-width: 1100px;"></div>
+        </section>
+
+        <!-- ══════════ PIPELINE ══════════ -->
+        <section id="tab-pipeline" class="tab-panel">
+            <div class="layout-2col">
+                <div class="card">
+                    <div class="card-head"><h2>Run Pipeline</h2></div>
+                    <p class="muted">Full flow: screen → 4-agent deep dive per candidate → composite ranking → markdown reports for top picks.</p>
+                    <label class="field"><span class="field-label">Query (optional)</span>
+                        <textarea id="p-query" class="input" rows="2" placeholder="Overrides/extends filters via LLM parsing"></textarea></label>
+                    <div class="grid-2">
+                        <label class="field"><span class="field-label">Analysis depth</span>
+                            <select id="p-depth" class="input">
+                                <option value="quick">quick (rules only)</option>
+                                <option value="standard" selected>standard</option>
+                                <option value="deep">deep</option>
+                            </select></label>
+                        <label class="field"><span class="field-label">Max candidates</span>
+                            <input id="p-max" type="number" class="input" value="5" min="1" max="50"></label>
+                    </div>
+                    <label class="field checkbox"><input id="p-report" type="checkbox" checked>
+                        <span>Generate markdown report for top pick(s)</span></label>
+                    <button id="btn-run-pipeline" class="btn btn-primary btn-block">Start Pipeline Run →</button>
+
+                    <div id="pipeline-progress" class="progress-wrap hidden">
+                        <div class="progress-meta">
+                            <span id="progress-stage">Starting…</span>
+                            <span id="progress-pct">0%</span>
+                        </div>
+                        <div class="progress-bar"><div id="progress-fill" class="progress-fill" style="width:0%"></div></div>
+                        <div id="progress-run-id" class="muted mono small"></div>
+                    </div>
+                </div>
+
+                <div class="results-col">
+                    <div id="pipeline-status" class="status-line"></div>
+                    <div id="pipeline-results"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ══════════ ANALYZE ══════════ -->
+        <section id="tab-analyze" class="tab-panel">
+            <div class="card analyze-input-card">
+                <div class="row gap-s">
+                    <div class="autocomplete">
+                        <input id="a-ticker" class="input input-lg" autocomplete="off" spellcheck="false"
+                               placeholder="Search company or ticker — e.g. INFY, RELIANCE, TCS">
+                        <div id="a-suggest" class="suggest-list hidden"></div>
+                    </div>
+                    <select id="a-depth" class="input input-lg" style="width:auto;">
+                        <option value="quick">quick</option>
+                        <option value="standard" selected>standard</option>
+                    </select>
+                    <button id="btn-analyze" class="btn btn-primary">Analyze →</button>
+                    <button id="btn-gen-report" class="btn btn-accent" disabled>Report ⤓</button>
+                </div>
+            </div>
+            <div id="analyze-status" class="status-line"></div>
+            <div id="analyze-results"></div>
+        </section>
+
+        <!-- ══════════ REPORTS ══════════ -->
+        <section id="tab-reports" class="tab-panel">
+            <div class="layout-2col">
+                <div class="card">
+                    <div class="card-head"><h2>Generated Reports</h2>
+                        <button id="btn-refresh-reports" class="btn btn-ghost btn-s">↻ Refresh</button></div>
+                    <div id="reports-list" class="file-list"></div>
+                </div>
+                <div class="card report-viewer-card">
+                    <div id="report-viewer" class="report-viewer">
+                        <p class="muted">Select a report to view it rendered.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ══════════ HISTORY ══════════ -->
+        <section id="tab-history" class="tab-panel">
+            <div class="card">
+                <div class="card-head"><h2>Pipeline Run History</h2>
+                    <button id="btn-refresh-history" class="btn btn-ghost btn-s">↻ Refresh</button></div>
+                <div id="history-list"></div>
+            </div>
+            <div id="history-detail" class="mt"></div>
+        </section>
+
+        <!-- ══════════ WATCHLIST ══════════ -->
+        <section id="tab-watchlist" class="tab-panel">
+            <div class="card">
+                <div class="card-head"><h2>Watchlist</h2>
+                    <button id="wl-refresh" class="btn btn-ghost btn-s">↻ Refresh</button></div>
+                <p class="muted small">Track tickers and get in-app alerts when a price level is reached or a
+                    fresh trade idea appears. Alerts also fire when a tracked idea hits its stop or target.</p>
+                <div class="row gap-s" style="flex-wrap:wrap; align-items:flex-end; margin-top:10px;">
+                    <label class="field" style="max-width:170px;"><span class="field-label">Ticker</span>
+                        <input id="wl-ticker" class="input" placeholder="e.g. RELIANCE"></label>
+                    <label class="field" style="max-width:130px;"><span class="field-label">Alert above</span>
+                        <input id="wl-above" class="input" type="number" step="any" placeholder="optional"></label>
+                    <label class="field" style="max-width:130px;"><span class="field-label">Alert below</span>
+                        <input id="wl-below" class="input" type="number" step="any" placeholder="optional"></label>
+                    <label class="field" style="flex:1; min-width:150px;"><span class="field-label">Note</span>
+                        <input id="wl-note" class="input" placeholder="optional"></label>
+                    <button id="wl-add" class="btn btn-primary">Add</button>
+                </div>
+                <div id="wl-list" class="table-scroll" style="margin-top:14px;"><p class="muted">Loading…</p></div>
+            </div>
+            <div class="card mt">
+                <div class="card-head"><h3>Today's digest</h3>
+                    <button id="digest-refresh" class="btn btn-ghost btn-s">↻ Refresh</button></div>
+                <div id="digest-body"><p class="muted">Loading digest…</p></div>
+            </div>
+        </section>
+
+        <!-- ══════════ PAPER TRADING ══════════ -->
+        <section id="tab-paper" class="tab-panel">
+            <div class="card">
+                <div class="card-head"><h2>Paper Trading</h2>
+                    <div class="row gap-s">
+                        <button id="paper-refresh" class="btn btn-ghost btn-s">↻ Refresh</button>
+                        <button id="paper-reset" class="btn btn-ghost btn-s">Reset account</button>
+                    </div>
+                </div>
+                <div id="paper-summary"><p class="muted">Loading…</p></div>
+            </div>
+            <div class="card mt">
+                <div class="card-head"><h3>Open a paper position</h3></div>
+                <div class="row gap-s" style="flex-wrap:wrap; align-items:flex-end;">
+                    <label class="field" style="max-width:160px;"><span class="field-label">Ticker</span>
+                        <input id="pp-ticker" class="input" placeholder="e.g. RELIANCE"></label>
+                    <label class="field" style="max-width:110px;"><span class="field-label">Side</span>
+                        <select id="pp-side" class="input"><option value="long">Long</option><option value="short">Short</option></select></label>
+                    <label class="field" style="max-width:100px;"><span class="field-label">Alloc %</span>
+                        <input id="pp-alloc" class="input" type="number" step="any" value="10"></label>
+                    <label class="field" style="max-width:120px;"><span class="field-label">Stop</span>
+                        <input id="pp-stop" class="input" type="number" step="any" placeholder="optional"></label>
+                    <label class="field" style="max-width:120px;"><span class="field-label">Target</span>
+                        <input id="pp-target" class="input" type="number" step="any" placeholder="optional"></label>
+                    <button id="pp-open" class="btn btn-primary">Open</button>
+                </div>
+                <p class="muted small" style="margin-top:6px;">Sized as a % of book equity, filled at the live price. Positions auto-close when the live price touches your stop or target.</p>
+            </div>
+            <div class="card mt"><div class="card-head"><h3>Open positions</h3></div><div id="paper-positions"></div></div>
+            <div class="card mt"><div class="card-head"><h3>P&amp;L by source</h3></div><div id="paper-attr"></div></div>
+            <div class="card mt"><div class="card-head"><h3>Closed trades</h3></div><div id="paper-closed"></div></div>
+        </section>
+    </main>
+
+    <!-- ══════════ SETTINGS & PREFERENCES ══════════ -->
+    <div id="settings-modal" class="modal-backdrop hidden">
+        <div class="modal" role="dialog" aria-label="Settings and preferences">
+            <div class="modal-head">
+                <h2>Settings &amp; preferences</h2>
+                <button id="settings-close" class="icon-btn" aria-label="Close settings">✕</button>
+            </div>
+            <div class="modal-body">
+                <section class="set-group">
+                    <h3>Appearance</h3>
+                    <div class="set-row">
+                        <span class="set-label">Theme</span>
+                        <div class="seg" id="set-theme">
+                            <button type="button" data-val="light">Light</button>
+                            <button type="button" data-val="dark">Dark</button>
+                            <button type="button" data-val="system">System</button>
+                        </div>
+                    </div>
+                    <div class="set-row">
+                        <span class="set-label">Accent</span>
+                        <div class="accent-row" id="set-accent"></div>
+                    </div>
+                    <div class="set-row">
+                        <span class="set-label">Density</span>
+                        <div class="seg" id="set-density">
+                            <button type="button" data-val="comfortable">Comfortable</button>
+                            <button type="button" data-val="compact">Compact</button>
+                        </div>
+                    </div>
+                </section>
+                <section class="set-group">
+                    <h3>Defaults</h3>
+                    <div class="set-row">
+                        <span class="set-label">Default market</span>
+                        <select id="set-market" class="input input-slim"></select>
+                    </div>
+                    <div class="set-row">
+                        <span class="set-label">Landing page</span>
+                        <select id="set-landing" class="input input-slim"></select>
+                    </div>
+                </section>
+                <section class="set-group">
+                    <h3>Profile</h3>
+                    <label class="field"><span class="field-label">Display name</span>
+                        <input id="set-name" class="input" autocomplete="name"></label>
+                    <label class="field"><span class="field-label">New password <span class="hint">(leave blank to keep current)</span></span>
+                        <input id="set-password" class="input" type="password" autocomplete="new-password" placeholder="••••••••"></label>
+                    <div class="row gap-s" style="align-items:center; margin-top:4px;">
+                        <button id="set-save-profile" class="btn btn-primary btn-s">Save profile</button>
+                        <span id="set-profile-msg" class="small muted"></span>
+                    </div>
+                </section>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="/static/js/app.js?v=3.2.0"></script>
+</body>
+</html>
