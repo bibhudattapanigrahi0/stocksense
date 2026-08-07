@@ -40,6 +40,8 @@ class Trade:
     holding_days: int
     exit_reason: str        # signal | stop | trailing | target | time | end_of_data | open
     is_open: bool = False
+    mae_pct: float = 0.0    # max adverse excursion: worst intrabar drawdown from entry (≤0, gross of cost)
+    mfe_pct: float = 0.0    # max favorable excursion: best intrabar gain from entry (≥0, gross of cost)
 
 
 @dataclass
@@ -105,6 +107,8 @@ def simulate(
             continue
 
         peak = entry_px
+        worst = 0.0        # max adverse excursion (most-negative close-vs-entry seen while held)
+        best = 0.0         # max favorable excursion (best close-vs-entry seen while held)
         exit_i: Optional[int] = None
         reason = "signal"
 
@@ -114,6 +118,8 @@ def simulate(
                 continue
             peak = max(peak, c)
             ret = c / entry_px - 1.0
+            worst = min(worst, ret)
+            best = max(best, ret)
             held = j - entry_i
 
             if strategy.stop_loss_pct and c <= entry_px * (1 - strategy.stop_loss_pct):
@@ -146,6 +152,8 @@ def simulate(
                 holding_days=n - 1 - entry_i,
                 exit_reason="open",
                 is_open=True,
+                mae_pct=round(worst * 100, 2),
+                mfe_pct=round(best * 100, 2),
             )
             break
 
@@ -165,6 +173,8 @@ def simulate(
                 ret_pct=round(net * 100, 2),
                 holding_days=exit_i - entry_i,
                 exit_reason=reason,
+                mae_pct=round(worst * 100, 2),
+                mfe_pct=round(best * 100, 2),
             )
         )
         i = exit_i  # next signal search resumes after this exit
@@ -218,6 +228,17 @@ def compute_metrics(
 
     win_rate = len(wins) / n * 100 if n else 0.0
     avg_win = float(np.mean([t.ret_pct for t in wins])) if wins else 0.0
+
+    # "Normal drawdown" band — how far a WINNING trade typically dipped before it worked out (median
+    # |MAE|), plus a wider 80th-percentile "beyond normal" marker. Surfaced on the idea board as
+    # hold-through guidance ("this setup usually dips ~X% first — that's normal"), NOT a stop. Winners
+    # only, since it answers "dips that resolved into wins". None when too few winners to be meaningful.
+    win_maes = [abs(t.mae_pct) for t in wins if t.mae_pct is not None]
+    if win_maes:
+        typical_dip = round(float(np.median(win_maes)), 1)
+        deep_dip = round(float(np.percentile(win_maes, 80)), 1)
+    else:
+        typical_dip = deep_dip = None
     avg_loss = float(np.mean([t.ret_pct for t in losses])) if losses else 0.0
     gross_win = sum(t.ret_pct for t in wins)
     gross_loss = abs(sum(t.ret_pct for t in losses))
@@ -249,6 +270,9 @@ def compute_metrics(
     return {
         "trades": n,
         "win_rate": round(win_rate, 1),
+        "n_winners": len(wins),
+        "typical_dip_pct": typical_dip,     # median worst-dip of winning trades (the "normal drawdown")
+        "deep_dip_pct": deep_dip,           # 80th-pct worst-dip of winners ("beyond this = unusual")
         "avg_win_pct": round(avg_win, 2),
         "avg_loss_pct": round(avg_loss, 2),
         "profit_factor": round(profit_factor, 2) if math.isfinite(profit_factor) else "inf",

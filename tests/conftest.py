@@ -12,12 +12,15 @@ def _hermetic_llm(monkeypatch):
     """Keep the whole suite network-free and deterministic regardless of a local
     .env: default every test to rules-only mode (no provider, no keys). Provider
     tests opt back in via their own monkeypatch, which runs after this fixture."""
-    from pipeline_core.services import earnings, edgar_13f, llm_service, market_regime, market_sentiment, sector
+    from pipeline_core.services import (
+        cot, earnings, edgar_13f, llm_service, market_regime, market_sentiment, sector, smart_money,
+    )
 
     monkeypatch.setattr(llm_service.settings, "llm_provider", "none")
     monkeypatch.setattr(llm_service.settings, "openai_api_key", "")
     monkeypatch.setattr(llm_service.settings, "anthropic_api_key", "")
     monkeypatch.setattr(llm_service.settings, "gemini_api_key", "")
+    llm_service.reset_llm_breaker()   # never carry a tripped circuit breaker between tests
 
     # Idea-curation sentiment is a live-network source too (Fear & Greed + per-coin news), so
     # neutralise it by default — a neutral 50 reading contributes no bias. Tests that exercise
@@ -48,6 +51,10 @@ def _hermetic_llm(monkeypatch):
     # snapshot and nothing reads a stale cache. Tests opt back in with their own monkeypatch.
     monkeypatch.setattr(edgar_13f, "get_panel", lambda: None)
 
+    # CFTC COT (metals smart-money) is a live Socrata source; default to "no rows" so the metals
+    # smart-money signal/strategy stay inert offline. Tests opt back in with their own monkeypatch.
+    monkeypatch.setattr(cot, "_fetch_rows", lambda market_name: [])
+
     # Earnings dates are a live yfinance source (feeds the idea board's event-risk factor);
     # default to "no known earnings" so the ranking factor is neutral offline.
     monkeypatch.setattr(earnings, "days_to_earnings", lambda sym, market="IN": None)
@@ -69,6 +76,12 @@ def _hermetic_llm(monkeypatch):
         return None
 
     monkeypatch.setattr(_runner, "aget_price_history", _no_history)
+
+    # snapshot_current_ideas now live-enriches the board before tracking (to capture entry-time
+    # factors), which reaches get_quote + the smart-money signal (13F/ownership/COT/flows). Neutralise
+    # those so tracking/backtest-run tests stay network-free; tests opt back in with their own monkeypatch.
+    monkeypatch.setattr(_runner, "get_quote", lambda symbol, market="IN", max_age=None: None)
+    monkeypatch.setattr(smart_money, "get_signal", lambda market, symbol: None)
 
 
 def make_stock(**overrides) -> dict:

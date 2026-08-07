@@ -136,6 +136,73 @@ def test_recompose_news_reorders(monkeypatch):
     assert [c["ticker"] for c in bucket["candidates"]] == ["B", "A"]
 
 
+# ── Multi-pillar confluence (breadth across independent families) ────
+
+def test_idea_pillars_reads_supporting_families():
+    c = {"conviction": 3, "eligible_conviction": 3, "quality_score": 62.0,
+         "regime_fit": "tailwind", "inst_ownership": {"qoq_change_pct": 5.0}}
+    p = ir.idea_pillars(c)
+    # `inst_ownership` (no normalized direction) still feeds the smart_money pillar (back-compat bridge).
+    assert (p["technical"], p["quality"], p["smart_money"], p["regime"]) == (True, True, True, True)
+    assert p["sentiment"] is None and p["sector"] is None       # not enriched on this idea → unavailable
+    s = ir.pillar_summary(c, available=6)
+    assert s["count"] == 4 and set(s["supporting"]) == {"technical", "quality", "smart_money", "regime"}
+    assert s["available"] == 6
+
+
+def test_idea_pillars_distinguishes_false_from_none():
+    # Measured-but-not-supporting is False; unmeasurable is None (must not read as support).
+    c = {"conviction": 1, "quality_score": 40.0, "news_score": 48.0, "sector_rs": -3.0,
+         "regime_fit": "headwind", "inst_ownership": {"qoq_change_pct": None}}
+    p = ir.idea_pillars(c)
+    assert p["quality"] is False and p["sentiment"] is False and p["sector"] is False
+    assert p["regime"] is False                     # headwind = measured, not supporting
+    assert p["smart_money"] is None                 # yfinance snapshot has no QoQ delta → can't judge
+    assert ir.pillar_summary(c)["count"] == 1       # only the technical family supports
+
+
+def test_pillar_tier_bar_and_availability_clamp(monkeypatch):
+    monkeypatch.setattr(ir.settings, "pillar_min_actionable", 3)
+    assert ir.pillar_tier(3, available=6) == "actionable"
+    assert ir.pillar_tier(2, available=6) == "watch"
+    # Thin-pillar market (crypto in a neutral tide: only technical + regime): the bar clamps to 2,
+    # so a 2-pillar idea is actionable rather than everything being filed under watch.
+    assert ir.pillar_tier(2, available=2) == "actionable"
+    assert ir.pillar_tier(1, available=2) == "watch"
+    assert ir.pillar_tier(1, available=0) == "actionable"       # floor of 1 guards a 0 denominator
+
+
+def test_recompose_pillar_tiering_orders_actionable_first():
+    # A has the higher base score but is thin (technical only); B has quality+regime+smart-money
+    # confluence. With the bar at 3, B graduates to actionable and leads despite A's higher score.
+    a = _cand("A", 5)
+    b = _cand("B", 4, eligible_conviction=4, quality_score=70.0, regime_fit="tailwind",
+              inst_ownership={"qoq_change_pct": 3.0})
+    bucket = {"candidates": [a, b], "_reserve": []}
+    runner._recompose_bucket(bucket, tilt=0.0, max_per_bucket=10,
+                             pillar_ctx={"available": 6, "min_actionable": 3})
+    shown = bucket["candidates"]
+    assert [c["ticker"] for c in shown] == ["B", "A"]           # actionable-first
+    assert (shown[0]["tier"], shown[1]["tier"]) == ("actionable", "watch")
+    assert shown[0]["pillar_count"] == 4 and shown[1]["pillar_count"] == 1
+    assert bucket["actionable_count"] == 1 and bucket["watch_count"] == 1
+
+
+def test_recompose_without_pillar_ctx_skips_tiering():
+    # Default (no pillar_ctx) → no tier fields, base order preserved — guards the pre-tiering behaviour.
+    bucket = {"candidates": [_cand("A", 5, quality_score=70.0), _cand("B", 4)], "_reserve": []}
+    runner._recompose_bucket(bucket, tilt=0.0, max_per_bucket=10)
+    assert [c["ticker"] for c in bucket["candidates"]] == ["A", "B"]
+    assert all("tier" not in c for c in bucket["candidates"])
+    assert "actionable_count" not in bucket
+
+
+def test_pillar_disclosure_shape():
+    d = ir.pillar_disclosure()
+    assert d["min_actionable"] == ir.settings.pillar_min_actionable and "enabled" in d
+    assert set(d["names"]) == set(ir.PILLAR_NAMES)
+
+
 def test_news_sentiment_caches_success_and_falls_back(monkeypatch):
     import asyncio
     from pipeline_core.agents import sentiment as sent_mod
@@ -175,3 +242,55 @@ def test_sector_rs_relative_return(monkeypatch):
     assert _real_sector_rs("Technology", "US") == pytest.approx(12.0)   # 20% − 8%
     assert _real_sector_rs("Nonexistent Sector", "US") is None          # unmapped sector → neutral
     assert _real_sector_rs("Technology", "IN") is None                  # no IN sector map yet
+
+
+# ── Realized-lift attribution ───────────────────────────────────────
+
+def _closed(name, val, ret):
+    return {"factors": {name: val}, "realized_return_pct": ret}
+
+
+def test_factor_attribution_lift_and_status():
+    # 8 supportive-news trades (6 win) vs 8 adverse (2 win) → lift = 75 − 25 = +50pp.
+    closed = ([_closed("news", 0.8, 4.0 if i < 6 else -2.0) for i in range(8)]
+              + [_closed("news", -0.8, 4.0 if i < 2 else -2.0) for i in range(8)])
+    n = ir.factor_attribution(closed, min_samples=8)["factors"]["news"]
+    assert n["supportive"] == {"n": 8, "win_rate": 75.0, "avg_return": pytest.approx(2.5)}
+    assert n["adverse"]["win_rate"] == 25.0
+    assert n["lift"] == 50.0 and n["status"] == "ok"
+
+
+def test_factor_attribution_gates_on_min_samples():
+    closed = ([_closed("sector", 0.5, 3.0) for _ in range(3)]
+              + [_closed("sector", -0.5, -1.0) for _ in range(3)])       # only 3 per cohort
+    s = ir.factor_attribution(closed, min_samples=8)["factors"]["sector"]
+    assert s["lift"] is None and s["status"] == "insufficient"           # not enough evidence
+    assert s["supportive"]["n"] == 3                                     # cohorts still reported
+
+
+def test_factor_attribution_ignores_neutral_and_legacy():
+    # |factor| ≤ eps counts in neither cohort; a record with no `factors` block is excluded entirely.
+    closed = [_closed("news", 0.02, 5.0),                                # neutral → ignored cohort-wise
+              _closed("news", 0.9, 5.0), _closed("news", -0.9, -5.0),
+              {"realized_return_pct": 9.0}]                              # legacy → out of sample
+    r = ir.factor_attribution(closed, min_samples=1)
+    assert r["sample"] == 3                                              # the 3 with a factors block
+    n = r["factors"]["news"]
+    assert n["supportive"]["n"] == 1 and n["adverse"]["n"] == 1          # neutral one in neither
+
+
+def test_factor_attribution_regime_by_label():
+    closed = ([{"factors": {"regime_fit": "tailwind"}, "realized_return_pct": 3.0 if i < 7 else -1.0}
+               for i in range(10)]
+              + [{"factors": {"regime_fit": "headwind"}, "realized_return_pct": 3.0 if i < 3 else -1.0}
+                 for i in range(10)])
+    reg = ir.factor_attribution(closed, min_samples=8)["factors"]["regime"]
+    assert reg["supportive"]["win_rate"] == 70.0 and reg["adverse"]["win_rate"] == 30.0
+    assert reg["lift"] == 40.0
+
+
+def test_factor_attribution_empty():
+    r = ir.factor_attribution([])
+    assert r["sample"] == 0 and r["baseline"]["win_rate"] is None
+    assert all(f["status"] == "insufficient" for f in r["factors"].values())
+    assert set(r["factors"]) == {"earnings", "news", "sector", "quality", "regime"}

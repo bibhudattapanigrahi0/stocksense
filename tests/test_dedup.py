@@ -43,6 +43,18 @@ def test_too_few_usable_series_no_clusters():
     assert dedup.cluster_symbols({}, threshold=0.8) == {}
 
 
+def test_mixed_tz_frames_align_and_cluster():
+    # Regression: crypto idea enrichment mixes tz-naive (Binance) and tz-aware (yfinance fallback)
+    # frames. Building the returns matrix must NOT raise "Cannot join tz-naive with tz-aware" — the
+    # indexes are normalised to naive UTC so a correlated pair still lands in one cluster.
+    base = np.cumsum(np.random.default_rng(1).normal(0, 1, 200)) + 500.0
+    naive = _frame(base)
+    aware = _frame(base * 1.01)
+    aware.index = aware.index.tz_localize("UTC")            # tz-aware twin of a correlated series
+    clusters = dedup.cluster_symbols({"NAIVE": naive, "AWARE": aware}, threshold=0.8)
+    assert clusters and clusters["NAIVE"] == clusters["AWARE"]
+
+
 # ── book collapse ───────────────────────────────────────────────────
 
 

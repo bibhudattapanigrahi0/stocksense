@@ -13,11 +13,26 @@ already loaded, so de-dup costs nothing extra on the intraday path.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import pandas as pd
 
 from pipeline_core.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+def _to_naive_utc(s: pd.Series) -> pd.Series:
+    """Normalise a series' DatetimeIndex to tz-naive UTC so frames from different sources can be
+    aligned. Crypto OHLCV (Binance) is tz-naive UTC while the yfinance fallback is tz-aware — mixing
+    the two in one DataFrame raises "Cannot join tz-naive with tz-aware". Leaves non-datetime or
+    already-naive indexes untouched."""
+    idx = s.index
+    if isinstance(idx, pd.DatetimeIndex) and idx.tz is not None:
+        s = s.copy()
+        s.index = idx.tz_convert("UTC").tz_localize(None)
+    return s
 
 
 def _returns_matrix(frames: dict, lookback: int) -> Optional[pd.DataFrame]:
@@ -27,7 +42,7 @@ def _returns_matrix(frames: dict, lookback: int) -> Optional[pd.DataFrame]:
     for sym, df in frames.items():
         if df is None or getattr(df, "empty", True) or "Close" not in df:
             continue
-        r = df["Close"].astype(float).pct_change().tail(lookback)
+        r = _to_naive_utc(df["Close"].astype(float).pct_change().tail(lookback))
         if r.notna().sum() >= 5:
             cols[sym] = r
     if len(cols) < 2:
@@ -49,10 +64,16 @@ def cluster_symbols(
     thr = settings.dedup_corr_threshold if threshold is None else threshold
     if not on:
         return {}
-    mat = _returns_matrix(frames, lookback)
-    if mat is None:
+    # De-dup is a ranking nicety, never worth failing the whole board over — degrade to "no de-dup"
+    # if the frames can't be correlated (e.g. malformed/misaligned indexes from a fallback source).
+    try:
+        mat = _returns_matrix(frames, lookback)
+        if mat is None:
+            return {}
+        corr = mat.corr()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(f"dedup correlation skipped ({type(e).__name__}: {e})")
         return {}
-    corr = mat.corr()
     symbols = list(corr.columns)
     cluster_of: dict[str, int] = {}
     nid = 0

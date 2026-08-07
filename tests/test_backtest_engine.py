@@ -167,6 +167,47 @@ def test_daily_positions_equal_weight_mean():
     assert abs(series.max()) <= 0.10 + 1e-9
 
 
+# ── "Normal drawdown" band (winners' max adverse excursion) ─────────
+
+def test_mae_mfe_tracked_on_winning_trade():
+    # Enter at 100, dip to 92 (−8% MAE), rally to 111 (+11% MFE) → target hit. The worst dip a
+    # winner sat through is captured — the raw material for the hold-through-it band.
+    df = make_df(closes=[100, 100, 92, 105, 111, 112])
+    res = simulate("T", df, STRAT_TARGET, cost_roundtrip_bps=0)
+    t = res.trades[0]
+    assert t.exit_reason == "target"
+    assert t.mae_pct == -8.0
+    assert t.mfe_pct == 11.0
+
+
+def test_winners_only_drawdown_band():
+    from pipeline_core.backtest.engine import Trade
+
+    def wtrade(ret, mae):
+        return Trade(ticker="T", entry_date="2024-01-01", exit_date="2024-01-05",
+                     entry_price=100.0, exit_price=100 + ret, ret_pct=ret,
+                     holding_days=4, exit_reason="target", mae_pct=mae)
+
+    # Winners dipped 4/6/10% first; losers' deeper dips must NOT drag the band down.
+    trades = [wtrade(8, -4.0), wtrade(6, -6.0), wtrade(12, -10.0),
+              wtrade(-15, -20.0), wtrade(-8, -18.0)]
+    m = compute_metrics(trades, pd.Series(dtype=float), benchmark_cagr=None, years=1.0)
+    assert m["n_winners"] == 3
+    assert m["typical_dip_pct"] == 6.0        # median(|−4, −6, −10|)
+    assert m["deep_dip_pct"] == 8.4           # 80th-pct of (4, 6, 10)
+
+
+def test_drawdown_band_none_without_winners():
+    from pipeline_core.backtest.engine import Trade
+
+    trades = [Trade(ticker="T", entry_date="2024-01-01", exit_date="2024-01-05",
+                    entry_price=100.0, exit_price=95.0, ret_pct=-5.0, holding_days=4,
+                    exit_reason="stop", mae_pct=-7.0)]
+    m = compute_metrics(trades, pd.Series(dtype=float), benchmark_cagr=None, years=1.0)
+    assert m["n_winners"] == 0
+    assert m["typical_dip_pct"] is None and m["deep_dip_pct"] is None
+
+
 def _trade(ret):
     from pipeline_core.backtest.engine import Trade
 

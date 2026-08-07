@@ -184,6 +184,13 @@ def _bundle(trades: list[dict]) -> dict:
     b = _stats(trades)
     b["by_regime"] = {r: _stats([t for t in trades if t["regime"] == r]) for r in ("trend", "range")}
     b["by_side"] = {sd: _stats([t for t in trades if t["side"] == sd]) for sd in ("long", "short")}
+    # Joint regime×side cells: a bot's edge is often side-dependent (e.g. positive short, negative
+    # long) so the idea engine must attribute by the *specific* side it fired, not the regime alone.
+    b["by_regime_side"] = {
+        r: {sd: _stats([t for t in trades if t["regime"] == r and t["side"] == sd])
+            for sd in ("long", "short")}
+        for r in ("trend", "range")
+    }
     return b
 
 
@@ -218,14 +225,15 @@ async def _load_deep(symbols: list[str], tf: str, bars: int, progress=None) -> d
 
 async def run_intraday_backtest(
     bot_ids: Optional[list[str]] = None,
-    timeframes: tuple[str, ...] = ("15m",),
-    universe: str = "Top 15",
+    timeframes: tuple[str, ...] = ("15m", "1h", "4h"),
+    universe: str = "Top 20",
     bars: int = 1500,
 ) -> dict:
     """Replay the signal bots over deep intraday history and persist the edge table.
 
-    Defaults are modest (one timeframe × Top 15 × 1500 bars ≈ a few minutes); widen for more
-    coverage at the cost of runtime. Runs as a single background job."""
+    Defaults span 15m/1h/4h × Top 20 × 1500 bars (≈ a few minutes) so a plain refresh measures the
+    higher timeframes where the tradable edge actually lives, not just the noisy 15m. Narrow the
+    `timeframes`/`universe` for a faster, shallower run. Runs as a single background job."""
     if intraday_job_state["running"]:
         return {"error": "An intraday backtest is already running"}
     intraday_job_state.update(running=True, error=None, started_at=datetime.now(timezone.utc).isoformat(),
@@ -315,14 +323,26 @@ def load_edge() -> Optional[dict]:
         return None
 
 
-def edge_for(bot_name: str, tf: str, regime: Optional[str] = None, edge: Optional[dict] = None) -> Optional[dict]:
-    """Stats for one bot on a timeframe (optionally a specific regime), or None if absent."""
+def edge_for(bot_name: str, tf: str, regime: Optional[str] = None, side: Optional[str] = None,
+             edge: Optional[dict] = None) -> Optional[dict]:
+    """Stats for one bot on a timeframe, or None if absent. Returns the **most specific cell with a
+    reliable sample** (≥ MIN_SAMPLE), preferring: joint regime×side → side → regime → overall. A
+    caller that passes only `regime` (side=None) gets exactly the previous regime-or-overall
+    behaviour, so existing call sites are unchanged."""
     data = edge if edge is not None else load_edge()
     if not data:
         return None
     entry = (data.get("bots") or {}).get(f"{bot_name}|{tf}")
     if not entry:
         return None
+    if regime and side:
+        cell = entry.get("by_regime_side", {}).get(regime, {}).get(side)
+        if cell and cell.get("trades", 0) >= MIN_SAMPLE:
+            return cell
+    if side:
+        cell = entry.get("by_side", {}).get(side)
+        if cell and cell.get("trades", 0) >= MIN_SAMPLE:
+            return cell
     if regime and entry.get("by_regime", {}).get(regime, {}).get("trades", 0) >= MIN_SAMPLE:
         return entry["by_regime"][regime]
     return entry

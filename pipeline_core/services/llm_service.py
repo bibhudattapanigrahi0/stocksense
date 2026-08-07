@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Optional, Type, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -26,6 +27,46 @@ T = TypeVar("T", bound=BaseModel)
 
 class LLMUnavailableError(RuntimeError):
     """Raised when no usable LLM provider is configured."""
+
+
+# ── Provider circuit breaker ─────────────────────────────────────────
+# When the configured provider starts failing — most importantly a quota / rate-limit (HTTP 429)
+# that won't clear for a while — every subsequent call would otherwise repeat the same slow, doomed
+# round-trip (the SDK retries 429s with backoff before finally raising). Under a per-item fan-out
+# (e.g. per-coin idea sentiment) that turns one dead provider into many seconds of latency for zero
+# value. The breaker trips after a quota error (or `llm_breaker_threshold` consecutive failures) and
+# short-circuits calls for `llm_breaker_cooldown_s`, so callers reach their deterministic fallback
+# immediately instead of once per item. Process-local and self-healing.
+_breaker = {"open_until": 0.0, "fails": 0}
+
+
+def _breaker_open() -> bool:
+    return time.monotonic() < _breaker["open_until"]
+
+
+def reset_llm_breaker() -> None:
+    """Clear the breaker — used on a healthy response and as a test hook."""
+    _breaker["open_until"] = 0.0
+    _breaker["fails"] = 0
+
+
+def _is_quota_error(err: Exception) -> bool:
+    """A rate-limit / quota-exhausted provider error — one that won't clear on immediate retry."""
+    s = str(err).lower()
+    return any(k in s for k in ("429", "quota", "resource_exhausted", "rate limit", "rate_limit"))
+
+
+def _breaker_record(ok: bool, err: Optional[Exception] = None) -> None:
+    if ok:
+        reset_llm_breaker()
+        return
+    _breaker["fails"] += 1
+    if (err is not None and _is_quota_error(err)) or _breaker["fails"] >= settings.llm_breaker_threshold:
+        _breaker["open_until"] = time.monotonic() + settings.llm_breaker_cooldown_s
+        logger.warning(
+            f"LLM circuit breaker OPEN for {settings.llm_breaker_cooldown_s}s after "
+            f"{_breaker['fails']} failure(s); short-circuiting to rules-only."
+        )
 
 
 def llm_available() -> bool:
@@ -63,7 +104,24 @@ async def llm_complete(
             f"LLM provider '{settings.llm_provider}' is not configured "
             "(missing credentials or provider 'none')."
         )
+    if _breaker_open():
+        raise LLMUnavailableError(
+            "LLM temporarily disabled by the circuit breaker after repeated provider failures."
+        )
 
+    try:
+        result = await _dispatch(prompt, system_prompt, temperature, max_tokens)
+    except LLMUnavailableError:
+        raise                            # misconfiguration, not a provider failure — don't count it
+    except Exception as e:               # provider / network / quota error — record, maybe trip
+        _breaker_record(False, e)
+        raise
+    _breaker_record(True)
+    return result
+
+
+async def _dispatch(prompt, system_prompt, temperature, max_tokens) -> str:
+    """Route to the configured provider (the raw call the circuit breaker wraps)."""
     provider = settings.llm_provider.lower()
     if provider == "openai":
         return await _openai_complete(prompt, system_prompt, temperature, max_tokens)
@@ -168,7 +226,11 @@ async def _openai_complete(
     (e.g. Gemini) via base_url/api_key/model/extra_params overrides."""
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI(api_key=api_key or settings.openai_api_key, base_url=base_url)
+    # max_retries=0: fail fast on a 429/5xx so our own circuit breaker trips immediately and the
+    # caller falls back to rules-only — instead of the SDK burning seconds of internal backoff per
+    # call (the dominant cost when a provider is rate-limited under a per-item fan-out).
+    client = AsyncOpenAI(api_key=api_key or settings.openai_api_key, base_url=base_url,
+                         max_retries=settings.llm_max_retries)
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})

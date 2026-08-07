@@ -66,7 +66,10 @@ def test_refresh_replaces_buys_and_preserves_rest(monkeypatch):
                         lambda s, d, lb=3: [{"ticker": "AAA", "signal_date": "2026-07-07", "price": 5}])
     captured = {}
     monkeypatch.setattr(runner, "_persist", lambda payload, market: captured.update(p=payload))
-    monkeypatch.setattr(runner, "snapshot_current_ideas", lambda market="IN": {"added": 2})
+    async def _fake_snap(market="IN"):
+        return {"added": 2}
+
+    monkeypatch.setattr(runner, "snapshot_current_ideas", _fake_snap)
 
     res = asyncio.run(runner.refresh_current_signals("IN"))
     assert res["updated"] and res["total_buys"] == 1 and res["added_tracked"] == 2

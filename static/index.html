@@ -18,7 +18,7 @@
         } catch (e) { document.documentElement.setAttribute("data-theme", "dark"); }
     })();
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=3.2.0">
+    <link rel="stylesheet" href="/static/css/style.css?v=3.5.0">
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js" defer></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js" defer></script>
 </head>
@@ -306,6 +306,12 @@
 
         <!-- ══════════ TRADE IDEAS ══════════ -->
         <section id="tab-ideas" class="tab-panel">
+            <div class="seg ideas-seg" role="tablist">
+                <button data-ideas-view="horizon" class="active" title="Technical ideas from the strategy backtest, split by holding horizon">⏱ By Horizon</button>
+                <button data-ideas-view="multibagger" title="Fundamentals-first screen for high-growth, high-quality, smaller-cap compounders">🚀 Multi-Baggers</button>
+            </div>
+
+            <div id="ideas-horizon-view">
             <div class="card lab-controls">
                 <div class="row gap-s" style="flex-wrap: wrap;">
                     <div style="flex:1; min-width: 240px;">
@@ -351,7 +357,59 @@
                 <p class="muted">Loading trade ideas…</p>
             </div>
 
+            <div id="hold-basket-card" class="card" style="margin-top:16px;"></div>
+
+            <div id="basket-bt-panel" class="card" style="display:none; margin-top:16px;"></div>
+
             <div id="ideas-disclaimer" class="muted small" style="margin-top:14px; max-width: 1100px;"></div>
+            </div><!-- /#ideas-horizon-view -->
+
+            <div id="ideas-multibagger-view" class="hidden">
+                <div class="card lab-controls">
+                    <div class="row gap-s" style="flex-wrap: wrap; align-items: center;">
+                        <div style="flex:1; min-width: 240px;">
+                            <h2 style="font-size:16px;">🚀 Multi-Bagger Candidates</h2>
+                            <p class="muted small" id="mb-run-info">A fundamentals-first screen for high-growth, high-quality, smaller-cap businesses with room to compound — scored on growth, quality, balance sheet, valuation, size &amp; ownership.</p>
+                        </div>
+                        <select id="mb-topn" class="input input-slim" title="How many candidates to show">
+                            <option value="20">Top 20</option>
+                            <option value="15">Top 15</option>
+                            <option value="10">Top 10</option>
+                        </select>
+                        <button id="btn-refresh-mb" class="btn" title="Recompute the screen from fresh fundamentals (scores the universe, then deep-dives the top survivors)">⟳ Refresh screen</button>
+                    </div>
+                    <div id="mb-progress" class="progress-wrap hidden">
+                        <div class="progress-meta">
+                            <span id="mb-progress-stage">Starting…</span>
+                            <span id="mb-progress-pct">0%</span>
+                        </div>
+                        <div class="progress-bar"><div id="mb-progress-fill" class="progress-fill" style="width:0%"></div></div>
+                    </div>
+                </div>
+
+                <div id="mb-tracker" class="card" style="margin-top:16px;">
+                    <div class="card-head">
+                        <h2 style="font-size:16px;">📊 Multi-Bagger Tracker <span class="muted small">— how far your picks have run</span></h2>
+                        <div class="row gap-s">
+                            <button id="btn-mb-track-all" class="btn btn-s" title="Track every candidate shown below so its bagger multiple can be followed">＋ Track all shown</button>
+                            <button id="btn-mb-refresh-tracked" class="btn btn-s" title="Re-price tracked picks &amp; re-score the thesis">⟳ Refresh</button>
+                            <button id="btn-mb-reset-tracked" class="btn btn-ghost btn-s" title="Forget all tracked multi-baggers">Reset</button>
+                        </div>
+                    </div>
+                    <div id="mb-scoreboard"><p class="muted small">Loading tracker…</p></div>
+                    <div id="mb-equity-wrap" class="hidden" style="margin-top:14px;">
+                        <div class="muted small" style="margin-bottom:6px;">Basket return — equal-weight, marked-to-market since each pick's entry.</div>
+                        <div class="chart-wrap" style="height:180px;"><canvas id="mb-equity-chart"></canvas></div>
+                    </div>
+                    <div id="mb-tracked-list" class="table-scroll" style="margin-top:12px;"></div>
+                </div>
+
+                <div id="mb-list" class="mb-grid" style="margin-top:16px;">
+                    <p class="muted">Loading multi-bagger candidates…</p>
+                </div>
+
+                <div id="mb-disclaimer" class="muted small" style="margin-top:14px; max-width: 1100px;"></div>
+            </div><!-- /#ideas-multibagger-view -->
         </section>
 
         <!-- ══════════ PORTFOLIO ══════════ -->
@@ -425,7 +483,7 @@
                         <option value="1">Any bot</option><option value="2">≥2 agree</option><option value="3">≥3 agree</option>
                     </select>
                     <label id="bot-strict-wrap" class="row gap-s" style="align-items:center; display:none;" title="Show only edge-backed ideas — a bot with positive measured edge in the current regime agrees. Needs a bot backtest.">
-                        <input type="checkbox" id="bot-strict"> <span class="small">Edge-backed only</span></label>
+                        <input type="checkbox" id="bot-strict" checked> <span class="small">Edge-backed only</span></label>
                     <select id="bot-universe" class="input input-slim" title="Universe">
                         <option>Top 50</option><option>Top 100</option>
                     </select>
@@ -652,6 +710,6 @@
 
     <div id="toast" class="toast hidden"></div>
 
-    <script src="/static/js/app.js?v=3.2.0"></script>
+    <script src="/static/js/app.js?v=3.5.0"></script>
 </body>
 </html>

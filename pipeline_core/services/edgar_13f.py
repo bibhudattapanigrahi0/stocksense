@@ -75,6 +75,34 @@ TRACKED_MANAGERS: dict[str, str] = {
     "0001112520": "Akre Capital Management",
 }
 
+# ── Famed "guru" investors (CIK → name) ─────────────────────────────
+# The coattail idea in its purest form: legendary, highly-concentrated, long-only-ish stock
+# pickers whose 13F is followed precisely because the picker is famous. Kept SEPARATE from the
+# institutional basket above (config-gated via smart_money.sm_us_gurus_enabled) so the guru set
+# can be tuned independently, and folded into the panel build by `tracked_managers()`. Every CIK
+# below was validated against EDGAR's submissions API. A wrong/renamed CIK is a graceful no-op
+# (contributes nothing); expandable — more gurus = more coverage. See docs/institutional-data.md.
+GURU_MANAGERS: dict[str, str] = {
+    "0001649339": "Scion Asset Management (Michael Burry)",
+    "0001536411": "Duquesne Family Office (Stanley Druckenmiller)",
+    "0001709323": "Himalaya Capital (Li Lu)",
+    "0001061165": "Lone Pine Capital",
+    "0001647251": "TCI Fund Management (Chris Hohn)",
+    "0000807985": "Southeastern Asset Management (Longleaf)",
+    "0000813917": "Harris Associates (Oakmark)",
+    "0001351069": "ValueAct Capital",
+    "0001520023": "Fundsmith (Terry Smith)",
+    "0000936753": "Ariel Investments",
+}
+
+
+def tracked_managers() -> dict[str, str]:
+    """The manager basket to aggregate into the panel: the institutional core, plus the famed
+    gurus when `sm_us_gurus_enabled` (the default). One place so build_panel and callers agree."""
+    if getattr(settings, "sm_us_gurus_enabled", True):
+        return {**TRACKED_MANAGERS, **GURU_MANAGERS}
+    return dict(TRACKED_MANAGERS)
+
 
 # ── Polite, cached SEC fetch ────────────────────────────────────────
 
@@ -255,7 +283,7 @@ def build_panel(target_tickers: list[str], force: bool = False) -> dict[str, lis
     cusip_universe: set[str] = set()
     raw: list[tuple] = []   # (filed, quarter, cik, {cusip: shares})
 
-    for cik, name in TRACKED_MANAGERS.items():
+    for cik, name in tracked_managers().items():
         filings = _filing_list(cik)
         if not filings:
             logger.info("EDGAR: no 13F-HR for %s (%s) — skipped", name, cik)
@@ -334,3 +362,27 @@ def get_institutional_series(ticker: str) -> Optional[pd.DataFrame]:
     if not panel:
         return None
     return series_from_records(panel.get(ticker.upper(), []))
+
+
+def enrich_frames(df_by_ticker: dict) -> None:
+    """Merge the 13F series onto each US ticker's daily frame (columns `inst13f_shares` /
+    `inst13f_qoq`), forward-filled from each filing date so a backtest can never see a filing
+    before it was public. No-op when the panel hasn't been built; mutates in place. Never raises
+    — the run proceeds without 13F on failure. (Called via smart_money.enrich_frames for US.)"""
+    try:
+        panel = get_panel()
+        if not panel:
+            logger.info("13F panel not built — institutional-13f strategy is inert this run")
+            return
+        merged = 0
+        for tk, df in df_by_ticker.items():
+            recs = panel.get(tk.upper())
+            series = series_from_records(recs) if recs else None
+            if series is None or series.empty:
+                continue
+            df["inst13f_shares"] = series["agg_shares"].reindex(df.index, method="ffill")
+            df["inst13f_qoq"] = series["qoq_change_pct"].reindex(df.index, method="ffill")
+            merged += 1
+        logger.info("13F enrichment: merged holdings onto %d/%d tickers", merged, len(df_by_ticker))
+    except Exception as e:
+        logger.warning("13F enrichment skipped: %s", e)

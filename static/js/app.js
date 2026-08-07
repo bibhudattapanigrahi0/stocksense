@@ -218,6 +218,7 @@ function setMarket(key, { updateHash = false } = {}) {
     if (sel && sel.value !== key) sel.value = key;
     // Invalidate all market-scoped caches so the tabs refetch for the new market.
     LAB_DATA = null; IDEAS_DATA = null; TRACKED_DATA = null; IDEAS_LOADED = false; PF_LOADED = false;
+    MB_DATA = null; MB_LOADED = false; MB_TRACKED_DATA = null;   // multi-bagger screen + tracker are market-scoped
     applyMarketUI();
     // Clear stale results from the previous market.
     $("#screen-results").innerHTML = "";
@@ -230,7 +231,11 @@ function setMarket(key, { updateHash = false } = {}) {
 
     // Re-load whichever data-driven tab is currently open (others reload lazily on view).
     const active = $(".tab.active") && $(".tab.active").dataset.tab;
-    if (active === "ideas") { loadTradeIdeas(); loadTrackedIdeas(); IDEAS_LOADED = true; }
+    if (active === "ideas") {
+        if ($("#ideas-multibagger-view") && !$("#ideas-multibagger-view").classList.contains("hidden")) {
+            loadMultibaggers(); loadMbTracker();   // multi-bagger sub-view is showing — re-scope to the new market
+        } else { loadTradeIdeas(); loadTrackedIdeas(); IDEAS_LOADED = true; }
+    }
     else if (active === "portfolio") initPortfolio();
     else if (active === "watchlist") loadWatchlist();
     else if (active === "paper") loadPaper();
@@ -1643,6 +1648,8 @@ function drawEquityChart(s) {
 
 let IDEAS_DATA = null;
 let IDEAS_LOADED = false;
+let MB_DATA = null, MB_LOADED = false, MB_POLL = null;   // multi-bagger sub-tab state
+let MB_TRACKED_DATA = null;                              // multi-bagger tracker state
 
 const HORIZON_ACCENT = { short: "var(--accent)", medium: "var(--warn)", long: "var(--accent-2)" };
 const HORIZON_ICON = { short: "⚡", medium: "📈", long: "🏔️" };
@@ -1655,9 +1662,355 @@ async function loadTradeIdeas() {
         IDEAS_DATA = await api(withMarket(`/api/v1/backtest/ideas?max_per_bucket=${n}`));
         IDEAS_LOADED = true;
         renderTradeIdeasTab();
+        loadHoldBasket();                    // committed hold book (separate live call; not on the 90s tick)
     } catch (e) {
         box.innerHTML = `<p class="muted">Could not load trade ideas: ${esc(e.message)}</p>`;
     }
+}
+
+// ── Today's Basket: the curated cross-horizon best-of, at the top of the board ──
+// The daily analog of the intraday shortlist — the full 30-idea board distilled into 3–5 trades sized
+// as ONE ¼-Kelly book (weights sum to ≤100%), diversified, regime-scaled, and sticky day-to-day.
+function basketStat(label, value, cls, title) {
+    return `<div class="bstat" title="${esc(title || "")}"><div class="bstat-val ${cls || ""}">${value}</div><div class="bstat-lbl">${esc(label)}</div></div>`;
+}
+
+function basketItemRow(it, i) {
+    const alloc = it.alloc_pct != null ? fmt(it.alloc_pct, 1) : "—";
+    const hz = `<span class="pill horizon-chip" title="${esc(it.horizon_label || it.horizon || "")} idea">${HORIZON_ICON[it.horizon] || ""} ${esc((it.horizon_label || it.horizon || "").replace(/ term$/i, ""))}</span>`;
+    // Carried (held) and fresh (NEW) are mutually exclusive in the badge — a pick held from a prior
+    // day reads as "held", a brand-new one as "NEW". Per-idea regime fit lives on the full board below;
+    // the basket header already states the regime posture, so the row stays uncluttered.
+    const tag = it.carried
+        ? `<span class="idea-held" title="Held from a prior day — the basket is sticky, so a still-valid pick isn't churned out unless something materially better appears.">held</span>`
+        : (it.is_new ? `<span class="idea-new" title="Fresh pick this run">NEW</span>` : "");
+    const buy = (it.buy_low != null && it.buy_high != null) ? `${priceFmt(it.buy_low)}–${priceFmt(it.buy_high)}`
+        : (it.price != null ? `~${priceFmt(it.price)}` : "—");
+    const tgt = it.target_price != null ? priceFmt(it.target_price) : "—";
+    const stop = it.stop_price != null ? priceFmt(it.stop_price) : "—";
+    const rr = it.risk_reward != null ? ` · <span title="Reward:risk">${fmt(it.risk_reward, 2)}:1</span>` : "";
+    const win = it.win_prob != null ? `${fmt(it.win_prob, 0)}% win` : "";
+    const winSrc = it.win_prob_source && it.win_prob_source !== "advertised" ? ` ✓` : "";
+    const exp = it.expected_return_pct != null ? `<span class="${it.expected_return_pct >= 0 ? "pos" : "neg"}" title="Expected return per trade = win%·target − loss%·stop (an estimate from measured edge).">exp ${it.expected_return_pct >= 0 ? "+" : ""}${fmt(it.expected_return_pct, 1)}%</span>` : "";
+    const paperBtn = it.price != null
+        ? `<button class="idea-paper-btn paper-btn" data-ticker="${esc(it.ticker)}" data-market="${esc(IDEAS_DATA.market || MARKET.key)}" data-side="long" data-price="${it.live_price != null ? it.live_price : it.price}" data-stop="${it.stop_price != null ? it.stop_price : ""}" data-target="${it.target_price != null ? it.target_price : ""}" data-alloc="${it.alloc_pct != null ? it.alloc_pct : ""}" data-source="basket" title="Paper-trade ${esc(it.ticker)} at ${it.alloc_pct != null ? it.alloc_pct + "% weight" : "market"}">📝</button>`
+        : "";
+    return `<div class="basket-item" data-ticker="${esc(it.ticker)}" title="Click to deep-dive ${esc(it.ticker)}">
+        <div class="bi-rank">${i + 1}</div>
+        <div class="bi-alloc" title="Suggested portfolio weight — capped ¼-Kelly, sized across the whole basket as one book (weights sum to ≤100%).">
+            <span class="bi-alloc-pct">${alloc}%</span><span class="bi-alloc-lbl">weight</span>
+        </div>
+        <div class="bi-main">
+            <div class="bi-top"><span class="bi-ticker">${esc(it.ticker)}</span>${hz}${tag}</div>
+            <div class="bi-plan mono small">Buy ${buy} · <span class="pos">Tgt ${tgt}</span> · <span class="neg">Stop ${stop}</span>${rr}</div>
+            <div class="bi-why muted small">${win}${winSrc}${win && exp ? " · " : ""}${exp}</div>
+        </div>
+        <div class="bi-actions">${paperBtn}</div>
+    </div>`;
+}
+
+function renderBasketCard(b) {
+    if (!b || !b.enabled || !(b.items || []).length) return "";
+    const s = b.summary || {};
+    const exp = s.expected_return_pct;
+    const expTile = basketStat("Expected return", `${exp != null && exp >= 0 ? "+" : ""}${fmt(exp, 1)}%`,
+        exp != null && exp >= 0 ? "pos" : "neg",
+        "Alloc-weighted expected return on capital (includes the cash drag from staying partly in cash). An estimate from measured edge — not a guarantee.");
+    const winTile = basketStat("Blended win rate", s.avg_win_pct != null ? `${fmt(s.avg_win_pct, 0)}%` : "—", "",
+        "Allocation-weighted average win probability across the basket (best available: learned → calibrated → advertised).");
+    const expoTile = basketStat("Invested", `${fmt(s.total_alloc_pct, 0)}%`, "",
+        `${fmt(s.total_alloc_pct, 0)}% of capital deployed, ${fmt(s.cash_pct, 0)}% held as cash (the book is sized to a risk budget, so it won't force full deployment).`);
+    const divTile = basketStat("Diversification", `${s.n_independent || b.items.length} names`,
+        "", `${s.n_independent || b.items.length} independent names (one per correlation cluster)${s.n_sectors ? ` across ${s.n_sectors} sector${s.n_sectors === 1 ? "" : "s"}` : ""}.`);
+    // Horizon mix chips (⚡ short / 📈 medium / 🏔️ long).
+    const mix = s.horizon_mix || {};
+    const mixChips = ["short", "medium", "long"].filter((h) => mix[h])
+        .map((h) => `<span class="pill pill-muted" title="${mix[h]} ${h}-term">${HORIZON_ICON[h]} ${mix[h]}</span>`).join(" ");
+    const regimeState = b.regime_state;
+    const regimePill = regimeState
+        ? `<span class="pill" title="Basket size + risk budget are scaled by the market regime — more names in risk-on, fewer and smaller in risk-off." style="border-color:${regimeState === "risk-on" ? "#30a46c" : regimeState === "risk-off" ? "#e5484d" : "#8a8f98"}66;">${regimeState === "risk-on" ? "🟢" : regimeState === "risk-off" ? "🔴" : "⚪"} ${esc(regimeState)}</span>`
+        : "";
+    const w = b.weights || {};
+    const carried = s.carried_count ? ` · ${s.carried_count} held from before` : "";
+    const spent = s.excluded_spent ? ` · ${s.excluded_spent} skipped (already hit stop/target)` : "";
+    const foot = `Balanced score = ${fmt((w.ev || 0) * 100, 0)}% expected value · ${fmt((w.confidence || 0) * 100, 0)}% confidence · ${fmt((w.quality || 0) * 100, 0)}% rank. Sticky across days (hysteresis)${carried}${spent}. ${esc(b.note || "")}`;
+    return `<div class="card basket-card">
+        <div class="basket-head">
+            <div class="basket-title">
+                <h3>🧺 Today's Basket <span class="pill">${b.items.length} trade${b.items.length === 1 ? "" : "s"}</span> ${regimePill} ${mixChips}</h3>
+                <span class="muted small">Take these ${b.items.length}, at these weights — the full board distilled into one deployable book you can actually hold.</span>
+            </div>
+            <div class="basket-actions">
+                <button id="basket-deploy-btn" class="btn btn-s" title="Deploy the basket as a NAV-tracked portfolio (P&L, rebalance, AI review) — see the Portfolio tab. Idempotent: re-deploying re-syncs the same portfolio.">📈 Deploy as portfolio</button>
+                <button id="basket-bt-btn" class="btn btn-ghost btn-s" title="Backtest the basket construction method — a weekly-rebalanced held-basket equity curve vs the benchmark.">📊 Backtest</button>
+                <button id="basket-track-btn" class="btn btn-ghost btn-s" title="Commit this basket and track each pick's outcome individually (also anchors tomorrow's sticky basket).">📌 Track</button>
+                <button id="basket-paper-btn" class="btn btn-ghost btn-s" title="Open a paper trade for every pick at its suggested weight — see the Paper tab.">📝 Paper all</button>
+            </div>
+        </div>
+        <div class="basket-metrics">${expTile}${winTile}${expoTile}${divTile}</div>
+        <div class="basket-items">${b.items.map((it, i) => basketItemRow(it, i)).join("")}</div>
+        <div class="basket-foot muted small">${foot}</div>
+    </div>`;
+}
+
+// Commit + track the whole curated basket (also advances the sticky anchor).
+async function trackBasket(e) {
+    const btn = e.currentTarget;
+    const orig = btn.innerHTML; btn.disabled = true; btn.innerHTML = "…";
+    try {
+        const r = await api(withMarket("/api/v1/backtest/basket/track"), { method: "POST" });
+        const n = (r && r.basket && r.basket.count) || 0;
+        toast(`📌 Basket tracked — ${n} pick${n === 1 ? "" : "s"} committed. Follow them in the tracker.`);
+        btn.innerHTML = "✓ tracked";
+        loadTrackedIdeas();
+    } catch (err) {
+        toast(err.message, true); btn.disabled = false; btn.innerHTML = orig;
+    }
+}
+
+// Deploy the whole basket as a NAV-tracked portfolio (idempotent — re-syncs the same one).
+async function deployBasket(e) {
+    const btn = e.currentTarget;
+    const orig = btn.innerHTML; btn.disabled = true; btn.innerHTML = "…";
+    try {
+        const r = await api(withMarket("/api/v1/backtest/basket/deploy"), { method: "POST" });
+        if (!r || !r.deployed) { toast((r && r.note) || "Nothing to deploy", true); btn.disabled = false; btn.innerHTML = orig; return; }
+        const n = (r.basket && r.basket.count) || (r.snapshot && r.snapshot.positions_total) || 0;
+        toast(`📈 Deployed "${esc(r.portfolio_name || "basket")}" — ${n} positions, NAV-tracked. See the Portfolio tab.`);
+        btn.innerHTML = "✓ deployed";
+    } catch (err) {
+        toast(err.message, true); btn.disabled = false; btn.innerHTML = orig;
+    }
+}
+
+// ── Basket-method backtest panel (held-basket, weekly rebalance, vs benchmark) ──
+let BASKET_BT_CHART = null;
+let BASKET_BT_POLL = null;
+
+function toggleBasketBacktest() {
+    const panel = $("#basket-bt-panel");
+    if (!panel) return;
+    const showing = panel.style.display !== "none";
+    if (showing) { panel.style.display = "none"; return; }
+    panel.style.display = "";
+    if (!panel.dataset.loaded) loadBasketBacktest();
+}
+
+async function loadBasketBacktest() {
+    const panel = $("#basket-bt-panel");
+    if (!panel) return;
+    panel.innerHTML = `<p class="muted small">Loading basket backtest…</p>`;
+    try {
+        const r = await api(withMarket("/api/v1/backtest/basket/backtest"));
+        panel.dataset.loaded = "1";
+        renderBasketBacktest(r);
+    } catch (e) {
+        panel.innerHTML = `<p class="muted small">Could not load: ${esc(e.message)}</p>`;
+    }
+}
+
+async function runBasketBacktest() {
+    const panel = $("#basket-bt-panel");
+    const btn = panel && panel.querySelector("#basket-bt-run");
+    if (btn) { btn.disabled = true; btn.innerHTML = "…"; }
+    try {
+        await api(withMarket("/api/v1/backtest/basket/backtest/run"), { method: "POST" });
+    } catch (e) {
+        toast(e.message, true); if (btn) { btn.disabled = false; btn.innerHTML = "Run backtest"; } return;
+    }
+    // Poll status until the job finishes, then reload the result.
+    if (BASKET_BT_POLL) clearInterval(BASKET_BT_POLL);
+    BASKET_BT_POLL = setInterval(async () => {
+        let s;
+        try { s = await api("/api/v1/backtest/basket/backtest/status"); } catch { return; }
+        const bar = panel && panel.querySelector("#basket-bt-prog");
+        if (bar) bar.textContent = `${esc(s.stage)} — ${fmt(s.progress_pct, 0)}%${s.detail ? " · " + esc(s.detail) : ""}`;
+        if (!s.running) {
+            clearInterval(BASKET_BT_POLL); BASKET_BT_POLL = null;
+            if (s.error) toast("Backtest failed: " + s.error, true);
+            loadBasketBacktest();
+        }
+    }, 3000);
+}
+
+function renderBasketBacktest(r) {
+    const panel = $("#basket-bt-panel");
+    if (!panel) return;
+    const runRow = `<div class="row gap-s" style="align-items:center; flex-wrap:wrap;">
+        <b>📊 Basket backtest</b>
+        <span class="muted small">Held-basket, weekly-rebalanced, point-in-time — validates the construction method vs the benchmark.</span>
+        <span style="flex:1;"></span>
+        <span id="basket-bt-prog" class="muted small"></span>
+        <button id="basket-bt-run" class="btn btn-s">${r && r.ran ? "Re-run" : "Run backtest"}</button>
+    </div>`;
+    if (!r || !r.ran) {
+        panel.innerHTML = runRow + `<p class="muted small" style="margin-top:10px;">${esc((r && r.note) || "Not run yet.")} A run takes a minute or two (loads history + replays weekly).</p>`;
+        panel.querySelector("#basket-bt-run").addEventListener("click", runBasketBacktest);
+        return;
+    }
+    const m = r.metrics || {}, e = r.extras || {};
+    const alpha = m.alpha_vs_benchmark_pct;
+    const tiles = [
+        basketStat("CAGR", `${m.cagr_pct >= 0 ? "+" : ""}${fmt(m.cagr_pct, 1)}%`, m.cagr_pct >= 0 ? "pos" : "neg", "Compound annual growth rate of the held basket over the backtest."),
+        basketStat("vs Benchmark", `${alpha >= 0 ? "+" : ""}${fmt(alpha, 1)}%`, alpha >= 0 ? "pos" : "neg", `Alpha: basket CAGR minus ${esc(r.benchmark_label || "benchmark")} CAGR (${fmt(m.benchmark_cagr_pct, 1)}%/yr).`),
+        basketStat("Sharpe", fmt(m.sharpe, 2), "", "Risk-adjusted return (annualized)."),
+        basketStat("Max drawdown", `${fmt(m.max_drawdown_pct, 1)}%`, "neg", "Worst peak-to-trough decline of the basket equity curve."),
+    ].join("");
+    const sub = `<div class="muted small" style="margin-top:10px;">
+        Over <b>${esc(r.as_of_start)} → ${esc(r.as_of_end)}</b> · ${e.rebalances} weekly rebalances ·
+        avg ${fmt(e.avg_basket_size, 1)} names · turnover ${fmt(e.avg_turnover_pct, 0)}%/rebalance ·
+        hit rate ${fmt(e.hit_rate_pct, 0)}% · total return ${fmt(m.total_return_pct, 0)}% ·
+        ${r.names} names × ${r.strategies} strategies.
+        <br>Validates the construction method (conviction + diversification + regime-scaled ¼-Kelly + hysteresis); the calibration/fusion win-rate layer is excluded to avoid lookahead — an estimate, not advice.
+    </div>`;
+    panel.innerHTML = runRow +
+        `<div class="basket-metrics" style="margin:14px 0;">${tiles}</div>` +
+        `<div class="chart-wrap" style="height:240px;"><canvas id="basket-bt-chart"></canvas></div>` + sub;
+    panel.querySelector("#basket-bt-run").addEventListener("click", runBasketBacktest);
+    drawBasketBtEquity(r.equity_curve || []);
+}
+
+function drawBasketBtEquity(curve) {
+    const canvas = $("#basket-bt-chart");
+    if (!canvas || !window.Chart) return;
+    if (BASKET_BT_CHART) { BASKET_BT_CHART.destroy(); BASKET_BT_CHART = null; }
+    const ct = chartTheme();
+    const labels = curve.map((p) => p.date);
+    BASKET_BT_CHART = new Chart(canvas, {
+        type: "line",
+        data: {
+            labels,
+            datasets: [
+                { label: "Basket", data: curve.map((p) => p.nav), borderColor: ct.brand, borderWidth: 1.8, pointRadius: 0, fill: true, backgroundColor: hexTint(ct.brand, 0.1), tension: 0.1 },
+                { label: "Benchmark", data: curve.map((p) => p.benchmark_nav), borderColor: ct.dim, borderWidth: 1.2, pointRadius: 0, borderDash: [4, 3], fill: false, tension: 0.1 },
+            ],
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false, animation: false,
+            interaction: { mode: "index", intersect: false },
+            scales: {
+                x: { grid: { display: false }, ticks: { color: ct.dim, maxTicksLimit: 8, autoSkip: true } },
+                y: { grid: { color: ct.grid }, ticks: { color: ct.dim, callback: (v) => v + "×" } },
+            },
+            plugins: { legend: { display: true, labels: { color: ct.dim, boxWidth: 12 } } },
+        },
+    });
+}
+
+// Paper-trade every pick in the basket at its suggested weight (fires the per-row paper buttons).
+async function paperTradeBasket(e) {
+    const btn = e.currentTarget;
+    const rows = Array.from(document.querySelectorAll(".basket-items .paper-btn:not(.paper-done)"));
+    if (!rows.length) { toast("No basket picks to paper-trade."); return; }
+    btn.disabled = true; btn.innerHTML = "…";
+    for (const b of rows) { await paperTradeIdea(b); }        // sequential: reuses the single-idea handler
+    toast(`📝 Papered ${rows.length} basket pick${rows.length === 1 ? "" : "s"} — see the Paper tab.`);
+    btn.innerHTML = "✓ papered all";
+}
+
+// ── My Hold Basket — the committed, conviction-held book (below Today's Basket) ──
+async function loadHoldBasket() {
+    const card = $("#hold-basket-card");
+    if (!card) return;
+    if (!card.dataset.loaded) card.innerHTML = `<p class="muted small">Loading your Hold Basket…</p>`;
+    try {
+        const d = await api(withMarket("/api/v1/backtest/hold-basket"));
+        card.dataset.loaded = "1";
+        renderHoldBasket(d);
+    } catch (e) {
+        card.innerHTML = `<p class="muted small">Could not load Hold Basket: ${esc(e.message)}</p>`;
+    }
+}
+
+function _holdActionRow(a) {
+    const cls = a.action === "EXIT" ? "neg" : (a.action === "ADD" || a.action === "BUY") ? "pos" : "muted";
+    const icon = a.action === "EXIT" ? "✕" : (a.action === "ADD" || a.action === "BUY") ? "＋" : "•";
+    const ret = a.return_pct != null ? ` <span class="${a.return_pct >= 0 ? "pos" : "neg"}">(${a.return_pct >= 0 ? "+" : ""}${fmt(a.return_pct)}%)</span>` : "";
+    return `<div class="hb-change"><span class="hb-act ${cls}">${icon} ${a.action}</span>
+        <b>${esc(a.ticker)}</b>${ret} <span class="muted small">— ${esc(a.reason || "")}</span></div>`;
+}
+
+function renderHoldBasket(d) {
+    const card = $("#hold-basket-card");
+    if (!card) return;
+    const head = (right) => `<div class="row gap-s" style="align-items:center; flex-wrap:wrap;">
+        <b>🎯 My Hold Basket</b>
+        <span class="muted small">A committed, conviction-held book — it stays put until something material changes.</span>
+        <span style="flex:1;"></span>${right || ""}</div>`;
+
+    if (!d || !d.committed) {
+        const prev = (d && d.preview && d.preview.items) || [];
+        const pills = prev.slice(0, 6).map((it) =>
+            `<span class="pill pill-muted" title="conviction ${it.conviction} · ${esc(it.horizon || "")}">${esc(it.ticker)} ${HORIZON_ICON[it.horizon] || ""}</span>`).join(" ");
+        card.innerHTML = head(`<button id="hb-commit" class="btn btn-s">📌 Commit Hold Basket</button>`) +
+            (prev.length
+                ? `<p class="muted small" style="margin-top:10px;">Today's hold-worthy picks (higher-conviction, longer-horizon, low-churn): ${pills}. Commit them as a book you can hold — you'll only be nudged to change on a real event.</p>`
+                : `<p class="muted small" style="margin-top:10px;">No hold-worthy names right now (need a backtest + signals for this market).</p>`);
+        const c = card.querySelector("#hb-commit");
+        if (c) c.addEventListener("click", commitHoldBasket);
+        return;
+    }
+
+    const material = d.material;
+    const statusPill = material
+        ? `<span class="pill" style="border-color:#e5484d66; color:var(--neg);">⚠️ ${(d.counts.EXIT || 0) + (d.counts.ADD || 0) + (d.counts.BUY || 0)} change(s) to review</span>`
+        : `<span class="pill" style="border-color:#30a46c66; color:var(--pos);">✓ No action needed</span>`;
+    const bookRet = d.book_return_pct;
+    const rows = (d.holdings || []).map((h, i) => `<tr>
+        <td class="muted">${i + 1}</td>
+        <td><b>${esc(h.ticker)}</b> <span class="pill pill-muted">${HORIZON_ICON[h.horizon] || ""} ${esc((h.horizon || "").slice(0, 3))}</span></td>
+        <td class="mono">${priceFmt(h.entry_price)}</td>
+        <td class="mono">${priceFmt(h.current_price)}</td>
+        <td class="mono ${(h.return_pct || 0) >= 0 ? "pos" : "neg"}">${h.return_pct != null ? (h.return_pct >= 0 ? "+" : "") + fmt(h.return_pct) + "%" : "—"}</td>
+        <td class="mono">${fmt((h.weight || 0) * 100, 1)}%</td></tr>`).join("");
+    const changes = (d.actions || []).filter((a) => a.action !== "HOLD");
+    const diff = material
+        ? `<div class="hb-changes" style="margin-top:12px;">
+             <div class="muted small" style="margin-bottom:6px;">Proposed changes — review, then apply:</div>
+             ${changes.map(_holdActionRow).join("")}
+             <div class="row gap-s" style="margin-top:10px;">
+               <button id="hb-apply" class="btn btn-s">✓ Apply changes</button>
+               <button id="hb-refresh" class="btn btn-ghost btn-s">Re-check</button>
+             </div></div>`
+        : `<div class="row gap-s" style="margin-top:10px;"><button id="hb-refresh" class="btn btn-ghost btn-s">Re-check</button></div>`;
+    card.innerHTML = head(statusPill) +
+        `<div class="muted small" style="margin-top:6px;">${d.count} names · book ${bookRet >= 0 ? "+" : ""}${fmt(bookRet)}% since entry · ${fmt(d.invested_pct, 0)}% invested · tracked as portfolio "${esc(d.portfolio_name || "")}".</div>
+         <div class="table-scroll" style="margin-top:10px;"><table class="trk-table"><thead><tr>
+           <th>#</th><th>Name</th><th>Entry</th><th>Now</th><th>Return</th><th>Weight</th></tr></thead>
+           <tbody>${rows}</tbody></table></div>${diff}
+         <div style="margin-top:10px;"><button id="hb-uncommit" class="linkbtn muted small">Uncommit this book</button></div>`;
+    const ap = card.querySelector("#hb-apply"); if (ap) ap.addEventListener("click", applyHoldRebalance);
+    const rf = card.querySelector("#hb-refresh"); if (rf) rf.addEventListener("click", loadHoldBasket);
+    const un = card.querySelector("#hb-uncommit"); if (un) un.addEventListener("click", uncommitHoldBasket);
+}
+
+async function commitHoldBasket(e) {
+    const btn = e.currentTarget; btn.disabled = true; btn.innerHTML = "…";
+    try {
+        const r = await api(withMarket("/api/v1/backtest/hold-basket/commit"), { method: "POST" });
+        if (r && r.committed === false) { toast(r.note || "Nothing to commit", true); btn.disabled = false; btn.innerHTML = "📌 Commit Hold Basket"; return; }
+        toast(`🎯 Hold Basket committed — ${r.count || 0} names. It stays put until something material changes.`);
+        renderHoldBasket(r);
+    } catch (err) { toast(err.message, true); btn.disabled = false; btn.innerHTML = "📌 Commit Hold Basket"; }
+}
+
+async function applyHoldRebalance(e) {
+    const btn = e.currentTarget; btn.disabled = true; btn.innerHTML = "…";
+    try {
+        const r = await api(withMarket("/api/v1/backtest/hold-basket/apply"), { method: "POST" });
+        if (r && r.applied === false) { toast(r.note || "Nothing to apply"); }
+        else { toast("✓ Hold Basket rebalanced."); }
+        renderHoldBasket(r.committed ? r : (await api(withMarket("/api/v1/backtest/hold-basket"))));
+    } catch (err) { toast(err.message, true); btn.disabled = false; btn.innerHTML = "✓ Apply changes"; }
+}
+
+async function uncommitHoldBasket() {
+    if (!confirm("Forget your committed Hold Basket? (Its NAV-tracked portfolio is kept.)")) return;
+    try {
+        await api(withMarket("/api/v1/backtest/hold-basket"), { method: "DELETE" });
+        toast("Hold Basket uncommitted.");
+        loadHoldBasket();
+    } catch (err) { toast(err.message, true); }
 }
 
 function renderTradeIdeasTab() {
@@ -1669,15 +2022,23 @@ function renderTradeIdeasTab() {
         box.innerHTML = `<div class="card"><p class="muted">No <b>${esc(mkt().label || MARKET.key)}</b> trade ideas yet — run a backtest for this market in the <b>Strategy Lab</b> tab first. It scans every strategy's current buy signals, which this tab groups by time horizon.</p></div>`;
         return;
     }
-    box.innerHTML = regimeBanner(IDEAS_DATA.regime) + rankingBanner(IDEAS_DATA.ranking) + calibrationBanner(IDEAS_DATA.calibration, IDEAS_DATA.fusion) + horizons.map((h) => renderHorizonColumn(buckets[h])).join("");
+    box.innerHTML = renderBasketCard(IDEAS_DATA.basket) + cryptoRiskBanner(IDEAS_DATA.risk_note) + regimeBanner(IDEAS_DATA.regime) + pillarsBanner(IDEAS_DATA.pillars) + rankingBanner(IDEAS_DATA.ranking) + calibrationBanner(IDEAS_DATA.calibration, IDEAS_DATA.fusion) + horizons.map((h) => renderHorizonColumn(buckets[h])).join("");
     updateIdeasRunInfo();
 
-    box.querySelectorAll(".idea-row").forEach((row) =>
+    box.querySelectorAll(".idea-row, .basket-item[data-ticker]").forEach((row) =>
         row.addEventListener("click", () => analyzeTicker(row.dataset.ticker)));
     box.querySelectorAll(".idea-ai-btn").forEach((btn) =>
         btn.addEventListener("click", (e) => { e.stopPropagation(); onIdeaAI(btn); }));
     box.querySelectorAll(".paper-btn").forEach((btn) =>
         btn.addEventListener("click", (e) => { e.stopPropagation(); paperTradeIdea(btn); }));
+    const trackBtn = box.querySelector("#basket-track-btn");
+    if (trackBtn) trackBtn.addEventListener("click", trackBasket);
+    const paperAllBtn = box.querySelector("#basket-paper-btn");
+    if (paperAllBtn) paperAllBtn.addEventListener("click", paperTradeBasket);
+    const deployBtn = box.querySelector("#basket-deploy-btn");
+    if (deployBtn) deployBtn.addEventListener("click", deployBasket);
+    const btBtn = box.querySelector("#basket-bt-btn");
+    if (btBtn) btBtn.addEventListener("click", toggleBasketBacktest);
 }
 
 // Regime badge: the market's risk-on/off tide (benchmark 200-DMA + a vol/macro factor). Mirrors the
@@ -1728,8 +2089,29 @@ function rankingBanner(rk) {
     </div></div>`;
 }
 
+// Confluence-tier disclosure: explains the Actionable/Watchlist split — quality as BREADTH across
+// independent families, not just how many technical strategies agree. Hidden when tiering is off.
+function pillarsBanner(pl) {
+    if (!pl || !pl.enabled) return "";
+    return `<div class="card" style="margin-bottom:12px;"><div class="row gap-s" style="flex-wrap:wrap; align-items:center;">
+        <b title="Each idea is scored on how many INDEPENDENT signal families confirm it — the technical setup itself plus fundamental quality, institutional accumulation, a regime tailwind, bullish news, and sector leadership. Breadth beats depth: one family firing loudly is a watch, several agreeing is a call to act.">🧭 Confluence tiers</b>
+        <span class="pill pill-muted" title="An idea is Actionable when at least ${pl.min_actionable} independent families confirm it (clamped to those available in this market); otherwise it stays on the per-column Watchlist.">★ ≥ ${pl.min_actionable} families → actionable</span>
+        <span class="muted small">Fewer, higher-conviction trades up top; thinner setups stay on watch until more signals line up.</span>
+    </div></div>`;
+}
+
 // Calibration banner: how well advertised win-rates match realized outcomes (isotonic), plus the
 // realized-win-rate-by-conviction table. Advertised rates are adjusted to realized before sizing.
+// Crypto-only risk disclosure — its strategies backtest with deep drawdowns, so say so plainly.
+function cryptoRiskBanner(note) {
+    if (!note) return "";
+    return `<div class="card" style="margin-bottom:12px; border-left:3px solid var(--warn);">
+        <div class="row gap-s" style="align-items:flex-start;">
+            <b title="Crypto ideas are generated from equity strategies; on crypto they show large backtested drawdowns.">⚠️ Crypto risk</b>
+            <span class="muted small">${esc(note)}</span>
+        </div></div>`;
+}
+
 function calibrationBanner(cal, fusion) {
     const fusionChip = (fusion && fusion.active)
         ? `<span class="pill pill-accent" title="A logistic model over conviction + win-rate + Sharpe beats the base rate out-of-sample (walk-forward). It now feeds sizing ahead of single-feature calibration.">🧠 learned model active${fusion.improvement != null ? ` · −${fusion.improvement} log-loss` : ""}</span>`
@@ -1773,9 +2155,18 @@ function renderHorizonColumn(b) {
     if (!b) return "";
     const accent = HORIZON_ACCENT[b.horizon] || "var(--accent)";
     const cands = b.candidates || [];
-    const rows = cands.length
-        ? cands.map((c, i) => renderIdeaRow(c, i, accent, b.horizon)).join("")
-        : `<p class="muted small" style="padding:10px 12px;">No current buy signals in this horizon.</p>`;
+    // Multi-pillar tiering: actionable ideas (clear the confluence bar) render as full cards; the thinner
+    // watchlist collapses into a disclosure. Backend orders candidates actionable-first. Tiering off (no
+    // `tier` field) → everything is "actionable" and the column renders exactly as before.
+    const tiered = cands.some((c) => c.tier);
+    const actionable = tiered ? cands.filter((c) => c.tier === "actionable") : cands;
+    const watch = tiered ? cands.filter((c) => c.tier === "watch") : [];
+    const rows = actionable.length
+        ? actionable.map((c, i) => renderIdeaRow(c, i, accent, b.horizon)).join("")
+        : `<p class="muted small" style="padding:10px 12px;">${tiered ? "No high-confluence ideas here right now — see the watchlist below." : "No current buy signals in this horizon."}</p>`;
+    const watchBlock = watch.length
+        ? `<details class="ideas-watchlist"><summary class="small" title="Lower-confluence ideas — only the technical setup (or one confirming family) fired. Kept for context, not surfaced as a call to act.">Watchlist <b>${watch.length}</b> · fewer confirming signals</summary><div class="ideas-list">${watch.map((c, i) => renderIdeaRow(c, actionable.length + i, accent, b.horizon)).join("")}</div></details>`
+        : "";
     const shown = cands.length;
     const moreNote = b.total_candidates > shown ? `<span class="muted small"> · ${b.total_candidates} total</span>` : "";
     // Quality gate: candidates whose soft factors (bearish news + lagging sector, earnings risk, …)
@@ -1791,6 +2182,10 @@ function renderHorizonColumn(b) {
         ? `<span class="idea-gate small" title="Correlation de-dup: ${collapsed} idea${collapsed === 1 ? "" : "s"} that move${collapsed === 1 ? "s" : ""} in lockstep with a higher-ranked pick ${collapsed === 1 ? "was" : "were"} collapsed — the shown ideas are independent setups, not the same bet under multiple tickers.">🔗 ${collapsed} collapsed</span>`
         : "";
     const notes = [gateNote, dedupNote].filter(Boolean).join(" · ");
+    // Count line: when tiered, lead with the actionable count (the "take these" set) and note the watch tail.
+    const countLine = tiered
+        ? `<b style="color:${accent}">${actionable.length}</b> actionable${watch.length ? ` · <b>${watch.length}</b> on watch` : ""}${moreNote} · from ${b.strategy_count} strategies${notes ? " · " + notes : ""}`
+        : `<b style="color:${accent}">${shown}</b> ${shown === 1 ? "idea" : "ideas"}${moreNote} · from ${b.strategy_count} strategies${notes ? " · " + notes : ""}`;
     return `
     <div class="ideas-col card" data-horizon="${esc(b.horizon)}" style="border-top: 3px solid ${accent};">
         <div class="ideas-col-head">
@@ -1798,8 +2193,9 @@ function renderHorizonColumn(b) {
             <span class="muted small">${esc(b.sub)}</span>
         </div>
         <p class="muted small ideas-col-detail">${esc(b.detail)}</p>
-        <p class="small"><b style="color:${accent}">${shown}</b> ${shown === 1 ? "idea" : "ideas"}${moreNote} · from ${b.strategy_count} strategies${notes ? " · " + notes : ""}</p>
+        <p class="small">${countLine}</p>
         <div class="ideas-list">${rows}</div>
+        ${watchBlock}
     </div>`;
 }
 
@@ -1869,10 +2265,20 @@ function ideaTopInner(c) {
         inst = `<span class="idea-inst" title="${esc(title)}">🏦 13F ${pct}${delta}${mgrs}</span>`;
     } else if (io && io.held_pct_institutions != null) {
         inst = `<span class="idea-inst" title="Institutions currently hold ${fmt(io.held_pct_institutions, 1)}% of shares${io.held_pct_insiders != null ? ` · insiders ${fmt(io.held_pct_insiders, 1)}%` : ""}. Live snapshot (yfinance) — point-in-time, not part of the backtest.">🏦 ${fmt(io.held_pct_institutions, 1)}%</span>`;
+    } else if (c.smart_money && c.smart_money.family && c.smart_money.family !== "ownership") {
+        // Market-native smart money (metals COT commercials; crypto flows/whales; India bulk deals).
+        // Direction colours the chip; the source's own `detail` explains it. Not part of the backtest.
+        const sm = c.smart_money, fam = sm.family, dir = sm.direction;
+        const icon = { cot: "🏦", flow: "🐋", whale: "🐋", bulk_deal: "🇮🇳", ace: "🇮🇳" }[fam] || "🧠";
+        const cls = dir === "accumulate" ? "pos" : dir === "distribute" ? "neg" : "";
+        const arrow = dir === "accumulate" ? " ▲" : dir === "distribute" ? " ▼" : "";
+        const title = `${sm.detail || (sm.label || "Smart money") + " — " + (dir || "neutral")}. Live smart-money confirmation — point-in-time, distinct from the backtested signal.`;
+        inst = `<span class="idea-inst ${cls}" title="${esc(title)}">${icon} ${esc(sm.label || "smart")}${arrow}</span>`;
     }
 
     return `
                 <span class="idea-ticker mono b">${esc(c.ticker)}</span>
+                ${pillarChip(c)}
                 ${newBadge}
                 ${heldBadge}
                 ${earn}
@@ -1900,6 +2306,32 @@ function ideaLiveLevelsHtml(c) {
                     ${ll.risk_reward != null ? `<div class="idea-lvl"><span class="lvl-label">R:R</span><span class="lvl-val mono">${fmt(ll.risk_reward, 2)}:1</span></div>` : ""}
                 </div>
             </details>`;
+}
+
+// Multi-pillar confluence: a compact ★N chip summarising how many INDEPENDENT families confirm this
+// idea (technical + fundamental quality + institutional accumulation + regime tailwind + news + sector).
+// The individual family chips (📈 news, 🔺 sector, 🏦 13F, 🟢 regime) already appear on the card — this
+// is the at-a-glance breadth score that drives the actionable/watch split. Absent when tiering is off.
+const PILLAR_LABEL = {
+    technical: "📊 technical setup", quality: "💎 fundamental quality", smart_money: "🏦 smart-money buying",
+    regime: "🟢 regime tailwind", sentiment: "📰 bullish news", sector: "🔄 sector leadership",
+};
+function pillarChip(c) {
+    if (!c.pillars || c.pillar_count == null) return "";
+    const supporting = Object.keys(c.pillars).filter((k) => c.pillars[k] === true);
+    const list = supporting.map((k) => PILLAR_LABEL[k] || k).join(" · ") || "technical only";
+    const actionable = c.tier === "actionable";
+    const cls = actionable ? "pillar-chip pillar-actionable" : "pillar-chip pillar-watch";
+    return `<span class="${cls}" title="Confluence — ${c.pillar_count} independent famil${c.pillar_count === 1 ? "y" : "ies"} confirm this idea: ${list}.${actionable ? " Clears the actionable bar." : " Below the bar → watchlist."}">★ ${c.pillar_count}</span>`;
+}
+
+// "Normal drawdown" band: how far a WINNING backtest trade of the backing strategies typically dipped
+// before it worked out — hold-through guidance so a routine wobble doesn't shake you out. NOT a stop.
+// Shown only when the backtest populated it (a fresh run after this feature shipped).
+function drawdownLine(c) {
+    if (c.typical_drawdown_pct == null) return "";
+    const deep = c.deep_drawdown_pct != null ? ` · unusual past ~${fmt(c.deep_drawdown_pct, 0)}%` : "";
+    return `<div class="idea-dd small" title="Across the backing strategies' WINNING backtest trades, the typical worst dip before the trade worked out was ~${fmt(c.typical_drawdown_pct, 1)}%${c.deep_drawdown_pct != null ? `; 4 in 5 winners stayed within ~${fmt(c.deep_drawdown_pct, 1)}%` : ""}. Hold-through context — a normal wobble, not your stop.">📉 usually dips ~${fmt(c.typical_drawdown_pct, 0)}% before working${deep}</div>`;
 }
 
 function renderIdeaRow(c, i, accent, horizon) {
@@ -1959,6 +2391,7 @@ function renderIdeaRow(c, i, accent, horizon) {
                 <div class="idea-lvl" title="${stopTitle}"><span class="lvl-label">Stop</span><span class="lvl-val mono neg">${stop}</span></div>
                 ${c.risk_pct != null && c.alloc_pct != null ? `<div class="idea-lvl" title="Risk ${c.risk_pct}% of equity if stopped → ${c.alloc_pct}% position (${esc(c.size_note || "")}, ¼-Kelly capped)"><span class="lvl-label">Size</span><span class="lvl-val mono"><b>${c.risk_pct}%</b> → ${c.alloc_pct}%</span></div>` : ""}
             </div>
+            ${drawdownLine(c)}
             <div class="idea-live-slot">${ideaLiveLevelsHtml(c)}</div>
             <div class="idea-strats">${pills}${more}${regimeTag}</div>
         </div>
@@ -1982,6 +2415,375 @@ function analyzeTicker(ticker) {
 
 $("#ideas-topn").addEventListener("change", loadTradeIdeas);
 $("#btn-refresh-ideas").addEventListener("click", loadTradeIdeas);
+
+// ── Multi-Bagger screen (fundamentals-first sub-tab of Trade Ideas) ──
+
+const MB_PILLARS = [
+    ["growth", "Growth"], ["quality", "Quality"], ["balance", "Balance sheet"],
+    ["value", "Valuation"], ["size", "Size / runway"], ["ownership", "Ownership"],
+];
+
+// Segmented toggle between the horizon board and the multi-bagger screen.
+document.querySelectorAll(".ideas-seg button").forEach((btn) =>
+    btn.addEventListener("click", () => setIdeasView(btn.dataset.ideasView)));
+
+function setIdeasView(view) {
+    document.querySelectorAll(".ideas-seg button").forEach((b) =>
+        b.classList.toggle("active", b.dataset.ideasView === view));
+    $("#ideas-horizon-view").classList.toggle("hidden", view !== "horizon");
+    $("#ideas-multibagger-view").classList.toggle("hidden", view !== "multibagger");
+    if (view === "multibagger" && !MB_LOADED) { loadMultibaggers(); loadMbTracker(); }
+}
+
+// Colour a 0–100 score: strong → positive, mid → brand, weak → muted.
+function mbScoreColor(s) {
+    if (s == null) return "var(--border)";
+    if (s >= 75) return "var(--pos)";
+    if (s >= 55) return "var(--brand-2)";
+    if (s >= 40) return "var(--warn)";
+    return "var(--text-dim)";
+}
+
+async function loadMultibaggers() {
+    const box = $("#mb-list");
+    if (!marketHasFundamentals()) {   // price-only markets (metals/crypto) have no fundamentals
+        MB_LOADED = true;
+        box.innerHTML = `<div class="card"><p class="muted">The multi-bagger screen is a <b>fundamentals</b> screen — available for equity markets. Switch to <b>India</b> or <b>US</b> from the market selector to use it.</p></div>`;
+        $("#mb-disclaimer").textContent = "";
+        return;
+    }
+    const n = $("#mb-topn") ? $("#mb-topn").value : 20;
+    box.innerHTML = `<p class="muted">Loading multi-bagger candidates…</p>`;
+    try {
+        MB_DATA = await api(withMarket(`/api/v1/backtest/multibaggers?top_n=${n}`));
+        MB_LOADED = true;
+        renderMultibaggers();
+    } catch (e) {
+        box.innerHTML = `<p class="muted">Could not load multi-bagger candidates: ${esc(e.message)}</p>`;
+    }
+}
+
+function renderMultibaggers() {
+    const box = $("#mb-list");
+    const cands = (MB_DATA && MB_DATA.candidates) || [];
+    if (MB_DATA && MB_DATA.note && !cands.length) {
+        box.innerHTML = `<div class="card"><p class="muted">${esc(MB_DATA.note)}</p></div>`;
+        $("#mb-disclaimer").textContent = "";
+        return;
+    }
+    if (!cands.length) {
+        box.innerHTML = `<div class="card"><p class="muted">No multi-bagger screen yet for <b>${esc(mkt().label || MARKET.key)}</b> — hit <b>⟳ Refresh screen</b> to run it. It scores the ${esc((MB_DATA && MB_DATA.universe) || "universe")} on fundamentals, then deep-dives the top names.</p></div>`;
+        $("#mb-disclaimer").textContent = "";
+        return;
+    }
+    box.innerHTML = cands.map((c, i) => renderMultibaggerCard(c, i + 1)).join("");
+    updateMbRunInfo();
+    $("#mb-disclaimer").textContent = MB_DATA.disclaimer || "";
+
+    // Click a card → analyze; buttons/AI-panel clicks are excluded.
+    box.querySelectorAll(".mb-card").forEach((card) =>
+        card.addEventListener("click", (e) => {
+            if (!e.target.closest("button") && !e.target.closest(".mb-ai-panel")) analyzeTicker(card.dataset.ticker);
+        }));
+    box.querySelectorAll(".mb-ai-btn").forEach((btn) =>
+        btn.addEventListener("click", (e) => { e.stopPropagation(); onMbAI(btn); }));
+    box.querySelectorAll(".mb-track-btn").forEach((btn) =>
+        btn.addEventListener("click", (e) => { e.stopPropagation(); trackMultibagger(btn.dataset.ticker, btn); }));
+    box.querySelectorAll(".paper-btn").forEach((btn) =>
+        btn.addEventListener("click", (e) => { e.stopPropagation(); paperTradeIdea(btn); }));
+}
+
+function updateMbRunInfo() {
+    if (!MB_DATA) return;
+    const bits = [];
+    if (MB_DATA.universe) bits.push(esc(MB_DATA.universe));
+    if (MB_DATA.screened) bits.push(`${MB_DATA.screened} screened`);
+    if (MB_DATA.run_at) bits.push(new Date(MB_DATA.run_at).toLocaleString());
+    $("#mb-run-info").innerHTML = `Fundamentals-first: growth · quality · balance sheet · valuation · size · ownership${bits.length ? " — " + bits.join(" · ") : ""}.`;
+}
+
+function renderMultibaggerCard(c, rank) {
+    const score = c.score != null ? Math.round(c.score) : 0;
+    const col = mbScoreColor(score);
+    const mcap = c.market_cap_display != null ? `${fmt(c.market_cap_display, 0)} ${mcapUnit()}` : "";
+
+    const meters = MB_PILLARS.map(([k, label]) => {
+        const v = c.pillars ? c.pillars[k] : null;
+        const w = v == null ? 0 : Math.max(0, Math.min(100, v));
+        return `<div class="mb-meter" title="${esc(label)}: ${v == null ? "no data" : Math.round(v) + " / 100"}">
+            <span class="mb-meter-label">${esc(label)}</span>
+            <span class="mb-meter-track"><span class="mb-meter-fill" style="width:${w}%; background:${mbScoreColor(v)};"></span></span>
+            <span class="mb-meter-val mono">${v == null ? "—" : Math.round(v)}</span>
+        </div>`;
+    }).join("");
+
+    const reasons = (c.reasons || []).map((r) => `<li class="pos">✅ ${esc(r)}</li>`).join("");
+    const concerns = (c.concerns || []).map((r) => `<li class="neg">⚠️ ${esc(r)}</li>`).join("");
+
+    const chips = [];
+    if (c.buy_signal_now) chips.push(`<span class="pill pill-buy" title="A strategy is currently signalling a buy — a timing tailwind. The ranking is fundamentals-first; this is context, not a heavy weight.">✓ buy signal now</span>`);
+    if (c.pct_in_52w_range != null) {
+        const p = Math.round(c.pct_in_52w_range);
+        const cls = p <= 40 ? "pill-low" : (p >= 85 ? "pill-high" : "pill-muted");
+        const word = p <= 40 ? "early in its range" : (p >= 85 ? "extended near highs" : "mid-range");
+        chips.push(`<span class="pill ${cls}" title="Price sits ${p}% up its 52-week range — ${word}.">${p}% of 52w</span>`);
+    }
+    if (c.deep) chips.push(`<span class="pill pill-accent" title="Deep-dived: scored with financial-statement metrics (Piotroski / ROCE / 3-year CAGRs${MB_DATA && MB_DATA.market === "IN" ? " + promoter holding" : ""}).">deep-dived</span>`);
+
+    const paperBtn = c.price != null
+        ? `<button class="paper-btn mb-paper-btn" data-ticker="${esc(c.ticker)}" data-market="${esc((MB_DATA && MB_DATA.market) || MARKET.key)}" data-side="long" data-price="${c.price}" data-source="multibagger" title="Paper trade ${esc(c.ticker)} at ${priceFmt(c.price)}">📝 Paper</button>`
+        : "";
+
+    return `
+    <div class="card mb-card" data-ticker="${esc(c.ticker)}" title="Analyze ${esc(c.ticker)}">
+        <div class="mb-head">
+            <div class="mb-rank">#${rank}</div>
+            <div class="mb-title">
+                <div class="mb-ticker">${esc(c.ticker)}${mcap ? ` <span class="muted small">· ${mcap}</span>` : ""}</div>
+                <div class="muted small mb-name">${esc(c.name || "")}${c.sector ? " · " + esc(c.sector) : ""}</div>
+            </div>
+            <div class="mb-score" style="border-color:${col}; color:${col};">
+                <span class="mb-score-num">${score}</span><span class="mb-score-cap">score</span>
+            </div>
+        </div>
+        ${chips.length ? `<div class="mb-chips">${chips.join("")}</div>` : ""}
+        <div class="mb-meters">${meters}</div>
+        <div class="mb-why">
+            ${reasons ? `<ul class="mb-reasons">${reasons}</ul>` : ""}
+            ${concerns ? `<ul class="mb-reasons">${concerns}</ul>` : ""}
+        </div>
+        <div class="mb-actions">
+            ${paperBtn}
+            <button class="mb-track-btn" data-ticker="${esc(c.ticker)}" title="Track ${esc(c.ticker)} — follow its bagger multiple (current ÷ entry) over time in the tracker above">📌 Track</button>
+            <button class="idea-ai-btn mb-ai-btn" data-ticker="${esc(c.ticker)}" title="AI analyst read of this idea (thesis + news sentiment + verdict)">🧠 AI</button>
+        </div>
+        <div class="mb-ai-panel idea-ai-panel hidden"></div>
+    </div>`;
+}
+
+// AI read for a multi-bagger card — its own handler (these cards aren't in IDEAS_DATA).
+function onMbAI(btn) {
+    const card = btn.closest(".mb-card");
+    const panel = card.querySelector(".mb-ai-panel");
+    if (!panel.classList.contains("hidden")) { panel.classList.add("hidden"); return; }
+    panel.classList.remove("hidden");
+    if (panel.dataset.loaded === "1") return;
+    const idea = ((MB_DATA && MB_DATA.candidates) || []).find((c) => c.ticker === btn.dataset.ticker);
+    if (!idea) { panel.innerHTML = `<p class="muted small">Idea not found.</p>`; return; }
+    panel.innerHTML = `<p class="muted small">🧠 Analyzing…</p>`;
+    btn.disabled = true;
+    fetchIdeaAI(idea)
+        .then((ai) => { panel.innerHTML = renderAIPanel(ai); panel.dataset.loaded = "1"; })
+        .catch((e) => { panel.innerHTML = `<p class="muted small">AI unavailable: ${esc(e.message)}</p>`; })
+        .finally(() => { btn.disabled = false; });
+}
+
+// Recompute the screen on the server, then poll the job to completion.
+async function refreshMultibaggers() {
+    if (!marketHasFundamentals()) { toast("Multi-bagger screen is for equity markets (India / US)", true); return; }
+    const btn = $("#btn-refresh-mb");
+    const n = $("#mb-topn") ? $("#mb-topn").value : 20;
+    btn.disabled = true;
+    try {
+        await api(withMarket(`/api/v1/backtest/multibaggers/refresh?top_n=${n}`), { method: "POST" });
+        toast("Multi-bagger screen started — scoring the universe…");
+        $("#mb-progress").classList.remove("hidden");
+        MB_POLL = setInterval(pollMbStatus, 2000);
+        pollMbStatus();
+    } catch (e) {
+        toast(e.message, true);
+        btn.disabled = false;
+    }
+}
+
+async function pollMbStatus() {
+    try {
+        const s = await api(withMarket("/api/v1/backtest/multibaggers/status"));
+        const job = s.job || {};
+        if (job.running) {
+            $("#mb-progress-stage").textContent = `${job.stage || "…"}${job.detail ? " · " + job.detail : ""}`;
+            $("#mb-progress-fill").style.width = `${job.progress_pct || 0}%`;
+            $("#mb-progress-pct").textContent = `${Math.round(job.progress_pct || 0)}%`;
+        } else {
+            clearInterval(MB_POLL);
+            $("#mb-progress-fill").style.width = "100%";
+            $("#mb-progress-pct").textContent = "100%";
+            $("#mb-progress-stage").textContent = job.error ? `Failed: ${job.error}` : "Completed";
+            $("#btn-refresh-mb").disabled = false;
+            setTimeout(() => $("#mb-progress").classList.add("hidden"), 1500);
+            if (job.error) toast(`Multi-bagger screen failed: ${job.error}`, true);
+            else { toast("Multi-bagger screen updated"); await loadMultibaggers(); }
+        }
+    } catch { /* transient — the next tick retries */ }
+}
+
+$("#btn-refresh-mb").addEventListener("click", refreshMultibaggers);
+$("#mb-topn").addEventListener("change", () => { if (MB_LOADED) loadMultibaggers(); });
+
+// ── Multi-Bagger Tracker (follow the bagger multiple over time) ──
+
+async function loadMbTracker() {
+    const board = $("#mb-scoreboard");
+    if (!marketHasFundamentals()) {          // price-only markets have no tracker
+        if (board) board.innerHTML = "";
+        if ($("#mb-equity-wrap")) $("#mb-equity-wrap").classList.add("hidden");
+        if ($("#mb-tracked-list")) $("#mb-tracked-list").innerHTML = "";
+        return;
+    }
+    if (board) board.innerHTML = `<p class="muted small">Pricing tracked picks…</p>`;
+    try {
+        MB_TRACKED_DATA = await api(withMarket("/api/v1/backtest/multibaggers/tracked"));
+        renderMbTracker();
+    } catch (e) {
+        if (board) board.innerHTML = `<p class="muted small">Could not load tracker: ${esc(e.message)}</p>`;
+    }
+}
+
+function renderMbTracker() {
+    const d = MB_TRACKED_DATA || {};
+    const rows = d.tracked || [];
+    const sb = d.scoreboard || {};
+    const board = $("#mb-scoreboard");
+    const eqWrap = $("#mb-equity-wrap");
+    const list = $("#mb-tracked-list");
+
+    if (!rows.length) {
+        board.innerHTML = `<p class="muted small">No multi-baggers tracked yet. Hit <b>📌 Track</b> on a candidate below (or <b>＋ Track all shown</b>) to follow its bagger multiple over time.</p>`;
+        if (eqWrap) eqWrap.classList.add("hidden");
+        if (list) list.innerHTML = "";
+        return;
+    }
+
+    const ms = sb.milestones || {};
+    const chip = (val, label, cls) =>
+        `<div class="score-chip"><span class="score-chip-val ${cls || ""}">${val}</span><span class="score-chip-lbl">${label}</span></div>`;
+    const pct = (v) => (v == null ? "—" : `${v >= 0 ? "+" : ""}${fmt(v)}%`);
+    board.innerHTML = `
+        <div class="scoreboard">
+            ${chip(sb.count || 0, "Tracked", "")}
+            ${chip(sb.best_multiple != null ? sb.best_multiple + "×" : "—", "Best multiple", (sb.best_multiple ?? 0) >= 2 ? "pos" : "")}
+            ${chip(sb.avg_multiple != null ? sb.avg_multiple + "×" : "—", "Avg multiple", "")}
+            ${chip(pct(sb.avg_return_pct), "Avg return", (sb.avg_return_pct ?? 0) >= 0 ? "pos" : "neg")}
+            ${chip(pct(sb.worst_return_pct), "Worst", (sb.worst_return_pct ?? 0) >= 0 ? "pos" : "neg")}
+            ${chip(ms["2"] || 0, "🎯 Doubled (2×+)", (ms["2"] || 0) > 0 ? "pos" : "")}
+            ${chip(ms["5"] || 0, "5×+", (ms["5"] || 0) > 0 ? "pos" : "")}
+            ${chip(ms["10"] || 0, "🚀 10×+", (ms["10"] || 0) > 0 ? "pos" : "")}
+        </div>
+        ${d.priced_at ? `<p class="muted small" style="margin-top:8px;">Priced ${new Date(d.priced_at).toLocaleString()} · multiple = current ÷ entry · thesis drift = fresh deep re-score − entry score. Open-ended holds — no stop/target close.</p>` : ""}`;
+
+    const eq = d.curve || [];
+    if (eq.length) { eqWrap.classList.remove("hidden"); drawMbEquity(eq); }
+    else eqWrap.classList.add("hidden");
+
+    list.innerHTML = renderMbTrackedTable(rows);
+    list.querySelectorAll(".trk-row").forEach((r) =>
+        r.addEventListener("click", (e) => { if (!e.target.closest("button")) analyzeTicker(r.dataset.ticker); }));
+    list.querySelectorAll(".mb-untrack-btn").forEach((b) =>
+        b.addEventListener("click", (e) => { e.stopPropagation(); untrackMultibagger(b.dataset.ticker); }));
+}
+
+function renderMbTrackedTable(rows) {
+    const body = rows.map((t) => {
+        const mult = t.multiple != null ? `${fmt(t.multiple, 2)}×` : "—";
+        const multCls = t.multiple == null ? "muted" : (t.multiple >= 1 ? "pos" : "neg");
+        const ret = t.return_pct != null ? `${t.return_pct >= 0 ? "+" : ""}${fmt(t.return_pct)}%` : "—";
+        const retCls = t.return_pct == null ? "muted" : (t.return_pct >= 0 ? "pos" : "neg");
+        const milestone = t.milestone ? `<span class="pill pill-buy mb-mult" title="Bagger milestone reached">${esc(t.milestone)}</span>` : "";
+        // Thesis drift: entry score → fresh deep re-score.
+        let drift = `<span class="muted">—</span>`;
+        if (t.current_score != null) {
+            const dd = t.score_drift;
+            const arrow = dd == null ? "" : (dd > 0 ? ` <span class="pos">▲${fmt(dd, 0)}</span>` : dd < 0 ? ` <span class="neg">▼${fmt(Math.abs(dd), 0)}</span>` : "");
+            drift = `<span title="Entry score → current (fresh deep re-score) — is the thesis strengthening or weakening?">${fmt(t.entry_score, 0)}→${fmt(t.current_score, 0)}${arrow}</span>`;
+        } else if (t.entry_score != null) {
+            drift = `<span class="muted" title="Couldn't re-score right now">${fmt(t.entry_score, 0)}→?</span>`;
+        }
+        return `<tr class="trk-row" data-ticker="${esc(t.ticker)}" title="Analyze ${esc(t.ticker)}">
+            <td class="mono b">${esc(t.ticker)} ${milestone}</td>
+            <td class="small muted">${esc(t.entry_date || "—")}</td>
+            <td class="mono">${priceFmt(t.entry_price)}</td>
+            <td class="mono">${priceFmt(t.current_price)}</td>
+            <td class="mono ${retCls}">${ret}</td>
+            <td class="mono b ${multCls}">${mult}</td>
+            <td class="small">${drift}</td>
+            <td><button class="mb-untrack-btn trk-ai-btn" data-ticker="${esc(t.ticker)}" title="Stop tracking ${esc(t.ticker)}">🗑</button></td>
+        </tr>`;
+    }).join("");
+    return `<table class="lab-table trk-table">
+        <thead><tr><th>Ticker</th><th>Entry date</th><th>Entry</th><th>Now</th><th>Return</th><th>Multiple</th><th>Score then→now</th><th></th></tr></thead>
+        <tbody>${body}</tbody></table>`;
+}
+
+let MB_CHART = null;
+function drawMbEquity(points) {
+    const canvas = $("#mb-equity-chart");
+    if (!canvas || !window.Chart) return;
+    if (MB_CHART) { MB_CHART.destroy(); MB_CHART = null; }
+    const pts = (points || []).map(([t, v]) => ({ x: t, y: v }));
+    const ct = chartTheme();
+    MB_CHART = new Chart(canvas, {
+        type: "line",
+        data: { datasets: [{ label: "Basket return (%)", data: pts, borderColor: ct.brand2, borderWidth: 1.6, pointRadius: 0, fill: true, backgroundColor: hexTint(ct.brand2, 0.1), tension: 0.1 }] },
+        options: {
+            responsive: true, maintainAspectRatio: false, animation: false,
+            interaction: { mode: "index", intersect: false },
+            scales: {
+                x: { type: "linear", grid: { display: false },
+                     ticks: { color: ct.dim, maxTicksLimit: 8, autoSkip: true,
+                              callback: (v) => new Date(v).toLocaleDateString(undefined, { month: "short", day: "numeric" }) } },
+                y: { grid: { color: ct.grid }, ticks: { color: ct.dim, callback: (v) => v + "%" } },
+            },
+            plugins: { legend: { display: false },
+                tooltip: { callbacks: { title: (items) => (items.length ? new Date(items[0].parsed.x).toLocaleDateString() : "") } } },
+        },
+    });
+}
+
+// Track one candidate from its card.
+async function trackMultibagger(ticker, btn) {
+    if (btn) btn.disabled = true;
+    try {
+        const r = await api(withMarket(`/api/v1/backtest/multibaggers/track?ticker=${encodeURIComponent(ticker)}`), { method: "POST" });
+        if (r && r.note && !r.added) { toast(r.note, true); if (btn) btn.disabled = false; }
+        else { toast(`📌 Tracking ${String(ticker).toUpperCase()}`); if (btn) { btn.textContent = "✓ tracking"; btn.classList.add("paper-done"); } }
+        await loadMbTracker();
+    } catch (e) {
+        toast(e.message, true);
+        if (btn) btn.disabled = false;
+    }
+}
+
+async function untrackMultibagger(ticker) {
+    try {
+        await api(withMarket(`/api/v1/backtest/multibaggers/tracked?ticker=${encodeURIComponent(ticker)}`), { method: "DELETE" });
+        toast(`Stopped tracking ${String(ticker).toUpperCase()}`);
+        await loadMbTracker();
+    } catch (e) { toast(e.message, true); }
+}
+
+$("#btn-mb-track-all").addEventListener("click", async () => {
+    const btn = $("#btn-mb-track-all");
+    const n = $("#mb-topn") ? $("#mb-topn").value : 20;
+    btn.disabled = true;
+    try {
+        const r = await api(withMarket(`/api/v1/backtest/multibaggers/track?top_n=${n}`), { method: "POST" });
+        if (r && r.note && !r.added) toast(r.note, true);
+        else toast(`Tracking ${r.added} new pick${r.added === 1 ? "" : "s"} · ${r.total} total`);
+        await loadMbTracker();
+    } catch (e) { toast(e.message, true); }
+    finally { btn.disabled = false; }
+});
+
+$("#btn-mb-refresh-tracked").addEventListener("click", loadMbTracker);
+
+$("#btn-mb-reset-tracked").addEventListener("click", async () => {
+    if (!confirm("Forget all tracked multi-baggers?")) return;
+    try {
+        await api(withMarket("/api/v1/backtest/multibaggers/tracked"), { method: "DELETE" });
+        toast("Multi-bagger tracker reset");
+        await loadMbTracker();
+    } catch (e) { toast(e.message, true); }
+});
 
 // ── Fast idea generation + auto-refresh ──────────────────────────
 
@@ -2250,15 +3052,49 @@ const STATUS_META = {
     unknown: { label: "No price", cls: "muted", icon: "❔" },
 };
 
+let ADHERENCE_DATA = null;
+
 async function loadTrackedIdeas() {
     const board = $("#ideas-scoreboard");
     board.innerHTML = `<p class="muted small">Pricing tracked ideas…</p>`;
     try {
         TRACKED_DATA = await api(withMarket("/api/v1/backtest/ideas/tracked"));
+        // Discipline scorecard ("system vs you") rides alongside — best-effort, never blocks the tracker.
+        try { ADHERENCE_DATA = await api(withMarket("/api/v1/adherence")); } catch { ADHERENCE_DATA = null; }
         renderTracker();
     } catch (e) {
         board.innerHTML = `<p class="muted small">Could not load tracker: ${esc(e.message)}</p>`;
     }
+}
+
+// Discipline scorecard — did sticking to the plan beat what you actually did? Compares your real exits
+// (paper trades + I'm-in/out marks) to holding each idea to its stop/target/expiry, entry held constant.
+function disciplineScorecard(data) {
+    const sc = data && data.scorecard;
+    if (!sc || !sc.n) {
+        return `<div class="disc-card muted small">🎯 <b>Discipline scorecard</b> — mark the ideas you act on with <b>I'm in / I'm out</b> below (or paper-trade them); this then shows how your real exits compared to following each idea's plan.</div>`;
+    }
+    const pct = (v) => (v == null ? "—" : `${v >= 0 ? "+" : ""}${fmt(v)}%`);
+    const d = sc.discipline_delta_pct;
+    const verdict = d == null ? ""
+        : d < -0.5 ? `<b class="neg">early exits cost you ${fmt(Math.abs(d))}%</b>`
+        : d > 0.5 ? `<b class="pos">your calls added ${fmt(d)}%</b>`
+        : `<b>you're tracking the plan</b>`;
+    const split = (sc.early_cost_n || sc.early_saved_n)
+        ? ` · ${sc.early_saved_n} early exit${sc.early_saved_n === 1 ? "" : "s"} saved you, ${sc.early_cost_n} cost you`
+        : "";
+    const chip = (val, label, cls) =>
+        `<div class="score-chip"><span class="score-chip-val ${cls}">${val}</span><span class="score-chip-lbl">${label}</span></div>`;
+    return `
+    <div class="disc-card">
+        <div class="disc-head">🎯 <b>Discipline scorecard</b> <span class="muted small">— your real exits vs following the plan (${sc.acted} acted of ${sc.n})</span></div>
+        <div class="scoreboard" style="margin-top:8px;">
+            ${chip(pct(sc.plan_return_pct), "📋 Plan book", (sc.plan_return_pct ?? 0) >= 0 ? "pos" : "neg")}
+            ${chip(pct(sc.your_return_pct), "🧑 Your book", (sc.your_return_pct ?? 0) >= 0 ? "pos" : "neg")}
+            ${chip(pct(d), "Discipline Δ", (d ?? 0) >= 0 ? "pos" : "neg")}
+        </div>
+        <p class="muted small" style="margin:6px 0 0;">${verdict}${split}. Plan = holding each idea to its stop / target / expiry; entry is held constant so this isolates your <b>exit</b> timing. Fed by paper trades + your I'm-in/out marks.</p>
+    </div>`;
 }
 
 const EXIT_META = {
@@ -2266,6 +3102,40 @@ const EXIT_META = {
     stop: { label: "Stopped", cls: "neg", icon: "⛔" },
     time: { label: "Expired", cls: "muted", icon: "⌛" },
 };
+
+// Factor scorecard: does each soft factor actually earn its weight? For every factor we compare the
+// realized win-rate of closed ideas where it was SUPPORTIVE at entry vs where it was ADVERSE — the
+// signed "lift". Populated from the ledger (TRACKED_DATA.attribution); the gate/de-dup aren't shown
+// because ideas they removed were never tracked.
+function factorScorecard(attr) {
+    if (!attr) return "";
+    const F = attr.factors || {};
+    const order = ["news", "sector", "quality", "earnings", "regime"];
+    const LABEL = { news: "📰 News", sector: "🔄 Sector", quality: "💎 Quality", earnings: "⚠️ Earnings", regime: "🌊 Regime" };
+    const withData = order.filter((k) => F[k] && (F[k].supportive.n + F[k].adverse.n) > 0);
+    if (!attr.sample || !withData.length) {
+        return `<div class="factor-card muted small">🎯 <b>Factor scorecard</b> — populates as tracked ideas <b>close</b> (measures each factor's realized win-rate lift: supportive vs adverse at entry). ${attr.sample ? `${attr.sample} closed so far, none yet carrying an active factor.` : ""}</div>`;
+    }
+    const cell = (c) => c.win_rate != null
+        ? `${fmt(c.win_rate)}% <span class="muted">(${c.n})</span>`
+        : `<span class="muted">— (${c.n})</span>`;
+    const rows = withData.map((k) => {
+        const f = F[k];
+        const lift = f.lift != null
+            ? `<span class="${f.lift >= 0 ? "pos" : "neg"} b">${f.lift >= 0 ? "+" : ""}${fmt(f.lift)}pp</span>`
+            : `<span class="muted small" title="Need ≥${attr.min_samples} closed trades in BOTH the supportive and adverse cohorts before a lift is trustworthy.">need more data</span>`;
+        return `<tr><td>${LABEL[k]}</td><td class="mono">${cell(f.supportive)}</td><td class="mono">${cell(f.adverse)}</td><td>${lift}</td></tr>`;
+    }).join("");
+    return `
+    <details class="factor-card" open>
+        <summary>🎯 <b>Factor scorecard</b> <span class="muted small">— realized win-rate, supportive vs adverse at entry (${attr.sample} closed with factor data)</span></summary>
+        <table class="factor-table">
+            <thead><tr><th>Factor</th><th>Supportive win</th><th>Adverse win</th><th>Lift</th></tr></thead>
+            <tbody>${rows}</tbody>
+        </table>
+        <p class="muted small" style="margin:6px 0 0;">Lift = supportive − adverse win-rate (pp); positive ⇒ the factor pointed the right way. The quality gate &amp; de-dup aren't scored here — ideas they removed were never tracked.</p>
+    </details>`;
+}
 
 function renderTracker() {
     const open = TRACKED_DATA.open || TRACKED_DATA.ideas || [];
@@ -2278,7 +3148,8 @@ function renderTracker() {
     const eqWrap = $("#ideas-equity-wrap");
 
     if (!open.length && !closed.length) {
-        board.innerHTML = `<p class="muted small">No ideas tracked yet. Click <b>＋ Track current</b> to start following the ideas below — or run a backtest, which tracks them automatically.</p>`;
+        board.innerHTML = `<p class="muted small">No ideas tracked yet. Click <b>＋ Track current</b> to start following the ideas below — or run a backtest, which tracks them automatically.</p>`
+            + disciplineScorecard(ADHERENCE_DATA);
         [openD, pastD, eqWrap].forEach((e) => e.classList.add("hidden"));
         return;
     }
@@ -2299,7 +3170,9 @@ function renderTracker() {
             ${chip(open.length, "Open", "")}
             ${chip(pct(sb.avg_return_pct), "Open avg", (sb.avg_return_pct ?? 0) >= 0 ? "pos" : "neg")}
         </div>
-        ${TRACKED_DATA.priced_at ? `<p class="muted small" style="margin-top:8px;">Priced ${new Date(TRACKED_DATA.priced_at).toLocaleString()} · win rate = wins ÷ (wins + losses) on <b>closed</b> trades; open ideas move to Past trades once they hit a target, stop, or time-stop.</p>` : ""}`;
+        ${TRACKED_DATA.priced_at ? `<p class="muted small" style="margin-top:8px;">Priced ${new Date(TRACKED_DATA.priced_at).toLocaleString()} · win rate = wins ÷ (wins + losses) on <b>closed</b> trades; open ideas move to Past trades once they hit a target, stop, or time-stop.</p>` : ""}
+        ${disciplineScorecard(ADHERENCE_DATA)}
+        ${factorScorecard(TRACKED_DATA.attribution)}`;
 
     // Idea-book equity curve (cumulative realized P&L).
     const eq = TRACKED_DATA.equity_curve || [];
@@ -2315,6 +3188,8 @@ function renderTracker() {
             r.addEventListener("click", () => analyzeTicker(r.dataset.ticker)));
         $("#ideas-tracked-list").querySelectorAll(".trk-ai-btn").forEach((b) =>
             b.addEventListener("click", (e) => { e.stopPropagation(); onTrackedAI(b); }));
+        $("#ideas-tracked-list").querySelectorAll(".disc-btn").forEach((b) =>
+            b.addEventListener("click", (e) => { e.stopPropagation(); markIdeaAction(b); }));
     } else openD.classList.add("hidden");
 
     // Past trades (closed) — with an AI post-mortem over the realized record.
@@ -2331,6 +3206,49 @@ function renderTracker() {
     } else pastD.classList.add("hidden");
 }
 
+// Log what you actually did with a tracked idea → feeds the discipline scorecard. Price defaults to
+// the live quote server-side. Refreshes the tracker so the scorecard + button state update.
+async function markIdeaAction(btn) {
+    const d = btn.dataset;
+    btn.disabled = true;
+    try {
+        const r = await api("/api/v1/backtest/ideas/tracked/action", {
+            method: "POST",
+            body: JSON.stringify({ ticker: d.ticker, horizon: d.horizon, market: d.market, action: d.action }),
+        });
+        if (r && r.ok === false) { toast(r.error || "Could not log that action", true); btn.disabled = false; return; }
+        toast(d.action === "in" ? `Logged — you're in ${esc(d.ticker)}` : `Logged — you're out of ${esc(d.ticker)}`);
+        loadTrackedIdeas();
+    } catch (e) { toast(e.message, true); btn.disabled = false; }
+}
+
+// "Normal drawdown" check on an open position: is the live dip within, or beyond, what winning
+// backtest trades of the backing strategies typically sat through? Reassurance vs an early warning —
+// the anti-panic half of "stick with it". Empty when the position isn't down or carries no band.
+function ddBadge(t) {
+    if (!t.dd_status) return "";
+    const meta = {
+        within: { cls: "dd-within", txt: "normal dip", icon: "✓" },
+        stretching: { cls: "dd-within", txt: "deep but normal", icon: "↓" },
+        beyond: { cls: "dd-beyond", txt: "beyond typical", icon: "⚠️" },
+    }[t.dd_status];
+    if (!meta) return "";
+    const title = t.dd_status === "beyond"
+        ? `Down ${fmt(t.dd_pct, 1)}% — past the ~${fmt(t.deep_drawdown_pct, 1)}% that 4 in 5 winning backtest trades stayed within. The thesis may be breaking; worth a fresh look.`
+        : `Down ${fmt(t.dd_pct, 1)}% — within the ~${fmt(t.typical_drawdown_pct, 1)}% dip winning backtest trades typically sat through. A normal wobble, not a reason to bail.`;
+    return ` <span class="dd-badge ${meta.cls}" title="${esc(title)}">${meta.icon} ${meta.txt}</span>`;
+}
+
+// "You" cell: log what you actually did with this idea (I'm-in / I'm-out) — the capture that feeds the
+// discipline scorecard. State-driven from the record's user_action.
+function actionButtons(t) {
+    const ua = t.user_action || {};
+    const base = `data-ticker="${esc(t.ticker)}" data-horizon="${esc(t.horizon || "")}" data-market="${esc(t.market || MARKET.key)}"`;
+    if (ua.exited) return `<span class="disc-done" title="You logged an entry and an exit — this counts toward the discipline scorecard above.">✓ logged</span>`;
+    if (ua.entered) return `<button class="disc-btn disc-out" ${base} data-action="out" title="Log that you exited here — the scorecard compares your exit to the plan's (stop/target/expiry).">I'm out</button>`;
+    return `<button class="disc-btn disc-in" ${base} data-action="in" title="Log that you took this trade — then hit I'm out when you exit, to score your discipline vs the plan.">I'm in</button>`;
+}
+
 function renderTrackedTable(ideas) {
     if (!ideas.length) return `<p class="muted small">None.</p>`;
     const rows = ideas.map((t) => {
@@ -2344,12 +3262,13 @@ function renderTrackedTable(ideas) {
             <td class="mono neg">${priceFmt(t.stop_price)}</td>
             <td class="mono">${priceFmt(t.current_price)}</td>
             <td class="mono ${retCls}">${ret}</td>
-            <td class="small ${st.cls}">${st.icon} ${st.label}</td>
+            <td class="small ${st.cls}">${st.icon} ${st.label}${ddBadge(t)}</td>
+            <td>${actionButtons(t)}</td>
             <td><button class="trk-ai-btn" data-ticker="${esc(t.ticker)}" data-horizon="${esc(t.horizon || "")}" title="AI read of this position">🧠</button></td>
         </tr>`;
     }).join("");
     return `<table class="lab-table trk-table">
-        <thead><tr><th>Ticker</th><th>Horizon</th><th>Entry</th><th>Stop</th><th>Now</th><th>P&L</th><th>Status</th><th>AI</th></tr></thead>
+        <thead><tr><th>Ticker</th><th>Horizon</th><th>Entry</th><th>Stop</th><th>Now</th><th>P&L</th><th>Status</th><th>You</th><th>AI</th></tr></thead>
         <tbody>${rows}</tbody></table>`;
 }
 
@@ -2846,7 +3765,7 @@ const convPill = (n) => `<span class="pill ${n >= 3 ? "pill-buy" : n >= 2 ? "pil
 const IDEAS_BOT = {
     id: "__ideas__", name: "★ Intraday Trade Ideas", kind: "ideas",
     description: "Every signal bot aggregated by conviction into ranked long & short ideas on your chosen timeframe.",
-    default_timeframe: "15m", timeframes: ["5m", "10m", "15m", "30m", "1h", "4h"],
+    default_timeframe: "4h", timeframes: ["5m", "10m", "15m", "30m", "1h", "4h"],
 };
 const CONVICTION_PILL = { proceed: "pill-buy", caution: "pill-hold", reduce: "pill-sell" };
 const SEVERITY_PILL = { high: "pill-high", medium: "pill-medium", low: "pill-low" };
@@ -3512,8 +4431,22 @@ async function loadPaper() {
     const box = $("#paper-summary");
     if (!box) return;
     box.innerHTML = `<p class="muted">Loading…</p>`;
-    try { renderPaper(await api(withMarket("/api/v1/paper"))); }
+    try {
+        try { ADHERENCE_DATA = await api(withMarket("/api/v1/adherence")); } catch { /* mirror is optional */ }
+        renderPaper(await api(withMarket("/api/v1/paper")));
+    }
     catch (e) { box.innerHTML = `<p class="muted">Could not load paper account: ${esc(e.message)}</p>`; }
+}
+
+// Compact discipline line for the Paper tab — paper trades feed the scorecard; the full one is in the Tracker.
+function disciplineMirror() {
+    const sc = ADHERENCE_DATA && ADHERENCE_DATA.scorecard;
+    if (!sc || !sc.n) return "";
+    const p = (v) => `${v >= 0 ? "+" : ""}${fmt(v)}%`;
+    const d = sc.discipline_delta_pct;
+    const msg = d == null ? "" : d < -0.5 ? `<span class="neg">early exits cost ${fmt(Math.abs(d))}%</span>`
+        : d > 0.5 ? `<span class="pos">your calls added ${fmt(d)}%</span>` : "on plan";
+    return `<p class="muted small" style="margin-top:4px;">🎯 Discipline: plan ${p(sc.plan_return_pct)} vs you ${p(sc.your_return_pct)} — ${msg}. <a href="#/trade-ideas">Full scorecard in the Tracker →</a></p>`;
 }
 
 function renderPaper(a) {
@@ -3528,7 +4461,8 @@ function renderPaper(a) {
             ${metricCell("Open", fmt(a.open_count, 0), "", "Open positions.")}
             ${metricCell("Win rate", a.win_rate != null ? fmt(a.win_rate) + "%" : "—", "", `${a.wins || 0}W / ${a.losses || 0}L on closed trades.`)}
         </div>
-        <p class="muted small" style="margin-top:6px;">Start ${_money(a.start_balance)} · deployed ${_money(a.deployed_notional)} · updated ${a.updated_at ? new Date(a.updated_at).toLocaleString() : "—"}</p>`;
+        <p class="muted small" style="margin-top:6px;">Start ${_money(a.start_balance)} · deployed ${_money(a.deployed_notional)} · updated ${a.updated_at ? new Date(a.updated_at).toLocaleString() : "—"}</p>
+        ${disciplineMirror()}`;
 
     const pos = a.open_positions || [];
     $("#paper-positions").innerHTML = pos.length ? `<div class="table-scroll"><table class="lab-table">

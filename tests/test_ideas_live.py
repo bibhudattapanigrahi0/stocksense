@@ -85,3 +85,27 @@ def test_enrich_no_history_skips_dedup(monkeypatch):
     bucket = asyncio.run(runner.enrich_ideas_live(ideas, "IN"))["buckets"]["short"]
     assert [c["ticker"] for c in bucket["candidates"]] == ["A", "B"]
     assert bucket["dedup"]["dropped"] == 0
+
+
+# ── Multi-pillar tiering wired end-to-end through enrich ─────────────
+
+def test_enrich_tags_pillar_tier(monkeypatch):
+    monkeypatch.setattr(runner, "get_quote", lambda tk, market="IN": 101.0)
+    ideas = _ideas()
+    ideas["buckets"]["short"]["candidates"][0]["conviction"] = 2       # technical pillar present
+    out = asyncio.run(runner.enrich_ideas_live(ideas, "IN"))
+    bucket = out["buckets"]["short"]
+    c = bucket["candidates"][0]
+    assert set(c["pillars"]) == set(runner.idea_ranking.PILLAR_NAMES)   # all families reported
+    assert c["pillars"]["technical"] is True                           # conviction ≥ 1
+    assert isinstance(c["pillar_count"], int) and c["tier"] in ("actionable", "watch")
+    assert "actionable_count" in bucket and "watch_count" in bucket
+
+
+def test_enrich_pillar_tiering_disabled_is_noop(monkeypatch):
+    monkeypatch.setattr(runner, "get_quote", lambda tk, market="IN": 101.0)
+    monkeypatch.setattr(runner.settings, "pillar_tiering_enabled", False)
+    ideas = _ideas()
+    ideas["buckets"]["short"]["candidates"][0]["conviction"] = 2
+    c = asyncio.run(runner.enrich_ideas_live(ideas, "IN"))["buckets"]["short"]["candidates"][0]
+    assert "tier" not in c and "pillars" not in c                      # disabled → no tiering fields

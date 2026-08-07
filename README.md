@@ -124,6 +124,9 @@ All stock/analysis/backtest tools take a `market` argument (`IN` | `US` | `METAL
 | `list_backtest_strategies` · `run_backtest` · `get_backtest_status` | The 38-strategy Strategy Lab: catalog, start a run, poll progress |
 | `get_backtest_leaderboard` · `get_backtest_strategy` · `get_backtest_signals` | Ranked metrics; one strategy's detail + BUY/SELL/HOLDING stocks; all current signals |
 | `get_trade_ideas` | Highest-conviction buys grouped into short / medium / long term horizons (≤ 20 each), each with a stop-loss |
+| `get_trade_basket` · `track_trade_basket` | **Today's Basket**: *"just tell me what to buy right now"* — the whole board distilled into a deployable best-of of 3–5 trades, sized as one ¼-Kelly book (weights ≤100%), diversified, regime-scaled, sticky day-to-day; `track_trade_basket` commits + tracks the picks |
+| `deploy_trade_basket` · `run_basket_backtest` · `get_basket_backtest` | Deploy the basket as a **NAV-tracked portfolio** (idempotent, cost-basis-preserving); and **backtest the construction method** — held-basket, monthly-rebalanced, point-in-time → CAGR/Sharpe/maxDD/alpha vs benchmark |
+| `get_hold_basket` · `commit_hold_basket` · `apply_hold_basket` | **My Hold Basket**: a committed, conviction-held, low-churn book — commit once, then it only changes on a **material** event (stop/target hit, thesis broke, or a dramatically-better idea), shown as a reasoned diff you apply |
 | `get_tracked_ideas` | Trade ledger: open positions + past trades (closed on stop/target/expiry) with realized win rate, per-idea P&L, and an idea-book equity curve |
 | `construct_portfolio` · `list_portfolios` · `get_portfolio` · `snapshot_portfolio` · `rebalance_portfolio` · `delete_portfolio` | **Portfolio management**: build a risk-shaped, theme-tilted basket from one or more strategies; save, list, mark-to-market (NAV over time), rebalance |
 | `list_risk_profiles` · `list_portfolio_themes` | Risk presets (conservative/balanced/aggressive) and curated themes (AI, green energy, EV, defense, …) |
@@ -165,10 +168,27 @@ account across devices. Then the workflow tabs:
   [docs/backtesting.md](docs/backtesting.md).
 - **Trade Ideas** — the backtest's current buy signals rolled up into **short / medium /
   long term** horizons, ranked by conviction (how many strategies agree), ≤ 20 candidates
-  each, **every idea with a stop-loss**. Includes an **Idea Tracker** that runs each idea as a
+  each, **every idea with a stop-loss**. At the top, **🧺 Today's Basket** distils the whole
+  ~30-idea board into ONE deployable best-of of **3–5 trades** — *"just tell me what to buy right
+  now"* — sized as a single ¼-Kelly book (per-trade **weights summing to ≤100%**), greedily
+  diversified (no two correlated names), regime-scaled, and **sticky day-to-day** so it's actually
+  holdable. One click to **Track**, **paper-trade**, or **📈 Deploy as a NAV-tracked portfolio** (P&L,
+  rebalance, AI review in the Portfolio tab), plus a **📊 Backtest** of the construction method
+  (held-basket, monthly-rebalanced, point-in-time equity curve vs the benchmark — which found the
+  method beats the S&P at a monthly cadence, +1.9% alpha / Sharpe 1.06). And a **🎯 My Hold Basket** —
+  the committed, conviction-held counterpart to the churny daily view: built for staying power (conviction
+  floor + longer-horizon tilt + wide hysteresis), frozen once committed, and it only asks you to change on
+  a **material** event (a holding hit its stop/target, its thesis broke, or a dramatically-better idea
+  appears) — a small reasoned diff you approve, alerted once. See
+  [docs/curated-basket.md](docs/curated-basket.md). Includes an **Idea Tracker** that runs each idea as a
   trade — closing it on stop / target / expiry into **Past Trades** with a realized return, a
   realized win-rate scoreboard, and a cumulative idea-book equity curve. Click a candidate to
-  deep-dive it in Analyze.
+  deep-dive it in Analyze. A **🚀 Multi-Baggers** sub-tab runs a *fundamentals-first* screen over a
+  broad mid/small-cap universe — high-growth, high-quality, smaller-cap compounders scored on six
+  pillars (growth · quality · balance sheet · valuation · size/runway · ownership) with a bounded
+  technical timing overlay, each card explaining *why it could multi-bag*. **📌 Track** a pick to
+  follow its **bagger multiple** (current ÷ entry, milestones to 10×) + thesis drift over time in the
+  Multi-Bagger Tracker. See [docs/multibaggers.md](docs/multibaggers.md).
 - **Bots** — pick a bot + timeframe. **★ Intraday Trade Ideas** (the default) aggregates the whole
   bidirectional signal-bot family by conviction into ranked **long and short** idea books; the
   **signal bots** (breakout, mean-reversion, ema-trend, vwap-reclaim, multi-timeframe confluence)

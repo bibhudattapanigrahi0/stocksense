@@ -120,6 +120,52 @@ async def test_evaluate_new_idea_for_watched_only(tmp_db, monkeypatch):
     assert [a["ticker"] for a in await run_store.list_alerts("IN") if a["type"] == "new_idea"] == ["WATCHED"]
 
 
+# ── engine: hold-coaching (beyond the normal-dip band) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_evaluate_hold_coach_beyond_band(tmp_db, monkeypatch):
+    monkeypatch.setattr(alerts.market_data, "get_quote", lambda *a, **k: None)
+
+    async def _tracked(market):
+        return {"closed": [], "open": [
+            {"ticker": "DIP", "dd_status": "beyond", "dd_pct": 12.0,
+             "typical_drawdown_pct": 7.0, "deep_drawdown_pct": 10.0},
+            {"ticker": "OK", "dd_status": "within", "dd_pct": 3.0},        # within band → no alert
+        ]}
+
+    monkeypatch.setattr(runner, "tracked_ideas_status", _tracked)
+    monkeypatch.setattr(runner, "horizon_ideas", lambda market=None: None)
+
+    s1 = await alerts.evaluate_market("IN")
+    assert s1["by_type"].get("hold_coach") == 1                            # only DIP (beyond)
+    coach = [a for a in await run_store.list_alerts("IN") if a["type"] == "hold_coach"][0]
+    assert coach["ticker"] == "DIP" and coach["severity"] == "warn"
+    s2 = await alerts.evaluate_market("IN")                                # same day → deduped
+    assert s2["by_type"].get("hold_coach", 0) == 0
+
+
+# ── engine: buy-zone "triggered" nudge for watched tickers ──────────
+
+
+@pytest.mark.asyncio
+async def test_evaluate_idea_triggered_in_buy_zone(tmp_db, monkeypatch):
+    await run_store.add_watch({"ticker": "TRIG", "market": "IN"})
+    monkeypatch.setattr(alerts.market_data, "get_quote", lambda *a, **k: 100.0)   # inside the buy zone
+    monkeypatch.setattr(runner, "tracked_ideas_status", _no_tracked)
+    zone = {"buy_low": 98.0, "buy_high": 102.0, "stop_price": 94.0, "target_price": 118.0}
+    ideas = {"horizons": ["short"], "buckets": {"short": {"candidates": [
+        {"ticker": "TRIG", "is_new": False, "conviction": 3, **zone, "latest_signal_date": "2026-07-30"},
+        {"ticker": "OTHER", "is_new": False, "conviction": 4, **zone},     # not watched → ignored
+    ]}}}
+    monkeypatch.setattr(runner, "horizon_ideas", lambda market=None: ideas)
+
+    s = await alerts.evaluate_market("IN")
+    assert s["by_type"].get("idea_triggered") == 1
+    trig = [a for a in await run_store.list_alerts("IN") if a["type"] == "idea_triggered"]
+    assert [a["ticker"] for a in trig] == ["TRIG"]
+
+
 # ── digest ──────────────────────────────────────────────────────────
 
 

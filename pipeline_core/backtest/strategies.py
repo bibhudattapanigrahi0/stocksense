@@ -412,6 +412,38 @@ def _inst13f_exit(df: pd.DataFrame) -> pd.Series:
     return _fill(trimmed | (c < ind.sma(c, 200)))
 
 
+# ── CFTC COT commercials accumulation (metals only) ─────────────────
+# Reads the weekly COT index that runner.py merges onto the daily frame (column `cot_index`,
+# forward-filled from each report's release date so there's no lookahead). "Follow the commercials":
+# go long when the informed hedgers move into the top of their multi-year net-position range with
+# price trending up. On any other market — or a symbol without COT data — the column is absent and
+# the strategy is simply inert. See pipeline_core/services/cot.py.
+
+def _has_cot(df: pd.DataFrame) -> bool:
+    return "cot_index" in df.columns
+
+
+def _cot_entry(df: pd.DataFrame) -> pd.Series:
+    if not _has_cot(df):
+        return _never(df)
+    c, idx = df["Close"], df["cot_index"]
+    # COT is a CONTRARIAN signal — commercials accumulate into weakness, so their net-long extreme is
+    # a SETUP (in the top quartile of their 3y range), not a same-day trend confirmation. The TRIGGER
+    # is price turning up (reclaiming the 20-DMA) while that setup is active — the informed money is
+    # positioned and price confirms the turn. (Demanding price>50-DMA at the extreme itself fires ~never.)
+    setup = idx >= 75
+    trigger = _crosses_above(c, ind.sma(c, 20))
+    return _fill(setup & trigger)
+
+
+def _cot_exit(df: pd.DataFrame) -> pd.Series:
+    if not _has_cot(df):
+        return _never(df)
+    c, idx = df["Close"], df["cot_index"]
+    # Leave when the commercial edge fades (COT back to mid-range) or the trend breaks (loses 50-DMA).
+    return _fill((idx < 50) | _crosses_below(c, ind.sma(c, 50)))
+
+
 # ── Strategy definitions ───────────────────────────────────────────
 
 STRATEGIES: list[StrategyDef] = [
@@ -809,6 +841,19 @@ STRATEGIES: list[StrategyDef] = [
                     "price loses the 200-DMA. Real filed holdings (quarterly, ~45-day lag), not a proxy.",
         entry=_inst13f_entry,
         exit=_inst13f_exit,
+        min_bars=260,
+    ),
+    StrategyDef(
+        id="cot-commercials-follow",
+        name="COT Commercials Accumulation",
+        category="Accumulation",
+        description="Metals only. Follow the 'smart money' hedgers, who accumulate into weakness: when "
+                    "CFTC COMMERCIALS sit in the top quartile of their 3-year net-position range (COT index "
+                    "≥ 75), buy the confirmation — price reclaiming its 20-DMA; exit when the edge fades "
+                    "(COT < 50) or the trend breaks (loses the 50-DMA). Real weekly CFTC positioning "
+                    "(released Fri for Tue), forward-filled — not a proxy. Inert without COT data.",
+        entry=_cot_entry,
+        exit=_cot_exit,
         min_bars=260,
     ),
 ]

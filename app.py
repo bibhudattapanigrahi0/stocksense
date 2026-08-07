@@ -52,7 +52,7 @@ from pipeline_core.portfolio import (
 from pipeline_core.portfolio import risk as pf_risk
 from pipeline_core.portfolio import themes as pf_themes
 from pipeline_core.portfolio.models import PortfolioBasis, PortfolioSpec, WeightingScheme
-from pipeline_core import alerts, paper
+from pipeline_core import adherence, alerts, paper
 from pipeline_core.services import auth, llm_service, market_data, run_store
 
 logging.basicConfig(level=logging.INFO)
@@ -89,6 +89,15 @@ async def _auto_refresh_loop() -> None:
                         logger.info("Alerts %s: %d new %s", mk, summary["emitted"], summary["by_type"])
                 except Exception as e:
                     logger.warning("Alert evaluation failed for %s: %s", mk, e)
+                # Weekly re-sync of a deployed basket portfolio (the live 'rebalance'): idempotent,
+                # cost-basis-preserving, and a no-op unless one exists and is due.
+                try:
+                    redep = await runner.maybe_redeploy_basket(mk)
+                    if redep and redep.get("deployed"):
+                        logger.info("Basket portfolio re-synced for %s (%s positions)",
+                                    mk, (redep.get("basket") or {}).get("count"))
+                except Exception as e:
+                    logger.warning("Basket re-deploy failed for %s: %s", mk, e)
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -775,7 +784,7 @@ async def backtest_ideas_track(max_per_bucket: int = 10, market: str = Query("IN
     after every backtest run."""
     from pipeline_core.backtest import runner
 
-    return runner.snapshot_current_ideas(max_per_bucket, market)
+    return await runner.snapshot_current_ideas(max_per_bucket, market)
 
 
 @app.delete("/api/v1/backtest/ideas/tracked")
@@ -784,6 +793,225 @@ async def backtest_ideas_untrack(market: str = Query("IN")):
     from pipeline_core.backtest import runner
 
     return runner.clear_tracked(market)
+
+
+class IdeaActionRequest(BaseModel):
+    ticker: str
+    horizon: str
+    market: str = "IN"
+    action: str = "in"           # "in" | "out"
+    price: Optional[float] = None
+
+
+@app.post("/api/v1/backtest/ideas/tracked/action")
+async def backtest_idea_action(req: IdeaActionRequest):
+    """Record what the user actually did on a tracked idea (I'm-in / I'm-out) — the 'you' side of the
+    discipline scorecard. Applies to the most-recent open tracked record for (ticker, horizon, market)."""
+    from pipeline_core.backtest import runner
+
+    return runner.mark_idea_action(req.ticker, req.horizon, req.market, req.action, req.price)
+
+
+@app.get("/api/v1/adherence")
+async def adherence_scorecard(market: str = Query("IN"), user: dict = Depends(current_user)):
+    """Discipline scorecard — 'system vs you': how the user's actual entries/exits (paper trades +
+    explicit I'm-in/out) compare to following each idea's plan to stop/target/expiry."""
+    return await adherence.discipline_scorecard(market, user_id=user["id"])
+
+
+@app.get("/api/v1/backtest/basket")
+async def backtest_basket(max_per_bucket: int = 10, market: str = Query("IN")):
+    """The curated **Today's Basket** for the market — the full 30-idea board distilled into ONE small,
+    deployable best-of (3–5 trades) sized as a single cross-horizon ¼-Kelly book (allocations sum to
+    ≤100%). Balanced/risk-adjusted (expected value × confidence × rank), greedily diversified (no two
+    correlated names; soft sector/horizon spread), regime-scaled in size, and sticky day-to-day
+    (hysteresis) so it's holdable. Also rides along on `/api/v1/backtest/ideas` as `basket`."""
+    from pipeline_core.backtest import runner
+
+    ideas = runner.horizon_ideas(max_per_bucket, market)
+    if ideas is None:
+        return {"enabled": True, "items": [], "market": market,
+                "note": f"No {market} backtest yet — run one in the Strategy Lab first."}
+    ideas = await runner.enrich_ideas_live(ideas, market)
+    return ideas.get("basket") or {"enabled": True, "items": [], "market": market}
+
+
+@app.post("/api/v1/backtest/basket/track")
+async def backtest_basket_track(max_per_bucket: int = 10, market: str = Query("IN")):
+    """Commit the current curated basket as the day's anchor and track its members (idempotent). Tagged
+    `source=basket` in the tracker. Reuses the idea snapshot, so it also advances the hysteresis anchor."""
+    from pipeline_core.backtest import runner
+
+    return await runner.snapshot_current_ideas(max_per_bucket, market)
+
+
+@app.post("/api/v1/backtest/basket/deploy")
+async def backtest_basket_deploy(max_per_bucket: int = 10, market: str = Query("IN")):
+    """Deploy the curated basket as a saved, NAV-tracked **Portfolio** — track it as a unit (NAV curve /
+    P&L / rebalance / AI review, all in the Portfolios tab) rather than as individual ideas. Idempotent
+    and cost-basis-preserving (re-deploying re-syncs the same portfolio, keeping entry prices on holds)."""
+    from pipeline_core.backtest import runner
+
+    return await runner.deploy_basket(market, max_per_bucket=max_per_bucket)
+
+
+@app.post("/api/v1/backtest/basket/backtest/run")
+async def basket_backtest_run(market: str = Query("IN"), years: int = Query(None)):
+    """Backtest the basket CONSTRUCTION method — a held-basket, weekly-rebalanced historical sim with
+    anti-lookahead → equity curve + CAGR/Sharpe/maxDD/alpha vs benchmark. Background job; 409 if one is
+    already running."""
+    from pipeline_core.backtest import basket_backtest as bb
+
+    if bb.job_state["running"]:
+        raise HTTPException(status_code=409, detail="A basket backtest is already running")
+
+    async def _job() -> None:
+        try:
+            await bb.run_basket_backtest(market, years)
+        except Exception as e:
+            logger.error(f"Basket backtest job failed: {e}")
+
+    asyncio.create_task(_job())
+    return {"status": "started", "market": market}
+
+
+@app.get("/api/v1/backtest/basket/backtest/status")
+async def basket_backtest_status():
+    """Progress of the running/last basket backtest job."""
+    from pipeline_core.backtest import basket_backtest as bb
+
+    return bb.status()
+
+
+@app.get("/api/v1/backtest/basket/backtest")
+async def basket_backtest_result(market: str = Query("IN")):
+    """The last basket-method backtest result for the market (equity curve + metrics). Empty until run."""
+    from pipeline_core.backtest import basket_backtest as bb
+
+    return bb.load_result(market) or {"ran": False, "market": market,
+                                      "note": f"No basket backtest for {market} yet — run one."}
+
+
+# ── My Hold Basket (committed, conviction-held book with material-change rebalance) ────
+
+
+@app.get("/api/v1/backtest/hold-basket")
+async def hold_basket_get(market: str = Query("IN")):
+    """The committed **Hold Basket**: its live holdings + P&L + the (usually empty) MATERIAL rebalance plan
+    (EXIT on stop/target/thesis-break, ADD only for a dramatically-better idea). If nothing is committed
+    yet, returns a `preview` of today's hold-worthy picks to commit."""
+    from pipeline_core.backtest import runner
+
+    return await runner.hold_basket_status(market)
+
+
+@app.post("/api/v1/backtest/hold-basket/commit")
+async def hold_basket_commit(market: str = Query("IN")):
+    """Commit today's hold basket as your book — persisted (entry prices + cost basis) and deployed as a
+    NAV-tracked portfolio. It then stays put until you apply a material change."""
+    from pipeline_core.backtest import runner
+
+    return await runner.commit_hold_basket(market)
+
+
+@app.post("/api/v1/backtest/hold-basket/apply")
+async def hold_basket_apply(market: str = Query("IN")):
+    """Apply the reviewed material rebalance (held − exits + material adds), keeping cost-basis on
+    survivors, and re-deploy. No-op when there's nothing material to change."""
+    from pipeline_core.backtest import runner
+
+    return await runner.apply_hold_rebalance(market)
+
+
+@app.delete("/api/v1/backtest/hold-basket")
+async def hold_basket_uncommit(market: str = Query("IN")):
+    """Forget the committed hold basket (the NAV-tracked portfolio is left intact)."""
+    from pipeline_core.backtest import runner
+
+    return runner.uncommit_hold_basket(market)
+
+
+# ── Multi-bagger screen (fundamentals-first long-horizon ideas) ────
+
+
+@app.get("/api/v1/backtest/multibaggers")
+async def get_multibaggers(market: str = Query("IN"), top_n: int = Query(20)):
+    """The market's ranked multi-bagger candidates — a fundamentals-first screen for high-growth,
+    high-quality, smaller-cap compounders. Loads the last persisted screen instantly; if none exists
+    yet it computes one inline. Equity markets only (others return an empty, note-bearing payload)."""
+    from pipeline_core import multibagger
+
+    cached = multibagger.load_latest_multibaggers(market)
+    if cached is not None:
+        cached["candidates"] = cached.get("candidates", [])[:top_n]
+        cached["count"] = len(cached["candidates"])
+        return cached
+    return await multibagger.screen_multibaggers(market, top_n)
+
+
+@app.post("/api/v1/backtest/multibaggers/refresh")
+async def refresh_multibaggers(market: str = Query("IN"), top_n: int = Query(20)):
+    """Recompute the market's multi-bagger screen in the background (poll `.../multibaggers/status`
+    for progress). 409 if a screen is already running; gated to equity markets."""
+    from pipeline_core import multibagger
+    from pipeline_core.markets import get_market
+
+    if not get_market(market).has_fundamentals:
+        raise HTTPException(status_code=400, detail="Multi-bagger screening is for equity markets only")
+    if multibagger.job_state["running"]:
+        raise HTTPException(status_code=409, detail="A multi-bagger screen is already running")
+
+    async def _job() -> None:
+        try:
+            await multibagger.screen_multibaggers(market, top_n)
+        except Exception as e:
+            logger.error(f"Multi-bagger screen failed: {e}")
+
+    asyncio.create_task(_job())
+    return {"status": "started", "market": market}
+
+
+@app.get("/api/v1/backtest/multibaggers/status")
+async def multibaggers_status(market: str = Query("IN")):
+    """Current/last multi-bagger screen job state + when the persisted screen was last run."""
+    from pipeline_core import multibagger
+
+    latest = multibagger.load_latest_multibaggers(market)
+    return {
+        "job": multibagger.job_state,
+        "market": market,
+        "last_run_at": latest.get("run_at") if latest else None,
+        "universe": latest.get("universe") if latest else None,
+        "count": latest.get("count") if latest else None,
+    }
+
+
+@app.post("/api/v1/backtest/multibaggers/track")
+async def track_multibaggers(market: str = Query("IN"), ticker: Optional[str] = Query(None),
+                             top_n: Optional[int] = Query(None)):
+    """Track multi-bagger candidate(s) so their bagger multiple can be followed over time. `ticker`
+    given → track just that one; else track the current top `top_n` from the persisted screen.
+    Idempotent per ticker+market."""
+    from pipeline_core import multibagger
+
+    return multibagger.track_multibaggers(market, ticker, top_n)
+
+
+@app.get("/api/v1/backtest/multibaggers/tracked")
+async def tracked_multibaggers(market: str = Query("IN")):
+    """Live status of tracked multi-baggers — each re-priced to a bagger multiple + return-since-entry
+    + milestone + thesis drift, plus a basket scoreboard and unrealised equity curve."""
+    from pipeline_core import multibagger
+
+    return await multibagger.tracked_multibaggers_status(market)
+
+
+@app.delete("/api/v1/backtest/multibaggers/tracked")
+async def untrack_multibaggers(market: str = Query("IN"), ticker: Optional[str] = Query(None)):
+    """Stop tracking one multi-bagger (ticker) or reset the market's whole tracked set."""
+    from pipeline_core import multibagger
+
+    return multibagger.untrack_multibaggers(market, ticker)
 
 
 # ── AI analyst (advisory LLM layer, rules-only fallback) ───────────
@@ -1004,11 +1232,11 @@ async def bots_list():
 
 @app.get("/api/v1/bots/ideas")
 async def bot_intraday_ideas(
-    timeframe: str = Query("15m"),
+    timeframe: str = Query("4h"),
     universe: str = Query("Top 50"),
     limit: int = Query(20, ge=1, le=50),
     min_conviction: int = Query(1, ge=1, le=5),
-    strict: bool = Query(False),
+    strict: bool = Query(True),
     top_k: int = Query(5, ge=1, le=20),
     min_score: float = Query(0.0, ge=0.0, le=1.0),
     sentiment: bool = Query(True),

@@ -226,3 +226,63 @@ async def test_gemini_preserves_explicit_model(monkeypatch):
 
     await llm_service.llm_complete("x")
     assert captured["model"] == "gemini-2.5-flash"  # explicit Gemini model kept
+
+
+# ── Circuit breaker ──────────────────────────────────────────────────
+
+
+async def test_breaker_trips_on_quota_and_short_circuits(monkeypatch):
+    """A quota/429 error trips the breaker immediately; further calls short-circuit to the
+    rules-only fallback instead of each repeating the slow, doomed provider round-trip."""
+    monkeypatch.setattr(llm_service.settings, "llm_provider", "gemini")
+    monkeypatch.setattr(llm_service.settings, "gemini_api_key", "AIza-test")
+    calls = {"n": 0}
+
+    async def quota_boom(*a, **k):
+        calls["n"] += 1
+        raise RuntimeError("Error code: 429 - RESOURCE_EXHAUSTED quota exceeded")
+
+    monkeypatch.setattr(llm_service, "_dispatch", quota_boom)
+    for _ in range(5):
+        with pytest.raises(Exception):
+            await llm_service.llm_complete("hi")
+    assert calls["n"] == 1                 # first call trips; the other four never reach the provider
+    assert llm_service._breaker_open()
+
+
+async def test_breaker_needs_threshold_for_generic_errors(monkeypatch):
+    """A non-quota (transient) error only trips after `llm_breaker_threshold` consecutive fails —
+    a single network blip shouldn't disable the provider."""
+    monkeypatch.setattr(llm_service.settings, "llm_provider", "gemini")
+    monkeypatch.setattr(llm_service.settings, "gemini_api_key", "AIza-test")
+    monkeypatch.setattr(llm_service.settings, "llm_breaker_threshold", 3)
+    calls = {"n": 0}
+
+    async def flaky(*a, **k):
+        calls["n"] += 1
+        raise RuntimeError("temporary network blip")
+
+    monkeypatch.setattr(llm_service, "_dispatch", flaky)
+    for _ in range(6):
+        with pytest.raises(Exception):
+            await llm_service.llm_complete("hi")
+    assert calls["n"] == 3 and llm_service._breaker_open()   # 3 real attempts, then open
+
+
+async def test_breaker_resets_on_success(monkeypatch):
+    monkeypatch.setattr(llm_service.settings, "llm_provider", "gemini")
+    monkeypatch.setattr(llm_service.settings, "gemini_api_key", "AIza-test")
+    monkeypatch.setattr(llm_service.settings, "llm_breaker_threshold", 3)
+    state = {"fail": True}
+
+    async def sometimes(*a, **k):
+        if state["fail"]:
+            raise RuntimeError("blip")
+        return "ok"
+
+    monkeypatch.setattr(llm_service, "_dispatch", sometimes)
+    with pytest.raises(Exception):
+        await llm_service.llm_complete("hi")     # one failure, below threshold → breaker stays closed
+    state["fail"] = False
+    assert await llm_service.llm_complete("hi") == "ok"
+    assert llm_service._breaker["fails"] == 0    # a healthy response resets the failure counter

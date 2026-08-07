@@ -78,10 +78,11 @@ def _spark(df, points: int = 32) -> list:
         return []
 
 
-def _edge_weight(bot_name: str, tf: str, regime: str, edge: Optional[dict]) -> tuple[float, Optional[float]]:
-    """(weight, measured win-rate) for a bot's vote. Weight maps measured expectancy → 0..3
-    (≤0 expectancy contributes ~nothing); neutral 1.0 when there's no measured edge yet."""
-    st = bt.edge_for(bot_name, tf, regime, edge=edge) if edge else None
+def _edge_weight(bot_name: str, tf: str, regime: str, side: str, edge: Optional[dict]) -> tuple[float, Optional[float]]:
+    """(weight, measured win-rate) for a bot's vote on THIS side. Weight maps the side-specific
+    measured expectancy → 0..3 (≤0 expectancy contributes ~nothing); neutral 1.0 when there's no
+    measured edge yet."""
+    st = bt.edge_for(bot_name, tf, regime, side=side, edge=edge) if edge else None
     if not st or not st.get("enough"):
         return 1.0, None
     exp = st.get("expectancy_pct", 0.0) or 0.0
@@ -124,11 +125,11 @@ def _idea(ticker: str, side: str, sigs: list[dict], tf: str, regime: str, edge: 
     bots = [s["bot"] for s in sigs]
     weights, win_rates, exps, trade_counts = [], [], [], []
     for s in sigs:
-        w, wr = _edge_weight(s["bot"], tf, regime, edge)
+        w, wr = _edge_weight(s["bot"], tf, regime, side, edge)
         weights.append(w)
         if wr is not None:
             win_rates.append(wr)
-        st = bt.edge_for(s["bot"], tf, regime, edge=edge) if edge else None
+        st = bt.edge_for(s["bot"], tf, regime, side=side, edge=edge) if edge else None
         if st and st.get("enough"):
             exps.append(st.get("expectancy_pct", 0.0) or 0.0)
             trade_counts.append(int(st.get("trades", 0) or 0))
@@ -213,6 +214,12 @@ async def _build_shortlist(longs: list[dict], shorts: list[dict],
     sentiment (see selection.py). Candidates are COPIES, so the long/short books stay untouched."""
     pool = settings.ideas_candidate_pool
     candidates = [dict(i) for i in longs[:pool]] + [dict(i) for i in shorts[:pool]]
+    # Honesty floor: never shortlist a *measured loser*. When the side-specific edge is known and
+    # ≤ 0, the idea has no business in the curated best-of — drop it so the shortlist stands aside
+    # rather than ranking the least-bad negative-edge trade. (Unmeasured ideas — quality=None — are
+    # kept and judged by the composite as before. Under the default strict gate these are already
+    # filtered upstream; this also protects the non-strict path.)
+    candidates = [c for c in candidates if not (c.get("quality") is not None and c["quality"] <= 0)]
     if not candidates:
         return {"shortlist": [], "fear_greed": None,
                 "diagnostics": {"considered": 0, "kept": 0, "cut": 0, "top_k": top_k,
@@ -241,12 +248,12 @@ async def _build_shortlist(longs: list[dict], shorts: list[dict],
 
 
 async def intraday_ideas(
-    timeframe: str = "15m",
+    timeframe: str = "4h",
     universe: str = "Top 50",
     bars: int = 300,
     limit: int = 20,
     min_conviction: int = 1,
-    strict: bool = False,
+    strict: bool = True,
     top_k: Optional[int] = None,
     min_score: Optional[float] = None,
     sentiment: bool = True,

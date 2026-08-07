@@ -76,19 +76,33 @@ def fear_greed() -> dict:
         return dict(_NEUTRAL)
 
 
+_coin_news_cache = diskcache.Cache(str(CACHE_DIR / "crypto_news_sentiment"))
+
+
 async def coin_news(ticker: str, name: Optional[str] = None) -> dict:
     """Per-coin news sentiment for the crypto market — a thin async wrapper over the existing
     news-sentiment agent, so idea curation has a **single sentiment entrypoint** (this module).
     Returns the agent's ``{score 0-100, consensus, summary, method, ...}``; degrades to a neutral
-    50 on any failure. Routed here so the hermetic test fixture can stub one place.
+    50 on any failure. **Result-cached ~1h** (like ``news_sentiment`` below), because the intraday
+    idea board re-scores the same candidate coins on every load — without this, each request re-hits
+    the LLM for up to a dozen coins (and, when the provider is down, eats a per-coin retry). Routed
+    here so the hermetic test fixture can stub one place.
     """
     from pipeline_core.agents.sentiment import analyze_ticker_sentiment  # lazy: avoid import cycle
 
+    ck = f"coin_news:{ticker.upper()}"
+    hit = _coin_news_cache.get(ck)
+    if hit is not None:
+        return dict(hit)
+
     try:
-        return await analyze_ticker_sentiment(ticker, name, market="CRYPTO")
+        result = await analyze_ticker_sentiment(ticker, name, market="CRYPTO")
     except Exception as e:
         logger.warning(f"coin news sentiment failed for {ticker}, neutral: {e}")
-        return {"score": 50.0, "consensus": "Neutral", "summary": "", "method": "unavailable"}
+        result = {"score": 50.0, "consensus": "Neutral", "summary": "", "method": "unavailable"}
+    if result.get("method") != "unavailable":       # don't cache a transient failure
+        _coin_news_cache.set(ck, result, expire=settings.cache_ttl_news)
+    return dict(result)
 
 
 _news_result_cache = diskcache.Cache(str(CACHE_DIR / "news_sentiment"))

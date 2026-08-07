@@ -127,3 +127,153 @@ def composite_multiplier(factors: dict, weights: Optional[dict] = None) -> float
 def apply(base_score: float, factors: dict, weights: Optional[dict] = None) -> float:
     """`base_score` (conviction × regime tilt) scaled by the composite factor multiplier."""
     return base_score * composite_multiplier(factors, weights)
+
+
+# ── Multi-pillar confluence (breadth across independent signal families) ──
+# Conviction measures DEPTH within one family (how many technical strategies agree in a horizon). This
+# measures BREADTH: how many *independent* families confirm the idea — the technical setup itself plus
+# fundamental quality, institutional accumulation, a regime tailwind, bullish news, and sector leadership.
+# Ideas clearing enough pillars are "actionable" (a small, high-conviction set); the rest are a watchlist.
+# Pure — reads only fields `enrich_ideas_live` already attached, so it's network-free and unit-testable.
+
+PILLAR_NAMES = ("technical", "quality", "smart_money", "regime", "sentiment", "sector")
+QUALITY_PILLAR_MIN = 55.0     # quality_score (0–100, 50 neutral) ≥ this ⇒ a supporting quality pillar
+NEWS_PILLAR_MIN = 55.0        # news_score (0–100, 50 neutral) ≥ this ⇒ a supporting sentiment pillar
+
+
+def _smart_money_supportive(sig: Optional[dict]) -> Optional[bool]:
+    """True when the smart money is ACCUMULATING — the market-agnostic read on the normalized
+    smart-money signal (services/smart_money.py): 13F QoQ additions (US), COT commercials
+    net-long (metals), exchange outflows / whale accumulation (crypto), bulk-deal buys (IN).
+    False when it's measurably distributing; None when it can't be judged — e.g. a yfinance
+    ownership *level* with no delta, or no signal at all. Only genuine accumulation supports the pillar."""
+    if not sig:
+        return None
+    direction = sig.get("direction")
+    if direction is not None:
+        return direction == "accumulate"
+    # Back-compat: a raw ownership dict (no normalized direction) → judge by the QoQ delta.
+    qoq = sig.get("net_delta_pct", sig.get("qoq_change_pct"))
+    return float(qoq) > 0 if qoq is not None else None
+
+
+def idea_pillars(c: dict) -> dict:
+    """Which independent families support this idea: True (supports), False (measured, doesn't), or None
+    (not available this market). Pure function of numbers the candidate already carries post-enrichment."""
+    qs = c.get("quality_score")
+    ns = c.get("news_score")
+    rs = c.get("sector_rs")
+    rf = c.get("regime_fit")
+    return {
+        "technical": (c.get("eligible_conviction", c.get("conviction", 0)) or 0) >= 1,
+        "quality": (qs >= QUALITY_PILLAR_MIN) if qs is not None else None,
+        "smart_money": _smart_money_supportive(c.get("smart_money") or c.get("inst_ownership")),
+        "regime": (rf == "tailwind") if rf is not None else None,
+        "sentiment": (ns >= NEWS_PILLAR_MIN) if ns is not None else None,
+        "sector": (rs > 0) if rs is not None else None,
+    }
+
+
+def pillar_summary(c: dict, available: Optional[int] = None) -> dict:
+    """`idea_pillars` plus the count of supporting families and how many were available to confirm.
+    `available` (families switched on for this market, from the caller) defaults to the number of
+    non-None readings on this idea when not supplied (standalone/testing use)."""
+    p = idea_pillars(c)
+    supporting = [k for k, v in p.items() if v is True]
+    avail = available if available is not None else sum(1 for v in p.values() if v is not None)
+    return {"pillars": p, "supporting": supporting, "count": len(supporting), "available": avail}
+
+
+def pillar_tier(count: int, available: int, min_actionable: Optional[int] = None) -> str:
+    """'actionable' when an idea clears the confluence bar, else 'watch'. The bar is clamped to the
+    families actually available this market — min(min_actionable, available) — so thin-pillar markets
+    (e.g. crypto in a neutral tide: only the technical family) still surface actionable ideas rather
+    than filing everything under watch."""
+    thr = settings.pillar_min_actionable if min_actionable is None else min_actionable
+    thr = max(1, min(thr, available or 1))
+    return "actionable" if count >= thr else "watch"
+
+
+def pillar_disclosure() -> dict:
+    """The confluence config, surfaced in the ideas payload so the UI can explain the Actionable/Watchlist
+    split (mirrors `rank_weights` for the composite banner)."""
+    return {
+        "enabled": settings.pillar_tiering_enabled,
+        "min_actionable": settings.pillar_min_actionable,
+        "names": list(PILLAR_NAMES),
+        "quality_min": QUALITY_PILLAR_MIN, "news_min": NEWS_PILLAR_MIN,
+    }
+
+
+# ── Realized-lift attribution (does each factor actually earn its weight?) ──
+# The soft factors above re-rank the board, but until now nothing measured whether they *help*. Each
+# tracked idea records the factor values it was generated with; once it closes it also carries a
+# realized return. This splits the closed ledger by each factor's sign at entry and compares realized
+# win-rates — turning "we added news sentiment" into "news added +N pp" (or "−0, drop it").
+
+_ATTRIB_EPS = 0.05      # |factor| must exceed this to count as supportive/adverse (ignore ~neutral)
+
+
+def _cohort_stats(returns: list) -> dict:
+    """Win-rate + average realized return (%) over a list of realized returns. A flat (==0) trade is
+    counted in the sample and the average but is neither a win nor a loss for the rate."""
+    wins = sum(1 for r in returns if r > 0)
+    losses = sum(1 for r in returns if r < 0)
+    decided = wins + losses
+    return {
+        "n": len(returns),
+        "win_rate": round(wins / decided * 100, 1) if decided else None,
+        "avg_return": round(sum(returns) / len(returns), 2) if returns else None,
+    }
+
+
+def _lift(sup: dict, adv: dict, min_samples: int) -> Optional[float]:
+    """Supportive − adverse win-rate (pp), only when BOTH cohorts have the evidence to compare."""
+    if sup["n"] < min_samples or adv["n"] < min_samples:
+        return None
+    if sup["win_rate"] is None or adv["win_rate"] is None:
+        return None
+    return round(sup["win_rate"] - adv["win_rate"], 1)
+
+
+def factor_attribution(closed: list, *, min_samples: Optional[int] = None,
+                       eps: float = _ATTRIB_EPS) -> dict:
+    """Realized win-rate lift per soft factor, measured over CLOSED tracked ideas.
+
+    For each of the four signed factors we split the closed set into a SUPPORTIVE cohort (factor
+    > +eps at entry) and an ADVERSE cohort (< −eps) and report
+    ``lift = supportive_win_rate − adverse_win_rate`` (pp) — positive ⇒ the factor pointed the right
+    way. Regime is attributed by its tailwind/headwind label. A lift is reported only when BOTH
+    cohorts reach ``min_samples`` (the closed set splits several ways, so we refuse to over-read a
+    handful of trades); otherwise ``lift=None`` with ``status="insufficient"``.
+
+    Pure — reads only fields already on the ledger (``factors`` + ``realized_return_pct``). Ideas
+    tracked before attribution existed have no ``factors`` block and are absent from every cohort."""
+    thr = settings.attribution_min_samples if min_samples is None else min_samples
+    withf = [c for c in closed
+             if c.get("factors") and c.get("realized_return_pct") is not None]
+    baseline = _cohort_stats([c["realized_return_pct"] for c in withf])
+
+    factors: dict[str, dict] = {}
+    for name in FACTOR_NAMES:                                  # earnings / news / sector / quality
+        sup, adv = [], []
+        for c in withf:
+            f = c["factors"].get(name)
+            if f is None:
+                continue
+            (sup if f > eps else adv if f < -eps else []).append(c["realized_return_pct"])
+        s, a = _cohort_stats(sup), _cohort_stats(adv)
+        lift = _lift(s, a, thr)
+        factors[name] = {"supportive": s, "adverse": a, "lift": lift,
+                         "status": "ok" if lift is not None else "insufficient"}
+
+    # Regime fit is a label, not a signed number — attribute tailwind vs headwind directly.
+    rs = _cohort_stats([c["realized_return_pct"] for c in withf
+                        if c["factors"].get("regime_fit") == "tailwind"])
+    ra = _cohort_stats([c["realized_return_pct"] for c in withf
+                        if c["factors"].get("regime_fit") == "headwind"])
+    r_lift = _lift(rs, ra, thr)
+    factors["regime"] = {"supportive": rs, "adverse": ra, "lift": r_lift,
+                         "status": "ok" if r_lift is not None else "insufficient"}
+
+    return {"sample": len(withf), "baseline": baseline, "factors": factors, "min_samples": thr}

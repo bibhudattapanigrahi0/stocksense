@@ -532,9 +532,13 @@ details.filter-detail summary:hover { color: var(--text); }
     font-family: var(--mono); font-size: 11px; font-weight: 700;
 }
 .idea-main { flex: 1; min-width: 0; }
-.idea-top { display: flex; align-items: baseline; gap: 8px; }
+/* Wrap the badge line: ticker + up to ~9 status/price chips must never overflow the
+   narrow column (parent .ideas-col clips with overflow:hidden). The price group
+   (now · R:R · 13F) still right-aligns via .idea-now's auto margin, on whatever line
+   it lands. Tighter row-gap keeps wrapped lines compact. */
+.idea-top { display: flex; align-items: baseline; flex-wrap: wrap; gap: 5px 8px; min-width: 0; }
 .idea-ticker { font-size: 14px; }
-.idea-now { margin-left: auto; color: var(--text-dim); }
+.idea-now { margin-left: auto; color: var(--text-dim); white-space: nowrap; }
 .idea-rr {
     font-size: 10.5px; padding: 1px 6px; border-radius: 5px;
     border: 1px solid var(--border); background: var(--bg-3); color: var(--text-dim);
@@ -582,6 +586,41 @@ details.filter-detail summary:hover { color: var(--text); }
     border: 1px solid var(--brand-2); background: var(--bg-3); color: var(--brand-2);
     cursor: help; font-weight: 600;
 }
+
+/* Multi-pillar confluence chip (★N) — how many INDEPENDENT families confirm an idea. Actionable
+   ideas (clear the bar) get a positive-tinted chip; watchlist ideas a muted one. */
+.pillar-chip {
+    align-self: center; font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 5px;
+    white-space: nowrap; cursor: help; border: 1px solid var(--border);
+}
+.pillar-actionable { color: var(--pos); border-color: var(--pos); background: var(--pos-tint); }
+.pillar-watch { color: var(--text-dim); background: var(--bg-3); }
+
+/* "Normal drawdown" hold-through line on an idea card — the typical dip a winning trade sat through */
+.idea-dd {
+    margin-top: 5px; font-size: 10.5px; color: var(--text-dim); cursor: help;
+    display: inline-flex; align-items: center; gap: 4px;
+}
+
+/* Per-column watchlist disclosure — the lower-confluence tail, collapsed by default */
+.ideas-watchlist { margin-top: 8px; border-top: 1px dashed var(--border); padding-top: 6px; }
+.ideas-watchlist > summary {
+    cursor: pointer; list-style: none; color: var(--text-dim);
+    display: inline-flex; align-items: center; gap: 4px; user-select: none;
+}
+.ideas-watchlist > summary::-webkit-details-marker { display: none; }
+.ideas-watchlist > summary::before { content: "▸"; font-size: 9px; }
+.ideas-watchlist[open] > summary::before { content: "▾"; }
+.ideas-watchlist[open] > summary { margin-bottom: 6px; }
+.ideas-watchlist .idea-row { opacity: 0.82; }
+
+/* Tracker "normal drawdown" band badge — within (reassuring) vs beyond (early warning) */
+.dd-badge {
+    font-size: 9.5px; font-weight: 600; padding: 0 5px; border-radius: 4px;
+    white-space: nowrap; cursor: help; border: 1px solid var(--border);
+}
+.dd-within { color: var(--text-dim); background: var(--bg-3); }
+.dd-beyond { color: var(--neg); border-color: var(--neg); background: var(--neg-tint); }
 
 /* Live-price zone status */
 .zone-pill {
@@ -632,6 +671,80 @@ details.filter-detail summary:hover { color: var(--text); }
 .score-chip-lbl { font-size: 10.5px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.03em; }
 .trk-table .pill { text-transform: capitalize; }
 .trk-row { cursor: pointer; }
+
+/* Factor scorecard — realized win-rate lift per soft factor (does each earn its weight?) */
+.factor-card {
+    margin-top: 12px; padding: 10px 12px; border: 1px solid var(--border);
+    border-radius: var(--r-m); background: var(--bg-3);
+}
+.factor-card > summary { cursor: pointer; list-style: none; }
+.factor-card > summary::-webkit-details-marker { display: none; }
+.factor-table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12.5px; }
+.factor-table th, .factor-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+.factor-table th { font-size: 10.5px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.03em; }
+.factor-table td:first-child { white-space: nowrap; }
+.factor-table tr:last-child td { border-bottom: none; }
+
+/* Discipline scorecard ("system vs you") — plan book vs your book + the cost/saved of early exits */
+.disc-card {
+    margin-top: 12px; padding: 10px 12px; border: 1px solid var(--border);
+    border-radius: var(--r-m); background: var(--bg-3);
+}
+.disc-head { font-size: 13px; }
+/* I'm-in / I'm-out capture buttons in the tracker "You" column */
+.disc-btn {
+    font-size: 10.5px; font-weight: 600; padding: 2px 8px; border-radius: 5px; cursor: pointer;
+    white-space: nowrap; border: 1px solid var(--border); background: var(--bg-2); color: var(--text);
+}
+.disc-in { border-color: var(--pos); color: var(--pos); }
+.disc-out { border-color: var(--warn); color: var(--warn); }
+.disc-btn:hover { background: var(--bg-3); }
+.disc-btn:disabled { opacity: 0.5; cursor: default; }
+.disc-done { font-size: 10.5px; color: var(--pos); white-space: nowrap; cursor: help; }
+
+/* ── Multi-bagger screen (fundamentals-first sub-tab of Trade Ideas) ── */
+.ideas-seg { margin-bottom: 16px; }
+.mb-grid {
+    display: grid; gap: 14px;
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+}
+.mb-card { padding: 14px 16px; cursor: pointer; transition: border-color var(--tr), transform var(--tr); }
+.mb-card:hover { border-color: var(--brand-2); transform: translateY(-1px); }
+.mb-head { display: flex; align-items: flex-start; gap: 10px; }
+.mb-rank {
+    flex: none; font-size: 12px; font-weight: 800; color: var(--text-dim);
+    min-width: 30px; padding-top: 2px;
+}
+.mb-title { flex: 1; min-width: 0; }
+.mb-ticker { font-size: 15px; font-weight: 700; }
+.mb-name { margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mb-score {
+    flex: none; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    width: 52px; height: 52px; border-radius: 50%; border: 3px solid var(--brand-2);
+}
+.mb-score-num { font-size: 19px; font-weight: 800; line-height: 1; }
+.mb-score-cap { font-size: 8.5px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dim); margin-top: 2px; }
+.mb-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.mb-meters { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 14px; margin-top: 12px; }
+.mb-meter { display: flex; align-items: center; gap: 7px; }
+.mb-meter-label { flex: none; width: 74px; font-size: 10.5px; color: var(--text-dim); }
+.mb-meter-track { flex: 1; height: 6px; border-radius: 999px; background: var(--bg-3); overflow: hidden; }
+.mb-meter-fill { display: block; height: 100%; border-radius: 999px; transition: width var(--tr); }
+.mb-meter-val { flex: none; width: 20px; text-align: right; font-size: 10.5px; color: var(--text-dim); }
+.mb-why { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+.mb-reasons { list-style: none; display: flex; flex-direction: column; gap: 3px; }
+.mb-reasons li { font-size: 12px; line-height: 1.4; }
+.mb-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.mb-card .idea-ai-panel { padding: 12px 0 0; }
+/* Track button on a card — mirrors the ghost paper/AI buttons. */
+.mb-track-btn {
+    font-size: 10px; padding: 2px 7px; border-radius: 6px; cursor: pointer; white-space: nowrap;
+    border: 1px solid var(--brand); background: transparent; color: var(--brand); transition: background 0.12s;
+}
+.mb-track-btn:hover { background: var(--brand-tint, var(--bg-3)); }
+.mb-track-btn:disabled { opacity: 0.6; cursor: default; }
+/* Bagger-milestone pill in the tracker table. */
+.pill.mb-mult { font-size: 9.5px; padding: 1px 6px; margin-left: 4px; vertical-align: middle; }
 
 /* ── AI analyst layer (advisory) ──────────────────────────────────── */
 .idea-wrap { border-bottom: 1px solid var(--border); }
@@ -962,3 +1075,61 @@ svg.spark { display: block; border: 1px solid var(--border); border-radius: 6px;
     .idea-row, .file-item, .hist-row { min-height: 44px; }
     .tab { padding-top: 13px; padding-bottom: 13px; }
 }
+
+/* ── Today's Basket — the curated cross-horizon best-of (hero card atop Trade Ideas). ──
+   Brand (indigo/cyan) chrome marks it as the recommended action; green/red stay reserved for
+   return/P&L only (a coloured number = money). The allocation WEIGHT is brand, not green. */
+.basket-card {
+    border: 1px solid var(--brand);
+    box-shadow: 0 3px 18px var(--brand-tint);
+    background: linear-gradient(180deg, var(--brand-tint), transparent 130px), var(--bg-2);
+    margin-bottom: 16px;
+}
+.basket-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+.basket-title h3 { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 3px; font-size: 16px; }
+.basket-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.basket-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 14px 0; }
+.bstat {
+    background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--r-m);
+    padding: 10px 12px; text-align: center;
+}
+.bstat-val { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.bstat-val.pos { color: var(--pos); }
+.bstat-val.neg { color: var(--neg); }
+.bstat-lbl { font-size: 11px; color: var(--text-dim); margin-top: 3px; text-transform: uppercase; letter-spacing: .04em; }
+
+.basket-items { display: flex; flex-direction: column; gap: 8px; }
+.basket-item {
+    display: flex; align-items: center; gap: 12px;
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--r-m);
+    padding: 10px 12px; cursor: pointer; transition: border-color .12s, background .12s;
+}
+.basket-item:hover { border-color: var(--brand); background: var(--brand-tint); }
+.bi-rank { color: var(--text-mute); font-weight: 700; font-size: 13px; width: 15px; text-align: center; flex: none; }
+.bi-alloc { flex: none; width: 66px; text-align: center; border-right: 1px solid var(--border); padding-right: 12px; }
+.bi-alloc-pct { display: block; font-size: 19px; font-weight: 700; color: var(--brand); font-variant-numeric: tabular-nums; }
+.bi-alloc-lbl { display: block; font-size: 10px; color: var(--text-mute); text-transform: uppercase; letter-spacing: .05em; }
+.bi-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.bi-top { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.bi-ticker { font-weight: 700; font-size: 15px; }
+.bi-plan { color: var(--text-dim); }
+.bi-actions { flex: none; }
+.horizon-chip { font-weight: 600; }
+.basket-foot { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); line-height: 1.5; }
+
+@media (max-width: 640px) {
+    .basket-metrics { grid-template-columns: repeat(2, 1fr); }
+    .basket-item { flex-wrap: wrap; }
+    .bi-alloc { border-right: none; }
+}
+
+/* My Hold Basket — committed book + material-change diff. */
+.hb-changes { border-top: 1px solid var(--border); padding-top: 10px; }
+.hb-change { display: flex; align-items: baseline; gap: 7px; padding: 4px 0; flex-wrap: wrap; }
+.hb-act {
+    font-size: 11px; font-weight: 700; letter-spacing: .03em; padding: 1px 7px; border-radius: var(--r-pill);
+    border: 1px solid var(--border); background: var(--bg-3); flex: none;
+}
+.hb-act.pos { color: var(--pos); border-color: color-mix(in srgb, var(--pos) 45%, transparent); }
+.hb-act.neg { color: var(--neg); border-color: color-mix(in srgb, var(--neg) 45%, transparent); }

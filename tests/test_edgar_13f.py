@@ -89,6 +89,7 @@ def test_map_cusips_batches_and_caches(monkeypatch):
 
 def test_build_panel_aggregates_across_managers(monkeypatch):
     monkeypatch.setattr(e, "TRACKED_MANAGERS", {"0000000001": "A", "0000000002": "B"})
+    monkeypatch.setattr(e, "GURU_MANAGERS", {})   # build_panel folds in gurus via tracked_managers()
     monkeypatch.setattr(e, "_filing_list",
                         lambda cik: [{"filed": "2020-05-15", "quarter": "2020-03-31", "accession": f"acc{cik}"}])
     monkeypatch.setattr(e, "_info_table",

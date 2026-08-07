@@ -237,10 +237,60 @@ def get_institutional_ownership(symbol: str, market: str = "IN") -> dict:
     }
 
 
+# ── Equity price providers (yfinance primary, Stooq keyless fallback) ──
+# Stooq market suffixes for its public CSV endpoint. Only markets we can map RELIABLY belong here —
+# Stooq is strongest for US (`aapl.us`); unmapped markets skip the Stooq leg (→ stale-serve instead).
+_STOOQ_SUFFIX = {"US": ".us"}
+
+
+def _yf_history(symbol: str, period: str, interval: str, market: str) -> pd.DataFrame:
+    """yfinance OHLCV for one symbol → a clean frame (NaN-Close rows dropped), or an EMPTY frame when
+    there's nothing usable. Raises on a network/transient error so the fallback chain can retry it."""
+    df = yf.Ticker(normalize_ticker(symbol, market)).history(period=period, interval=interval)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    # yfinance can append a trailing row for the incomplete current session with NaN Close — NaN
+    # prices silently break every downstream comparison (x > NaN is always False), so strip them.
+    return df.dropna(subset=["Close"])
+
+
+def _stooq_symbol(symbol: str, market: str) -> Optional[str]:
+    """Map a symbol to Stooq's ticker format, or None when we have no reliable mapping (→ skip Stooq)."""
+    suffix = _STOOQ_SUFFIX.get(get_market(market).key)
+    return f"{symbol.lower()}{suffix}" if suffix else None
+
+
+def _stooq_history(symbol: str, period: str, market: str) -> pd.DataFrame:
+    """Keyless Stooq daily-EOD fallback via the public CSV endpoint (no dependency, no key). Returns
+    an EMPTY frame when Stooq doesn't cover the symbol/market or on any error — the chain then moves
+    on (or falls to the stale cache). Daily bars only."""
+    sym = _stooq_symbol(symbol, market)
+    if sym is None:
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(f"https://stooq.com/q/d/l/?s={sym}&i=d")
+    except Exception as e:
+        logger.warning(f"Stooq fetch failed for {symbol} ({market}): {e}")
+        return pd.DataFrame()
+    if df is None or df.empty or "Close" not in df or "Date" not in df:
+        return pd.DataFrame()                     # Stooq returns a 1-row "N/D" CSV for unknown symbols
+    df = df.assign(Date=pd.to_datetime(df["Date"], errors="coerce")).dropna(subset=["Date", "Close"])
+    df = df.set_index("Date").sort_index()
+    days = _period_to_days(period)
+    return df.tail(days) if days else df
+
+
 def get_price_history(symbol: str, period: str = "1y", interval: str = "1d", market: str = "IN",
                       force_refresh: bool = False) -> pd.DataFrame:
     """OHLCV price history. Cached 15 minutes. Pass `force_refresh=True` to skip the cache and
-    re-fetch (used by the live mark-to-market quote so gains/losses reflect the latest price)."""
+    re-fetch (used by the live mark-to-market quote so gains/losses reflect the latest price).
+
+    Resilient by design: the equity fetch runs through the shared provider fallback chain
+    (`providers.fetch_with_fallback` — retries + exponential backoff + per-provider health at
+    `/health/providers`) with yfinance primary and a keyless Stooq daily fallback. When *every* live
+    source fails it serves the **last-good cached frame** (kept ~7 days), flagged
+    ``df.attrs['stale']=True``, rather than an empty frame — so one yfinance 429 no longer empties a
+    whole backtest or board. Returns an empty frame only when nothing has ever been fetched."""
     m = get_market(market)
     cache_key = f"price:{m.key}:{symbol}:{period}:{interval}"
     if not force_refresh:
@@ -248,8 +298,8 @@ def get_price_history(symbol: str, period: str = "1y", interval: str = "1d", mar
         if cached is not None:
             return cached
 
-    # Crypto OHLCV comes from Binance (full O/H/L/C/V, broad coverage); fall through
-    # to yfinance for coins Binance doesn't list. Intraday intervals still use yfinance.
+    # Crypto OHLCV comes from Binance/Kraken (full O/H/L/C/V, broad coverage); fall through to the
+    # yfinance leg below for coins Binance doesn't list. Intraday intervals still use yfinance.
     if m.key == "CRYPTO" and interval == "1d":
         from pipeline_core.services import crypto_data
 
@@ -258,24 +308,39 @@ def get_price_history(symbol: str, period: str = "1y", interval: str = "1d", mar
             cache.set(cache_key, cdf, expire=settings.cache_ttl_price)
             return cdf
 
-    try:
-        ticker = yf.Ticker(normalize_ticker(symbol, m.key))
-        df = ticker.history(period=period, interval=interval)
-        if df.empty:
-            logger.warning(f"No price data for {symbol}")
-            return pd.DataFrame()
-        # yfinance can append a trailing row for the incomplete current
-        # session with NaN Close — NaN prices silently break every
-        # downstream comparison (x > NaN is always False).
-        df = df.dropna(subset=["Close"])
-        if df.empty:
-            logger.warning(f"Only NaN price rows for {symbol}")
-            return pd.DataFrame()
+    # Equity/metals (and crypto-not-on-Binance): yfinance → Stooq via the fallback chain.
+    from pipeline_core.services import providers
+
+    chain: list = [("yfinance", lambda: _yf_history(symbol, period, interval, m.key))]
+    if interval == "1d" and settings.equity_fallback_enabled:
+        chain.append(("stooq", lambda: _stooq_history(symbol, period, m.key)))
+    df, source = providers.fetch_with_fallback(
+        chain, validate=lambda d: d is not None and not getattr(d, "empty", True),
+        retries=settings.price_fetch_retries, backoff=0.5,
+    )
+    laststood_key = f"laststood:{cache_key}"
+    if df is not None and not df.empty:
+        try:                                       # metadata for callers/health; harmless if dropped
+            df.attrs["source"], df.attrs["stale"] = source, False
+        except Exception:
+            pass
         cache.set(cache_key, df, expire=settings.cache_ttl_price)
+        cache.set(laststood_key, df, expire=settings.cache_ttl_laststood)   # keep a stale-serve copy
         return df
-    except Exception as e:
-        logger.error(f"Failed to fetch price history for {symbol}: {e}")
-        return pd.DataFrame()
+
+    # Every live source failed — serve the last-good frame (flagged stale) so a transient outage
+    # degrades gracefully instead of emptying the board. Empty only if we've never succeeded.
+    stale = cache.get(laststood_key)
+    if stale is not None and not getattr(stale, "empty", True):
+        stale = stale.copy()
+        try:
+            stale.attrs["source"], stale.attrs["stale"] = "cache", True
+        except Exception:
+            pass
+        logger.warning(f"Serving stale cached history for {symbol} ({market}) — all live sources failed")
+        return stale
+    logger.warning(f"No price data for {symbol} ({market}) and no cached fallback")
+    return pd.DataFrame()
 
 
 def get_quote(symbol: str, market: str = "IN", max_age: Optional[int] = None) -> Optional[float]:

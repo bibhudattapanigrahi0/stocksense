@@ -23,6 +23,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from pipeline_core.config import settings
 from pipeline_core.services import market_data, run_store
 
 logger = logging.getLogger(__name__)
@@ -126,6 +127,22 @@ async def evaluate_market(market: str, *, recent_hours: int = 48, user_id: Optio
                           fingerprint=f"closed|{market}|{c['ticker']}|{c.get('exit_date')}|{reason}",
                           data={"reason": reason, "return_pct": ret}))
 
+    # 2b) Hold-coaching: an open position dropped BEYOND its normal-dip band (winners rarely fell this
+    #     far before recovering) → an anti-panic "review the thesis" nudge. Reuses tracked_ideas_status'
+    #     dd_status (already computed above), so no extra I/O. One alert per ticker per day.
+    if settings.alert_hold_coach_enabled:
+        for o in status.get("open", []):
+            if o.get("dd_status") != "beyond":
+                continue
+            dd, typ = o.get("dd_pct"), o.get("typical_drawdown_pct")
+            tail = f" (−{dd}% vs ~{typ}% typical)" if dd is not None and typ is not None else ""
+            await emit(_alert(market, "hold_coach", f"{o['ticker']} beyond its normal dip",
+                              f"{o['ticker']} is down past where winning trades usually recover{tail} — "
+                              "review the thesis before bailing.",
+                              ticker=o["ticker"], severity="warn",
+                              fingerprint=f"holdcoach|{market}|{o['ticker']}|{_day()}",
+                              data={"dd_pct": dd, "typical": typ, "deep": o.get("deep_drawdown_pct")}))
+
     # 3) Fresh ideas for watchlist tickers only (targeted, not the whole board).
     if watch_tickers:
         try:
@@ -145,6 +162,45 @@ async def evaluate_market(market: str, *, recent_hours: int = 48, user_id: Optio
                                       fingerprint=f"newidea|{market}|{c['ticker']}|{h}|{c.get('latest_signal_date')}",
                                       data={"horizon": h, "conviction": c.get("conviction"),
                                             "risk_pct": c.get("risk_pct"), "alloc_pct": c.get("alloc_pct")}))
+
+            # 3b) A watchlist idea is IN ITS BUY ZONE right now — a "triggered, consider entering" nudge
+            #     (take-the-trade side). Targeted to the watchlist, so at most a few live quotes.
+            if settings.alert_triggered_enabled:
+                for h in ideas.get("horizons", []):
+                    for c in ideas["buckets"][h]["candidates"]:
+                        if c["ticker"] not in watch_tickers:
+                            continue
+                        try:
+                            px = await asyncio.to_thread(market_data.get_quote, c["ticker"], market)
+                        except Exception:
+                            px = None
+                        if px is None or runner._idea_zone(px, c) != "in_zone":
+                            continue
+                        await emit(_alert(market, "idea_triggered", f"{c['ticker']} entered its buy zone",
+                                          f"{c['ticker']} is at {round(px, 2)}, inside its {h}-term buy zone "
+                                          f"(conviction {c.get('conviction')}) — triggered, consider entering.",
+                                          ticker=c["ticker"], severity="info",
+                                          fingerprint=f"triggered|{market}|{c['ticker']}|{h}|{_day()}",
+                                          data={"horizon": h, "price": px, "conviction": c.get("conviction")}))
+
+    # 4) The committed Hold Basket needs a MATERIAL rebalance (a holding broke, or a much-stronger idea
+    #    appeared). One alert per distinct change-set per day (fingerprint) — no re-nagging.
+    if settings.hold_basket_enabled:
+        try:
+            hb = await runner.hold_basket_status(market)
+        except Exception as e:
+            logger.debug("alerts: hold status failed for %s: %s", market, e)
+            hb = None
+        if hb and hb.get("committed") and hb.get("material"):
+            changes = [a for a in hb.get("actions", []) if a["action"] in ("EXIT", "ADD", "BUY")]
+            exits = sorted(a["ticker"] for a in changes if a["action"] == "EXIT")
+            adds = sorted(a["ticker"] for a in changes if a["action"] in ("ADD", "BUY"))
+            body = "; ".join(f"{a['ticker']} — {a['reason']}" for a in changes[:3])
+            await emit(_alert(market, "hold_rebalance",
+                              f"Hold Basket: {len(changes)} change{'s' if len(changes) != 1 else ''} to review",
+                              body + ("." if body else ""), severity="warn",
+                              fingerprint=f"holdreb|{market}|{'+'.join(exits)}/{'+'.join(adds)}|{_day()}",
+                              data={"counts": hb.get("counts"), "actions": changes}))
 
     by_type: dict[str, int] = {}
     for a in emitted:

@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     # Gemini speaks the OpenAI-compatible API — reused via the openai SDK (no extra deps).
     gemini_base_url: str = Field(default="https://generativelanguage.googleapis.com/v1beta/openai/")
     llm_model: str = Field(default="gpt-4o-mini")
+    # Circuit breaker: after a quota/429 (or this many consecutive failures) skip the provider for
+    # the cooldown so per-item fan-outs fall back to rules-only fast instead of retrying a dead API.
+    llm_breaker_cooldown_s: int = 120
+    llm_breaker_threshold: int = 3
+    # Provider-SDK retries per call — 0 so a 429 fails fast into the breaker/lexicon rather than
+    # burning the SDK's internal exponential backoff on every doomed call.
+    llm_max_retries: int = 0
 
     # SEC EDGAR — free historical institutional holdings (13F filings) for US equities.
     # SEC's fair-access policy REQUIRES a descriptive User-Agent with real contact info on
@@ -46,6 +53,24 @@ class Settings(BaseSettings):
     # (the 13F key), free without a key at low volume — a key just raises the rate limit.
     sec_user_agent: str = Field(default="StockSense/1.0 (contact: set sec_user_agent in .env)")
     openfigi_api_key: str = Field(default="")
+
+    # Smart-money / coattail layer — generalizes the 13F ownership signal into a per-market
+    # "follow the smart money" overlay (see pipeline_core/services/smart_money.py): who the proven,
+    # informed money is and whether they're accumulating, used as an extra INDEPENDENT confluence
+    # family (a pillar), a live badge, and a backtestable follow-the-smart-money strategy. Each
+    # source is keyless; fragile/paid ones default OFF and land behind their flag later.
+    smart_money_enabled: bool = True
+    sm_us_gurus_enabled: bool = True        # fold famed gurus into the US 13F basket (edgar_13f.GURU_MANAGERS)
+    sm_metals_cot_enabled: bool = True      # CFTC Commitments of Traders — commercials positioning (Phase 1)
+    sm_crypto_flows_enabled: bool = True    # exchange netflows + Hyperliquid top-trader positioning (Phase 2)
+    sm_in_bulk_deals_enabled: bool = True   # NSE/BSE bulk & block deals + FII/DII flows (Phase 3)
+    sm_in_ace_enabled: bool = False         # fragile: ace-investor shareholding-pattern scrape (Phase 4)
+    sm_crypto_labels_enabled: bool = False  # best-effort/paid: on-chain smart-money wallet labels (Phase 4)
+    # CFTC COT (metals): the commercial net position is normalized to a 0–100 COT index over this
+    # lookback; ≥ high ⇒ commercials heavily net-long (bullish coattail), ≤ low ⇒ net-short (bearish).
+    cot_lookback_weeks: int = 156           # ~3 years of weekly reports for the range normalization
+    cot_index_high: float = 75.0
+    cot_index_low: float = 25.0
 
     # Cache TTL (seconds)
     cache_ttl_price: int = 900            # 15 minutes (history bars — effectively immutable intraday)
@@ -55,6 +80,14 @@ class Settings(BaseSettings):
     cache_ttl_holdings: int = 86400       # 1 day
     cache_ttl_fear_greed: int = 3600      # 1 hour (crypto Fear & Greed index)
     cache_ttl_regime: int = 3600          # 1 hour (per-market risk-on/off regime gauge)
+
+    # Equity data resilience — yfinance has no SLA and rate-limits (HTTP 429) under load, which used
+    # to empty a whole backtest/board. The equity price fetch now runs through the provider fallback
+    # chain (retries + backoff + health at /health/providers) with a keyless Stooq fallback, and
+    # serves the last-good frame (flagged stale) rather than nothing when every live source fails.
+    price_fetch_retries: int = 2          # transient-failure retries per provider (exp backoff)
+    equity_fallback_enabled: bool = True  # try Stooq daily EOD when yfinance yields nothing
+    cache_ttl_laststood: int = 604800     # 7 days — how long a last-good frame is kept for stale-serve
 
     # Screening defaults
     default_market: str = "IN"            # "IN" | "US" | "METALS" | "CRYPTO"
@@ -110,6 +143,13 @@ class Settings(BaseSettings):
     regime_size_weight: float = 0.5           # risk-off size haircut strength (applied only when tilt<0)
     regime_size_floor: float = 0.4            # never trim a position below this fraction of its base size
 
+    # Crypto daily-idea risk gate — crypto strategies backtest with catastrophic drawdowns (−74%…−100%),
+    # so a strategy's BUY signal only counts toward an idea's conviction when its backtested risk clears
+    # these floors. Applied only for the CRYPTO market; equities (modest DDs) are unaffected. Never
+    # empties a bucket — if all would be gated, the least-bad by drawdown are kept.
+    crypto_idea_dd_floor: float = -95.0       # drop votes from strategies with max_drawdown_pct ≤ this
+    crypto_idea_sharpe_floor: float = 0.2     # …and from strategies below this backtested Sharpe
+
     # Daily-idea composite ranking — soft accuracy factors layered on conviction × regime, each a
     # bounded ± multiplier (see pipeline_core/backtest/idea_ranking.py). 0 disables a factor; all-zero
     # reproduces the pre-factor board. Applied live (a re-rank pool is enriched, re-scored, then capped).
@@ -134,6 +174,96 @@ class Settings(BaseSettings):
     # Fundamental quality: lift high-ROE / low-leverage / healthy-margin names, trim weak-quality
     # technical breakouts (from get_stock_info; equity-only, ~4y statement history). 0 disables it.
     rank_w_quality: float = 0.15
+    # Factor attribution — measure each soft factor's REALIZED lift from the closed-idea ledger
+    # (win-rate when the factor was supportive vs adverse at entry). A factor's supportive/adverse
+    # cohort must each reach this many closed trades before a lift number is reported (else "need
+    # more data"). Kept modest since the closed set splits several ways; raise for stricter evidence.
+    attribution_min_samples: int = 8
+
+    # Multi-pillar confluence — reframe "quality" from DEPTH in one family (conviction = how many
+    # technical strategies agree) to BREADTH across independent families (technical + fundamental
+    # quality + institutional accumulation + regime tailwind + news + sector). An idea clearing
+    # ≥ pillar_min_actionable of the families available this market is ACTIONABLE (a small, high-
+    # conviction set); the rest drop to a per-column Watchlist. The bar is clamped to availability so
+    # thin-pillar markets (crypto/metals) still surface actionable ideas. See idea_ranking.idea_pillars.
+    pillar_tiering_enabled: bool = True        # split the board into Actionable / Watchlist tiers
+    pillar_min_actionable: int = 3             # families an idea must confirm (technical + ≥2 more)
+
+    # "Normal drawdown" band — surface how far a WINNING backtest trade of the backing strategies
+    # typically dipped before it worked (median |max-adverse-excursion|), as hold-through guidance on
+    # the idea card + a within/beyond flag while held. Anti-panic info, NOT a stop. The engine always
+    # computes it (negligible cost); this only gates surfacing it. See engine.compute_metrics.
+    drawdown_band_enabled: bool = True
+
+    # Curated basket — the daily analog of the intraday shortlist (bots/selection.py): distil the
+    # full 30-idea board (10 × short/medium/long) into ONE small, deployable best-of of 3–5 trades
+    # sized as a single cross-horizon ¼-Kelly book (allocations sum to ≤100%). Balanced/risk-adjusted:
+    # each idea scores on expected value × sample/agreement confidence × its existing rank_score, then
+    # a GREEDY DIVERSIFIED pick skips names in the same correlation cluster (cross-horizon, reusing the
+    # board's dedup clusters) with soft sector/horizon spread. Regime scales the size (more names in
+    # risk-on, fewer in risk-off) and it's STICKY across days (hysteresis) so it's actually holdable.
+    # See pipeline_core/backtest/basket.py. basket_enabled=False leaves the board untouched.
+    basket_enabled: bool = True
+    basket_size_min: int = 3                   # basket size in risk-off (fewer, higher-conviction bets)
+    basket_size_max: int = 5                   # basket size in risk-on (neutral uses the midpoint)
+    basket_w_ev: float = 0.45                  # weight on expected value (p·target − (1−p)·stop)
+    basket_w_confidence: float = 0.30          # weight on sample/agreement confidence (Wilson/agreement)
+    basket_w_quality: float = 0.25             # weight on the idea's per-horizon-normalized rank_score
+    basket_sector_cap: int = 2                 # soft cap: at most this many names per sector (equity)
+    basket_hysteresis_margin: float = 0.10     # a challenger must beat an incumbent's score by >this to swap it in
+    # Deploy the basket as a NAV-tracked Portfolio (reuses the portfolio layer). The live deployed book
+    # re-syncs on a weekly cadence (idempotent, cost-basis-preserving) so it tracks the sticky basket
+    # without churning; NAV still snapshots daily. See runner.deploy_basket / bots/crypto_momentum.deploy.
+    basket_autodeploy_enabled: bool = True     # auto re-sync of an already-deployed basket portfolio
+    basket_redeploy_days: int = 30             # re-deploy an existing basket portfolio at most this often
+    # Backtest of the basket CONSTRUCTION method — a held-basket, periodically-rebalanced historical sim
+    # with anti-lookahead (point-in-time signals/regime/clusters). Validates conviction aggregation +
+    # cross-horizon diversification + regime-scaled ¼-Kelly + hysteresis (NOT the full-sample calibration
+    # layer, which would leak). See pipeline_core/backtest/basket_backtest.py.
+    # CADENCE: the real US backtest (2019→2026) showed rebalance frequency is the dominant lever —
+    # WEEKLY(5d) −5% CAGR / −20% alpha (turnover eats it), MONTHLY(21d) +17% CAGR / +1.9% alpha /
+    # Sharpe 1.06, QUARTERLY(63d) +11% / −4% alpha. Monthly is the sweet spot (default), since turnover
+    # cost is ~linear in rebalance count (weekly does ~4× the trades of monthly for similar per-rebalance
+    # turnover). Deploy re-sync (above) matches at ~monthly.
+    basket_backtest_years: int = 8             # history span for the basket backtest
+    basket_rebalance_days: int = 21            # rebalance cadence in trading days (~monthly — see CADENCE)
+    basket_backtest_cost_bps: float = 25.0     # round-trip turnover cost per unit weight traded (bps)
+
+    # My Hold Basket — the COMMITTED, conviction-held counterpart to the (live-view) daily basket. Built
+    # for STAYING POWER (higher conviction floor + longer-horizon tilt + much wider hysteresis), it's
+    # deployed as a frozen NAV-tracked portfolio that only changes on a MATERIAL event (a holding hit its
+    # stop/target, its thesis broke, or a dramatically-better idea clears the displacement bar) — shown as
+    # a reasoned diff you approve, and alerted once. See build_basket(hold_mode=True) + hold_rebalance_plan.
+    hold_basket_enabled: bool = True
+    hold_min_conviction: int = 2               # only names ≥ this many agreeing strategies are hold-worthy
+    hold_hysteresis_margin: float = 0.30       # incumbent stickiness (vs the daily 0.10) — hold, don't churn
+    hold_displacement_conviction_gap: int = 2  # a fresh name only bumps a holding if its conviction is ≥ this higher
+    hold_size_min: int = 3                     # hold-book size in risk-off
+    hold_size_max: int = 5                     # hold-book size in risk-on (neutral = midpoint)
+    # (the per-horizon score tilt favouring longer holds lives in basket.HOLD_HORIZON_FACTOR)
+
+    # Multi-bagger screen — a fundamentals-first, long-horizon idea generator (a sub-tab of Trade
+    # Ideas; see pipeline_core/multibagger.py). Scores a broad mid/small-cap universe on six pillars
+    # and surfaces high-growth, high-quality, smaller-cap compounders. Equity markets only.
+    multibagger_enabled: bool = True
+    multibagger_max_universe: int = 500       # cap names fetched in the (cheap) info stage
+    multibagger_top_n: int = 20               # candidates shown
+    multibagger_deep_top_n: int = 25          # survivors that pay for the deep (statements) stage
+    multibagger_min_coverage: float = 0.5     # drop a name scored on < this fraction of the 6 pillars
+    # Pillar weights (composite = coverage-renormalised weighted mean). Size is the defining
+    # multi-bagger tilt (smaller = more runway); technical is a small, bounded timing overlay only.
+    multibagger_w_growth: float = 0.30
+    multibagger_w_quality: float = 0.22
+    multibagger_w_balance: float = 0.13
+    multibagger_w_value: float = 0.10
+    multibagger_w_size: float = 0.15
+    multibagger_w_ownership: float = 0.10
+    multibagger_w_technical: float = 0.08     # max ±8% nudge — can't reorder the fundamental leaders
+
+    # Hold-coaching alerts — the ACTIVE half of "take & stick with it", on the background alert loop
+    # (pipeline_core/alerts.py evaluate_market). Anti-panic + take-the-trade nudges, in-app only.
+    alert_hold_coach_enabled: bool = True     # alert when an open position is BEYOND its normal-dip band (review thesis)
+    alert_triggered_enabled: bool = True      # alert when a watchlist idea ENTERS its buy zone (triggered — consider entering)
 
     # Reports
     report_top_n: int = 1                 # how many top candidates get reports

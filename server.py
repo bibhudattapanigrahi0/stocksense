@@ -521,6 +521,193 @@ async def refresh_trade_ideas(market: str = "IN") -> dict:
 
 
 @mcp.tool
+async def get_trade_basket(market: str = "IN", max_per_bucket: int = 10) -> dict:
+    """
+    The curated **Today's Basket** — the full 30-idea board (10 × short/medium/long) distilled into ONE
+    small, deployable best-of of 3–5 trades a user can actually take. **Use this to answer "just tell me
+    what to buy right now."** It is the daily analog of the intraday shortlist:
+
+      • balanced / risk-adjusted score — expected value (p·target − (1−p)·stop) × sample/agreement
+        confidence × the idea's existing composite rank;
+      • greedily DIVERSIFIED — never two names from the same correlation cluster (cross-horizon), with a
+        soft per-sector cap and horizon spread;
+      • sized as ONE ¼-Kelly book, so each pick's `alloc_pct` is a real portfolio weight summing to
+        ≤100% (regime trims the book and shrinks the basket in risk-off);
+      • STICKY day-to-day (hysteresis) so it's holdable, not a daily reshuffle.
+
+    Each item carries `alloc_pct`, `win_prob`, `expected_return_pct`, `basket_score`, `horizon`, entry/
+    stop/target, and `carried` (held from a prior day). The `summary` gives the basket's expected return,
+    blended win rate, exposure vs cash, and diversification. market ∈ {IN, US, METALS, CRYPTO}.
+    """
+    from pipeline_core.backtest import runner
+
+    ideas = runner.horizon_ideas(max_per_bucket, market)
+    if ideas is None:
+        return {"enabled": True, "items": [], "market": market,
+                "note": f"No {market} backtest yet — call run_backtest."}
+    ideas = await runner.enrich_ideas_live(ideas, market)
+    return ideas.get("basket") or {"enabled": True, "items": [], "market": market}
+
+
+@mcp.tool
+async def track_trade_basket(market: str = "IN", max_per_bucket: int = 10) -> dict:
+    """
+    Commit the current curated basket as the day's anchor and track its members so their outcome can be
+    followed (idempotent; tagged `source=basket` in the idea tracker). Also advances the day-to-day
+    hysteresis anchor. Returns {added, total, basket summary}. market ∈ {IN, US, METALS, CRYPTO}.
+    """
+    from pipeline_core.backtest import runner
+
+    return await runner.snapshot_current_ideas(max_per_bucket, market)
+
+
+@mcp.tool
+async def deploy_trade_basket(market: str = "IN") -> dict:
+    """
+    Deploy the curated basket as a saved, **NAV-tracked Portfolio** so it's tracked as a UNIT — a NAV
+    curve, P&L, rebalancing, and AI review (all via the portfolio layer / Portfolios tab) — instead of
+    only as individual tracked ideas. Each pick becomes a position at its basket weight; cash = the
+    basket's cash. **Idempotent + cost-basis-preserving**: re-deploying re-syncs the same-named portfolio
+    and keeps entry prices on names still held (so the NAV curve survives weekly rebalances). Returns
+    {deployed, portfolio_id, snapshot, basket}. market ∈ {IN, US, METALS, CRYPTO}.
+    """
+    from pipeline_core.backtest import runner
+
+    return await runner.deploy_basket(market)
+
+
+@mcp.tool
+async def get_hold_basket(market: str = "IN") -> dict:
+    """
+    Your committed **Hold Basket** — the conviction-held, low-churn counterpart to the daily basket.
+    **Use this for "what am I holding and do I need to do anything?"** Returns the live holdings + P&L and
+    the (usually empty) **material** rebalance plan: a holding only shows EXIT when it hit its stop/target
+    or its thesis broke, and a new name only shows ADD when it's dramatically higher-conviction — so a
+    still-valid holding is never churned. If nothing is committed yet, returns a `preview` to commit.
+    market ∈ {IN, US, METALS, CRYPTO}.
+    """
+    from pipeline_core.backtest import runner
+
+    return await runner.hold_basket_status(market)
+
+
+@mcp.tool
+async def commit_hold_basket(market: str = "IN") -> dict:
+    """
+    Commit today's hold basket as your book — a conviction-tilted, staying-power set, persisted (entry
+    prices + cost basis) and deployed as a NAV-tracked portfolio. It then **stays put** until you apply a
+    material change, so you can hold it without daily churn. market ∈ {IN, US, METALS, CRYPTO}.
+    """
+    from pipeline_core.backtest import runner
+
+    return await runner.commit_hold_basket(market)
+
+
+@mcp.tool
+async def apply_hold_basket(market: str = "IN") -> dict:
+    """
+    Apply the reviewed **material** rebalance to your committed Hold Basket (held − exits + material adds),
+    keeping the cost-basis on names you're still holding, and re-deploy. A no-op when nothing material has
+    changed. market ∈ {IN, US, METALS, CRYPTO}.
+    """
+    from pipeline_core.backtest import runner
+
+    return await runner.apply_hold_rebalance(market)
+
+
+@mcp.tool
+async def run_basket_backtest(market: str = "IN", years: int = 8, rebalance_days: int = 5) -> dict:
+    """
+    Backtest the basket CONSTRUCTION method — *"would this basket approach have made money?"* A
+    held-basket, **weekly-rebalanced** historical simulation with anti-lookahead: the board is rebuilt
+    point-in-time at each rebalance, the same diversified/regime-scaled/sticky basket is picked, held to
+    the next rebalance, and compounded → an equity curve with **CAGR / Sharpe / max-drawdown / alpha vs
+    benchmark**, plus turnover and hit-rate. Validates the construction method (the full-sample
+    calibration layer is excluded to avoid lookahead). Runs inline (a minute or two on a warm cache);
+    result is also saved. market ∈ {IN, US, METALS, CRYPTO}.
+    """
+    from pipeline_core.backtest import basket_backtest as bb
+
+    return await bb.run_basket_backtest(market, years, rebalance_days)
+
+
+@mcp.tool
+async def get_basket_backtest(market: str = "IN") -> dict:
+    """
+    The last basket-method backtest result for the market — equity curve + CAGR/Sharpe/maxDD/alpha vs
+    benchmark + turnover/hit-rate. Empty until `run_basket_backtest` has run. market ∈ {IN, US, METALS, CRYPTO}.
+    """
+    from pipeline_core.backtest import basket_backtest as bb
+
+    return bb.load_result(market) or {"ran": False, "market": market, "note": "No basket backtest yet."}
+
+
+@mcp.tool
+async def get_multibagger_ideas(market: str = "IN", top_n: int = 20) -> dict:
+    """
+    Multi-bagger candidates for the market — a **fundamentals-first**, long-horizon screen (distinct
+    from the technical horizon board): high-growth, high-quality, smaller-cap businesses whose growth
+    may not be fully priced in (the Peter Lynch "ten-bagger" idea). Each candidate carries a 0–100
+    multi-bagger `score` = a coverage-renormalised weighted mean of six pillars (growth, quality,
+    balance-sheet, valuation sanity, size/runway, ownership) with a small bounded technical timing
+    overlay, plus `reasons` ("why it could multi-bag"), `concerns`, and the raw `metrics`. Loads the
+    last persisted screen instantly (call refresh_multibagger_ideas to recompute). **Use this to answer
+    "which stocks could compound many times over / multi-bag from here?"** Equity markets only
+    (IN / US); price-only markets return an empty, note-bearing payload.
+    """
+    from pipeline_core import multibagger
+
+    cached = multibagger.load_latest_multibaggers(market)
+    if cached is not None:
+        cached["candidates"] = cached.get("candidates", [])[:top_n]
+        cached["count"] = len(cached["candidates"])
+        return cached
+    return await multibagger.screen_multibaggers(market, top_n)
+
+
+@mcp.tool
+async def refresh_multibagger_ideas(market: str = "IN", top_n: int = 20) -> dict:
+    """
+    Recompute the market's multi-bagger screen from fresh fundamentals and return the ranked result.
+    Scores a broad mid/small-cap universe (IN: NIFTY 500; US: S&P 500 + NASDAQ-100) from cached
+    company profiles, then deep-dives the top survivors (financial statements → Piotroski / ROCE /
+    3-year CAGRs, plus IN promoter holding). Takes longer than get_multibagger_ideas on a cold cache;
+    the result is persisted so subsequent reads are instant. Equity markets only (IN / US).
+    """
+    from pipeline_core import multibagger
+
+    return await multibagger.screen_multibaggers(market, top_n)
+
+
+@mcp.tool
+async def track_multibagger_ideas(market: str = "IN", ticker: str = "") -> dict:
+    """
+    Start tracking multi-bagger candidate(s) so their **bagger multiple** (current ÷ entry price) can
+    be followed over time. Pass a `ticker` to track just that one candidate, or leave it empty to
+    track the whole current screen. Idempotent (an already-tracked name is skipped). Requires a prior
+    screen (get_/refresh_multibagger_ideas). Returns {added, total}. market ∈ {IN, US}.
+    """
+    from pipeline_core import multibagger
+
+    return multibagger.track_multibaggers(market, ticker or None)
+
+
+@mcp.tool
+async def get_tracked_multibaggers(market: str = "IN") -> dict:
+    """
+    Follow-up scoreboard for tracked multi-baggers: every tracked name re-priced to a **bagger
+    multiple** (2× = a 'double bagger') + return-since-entry + the highest milestone reached, plus a
+    fresh **thesis re-score** (entry score → now, so you see if the fundamental case is strengthening
+    or weakening) and a basket scoreboard (avg/best multiple, milestone tally). Unlike the horizon
+    idea tracker these are open-ended holds — there's no stop/target close. **Use this to answer "how
+    are my tracked multi-baggers doing — how far have they run?"** market ∈ {IN, US}.
+    """
+    from pipeline_core import multibagger
+
+    return await multibagger.tracked_multibaggers_status(market)
+
+
+@mcp.tool
 async def get_tracked_ideas(market: str = "IN") -> dict:
     """
     Follow-up scoreboard for trade ideas (for the market): every tracked idea (auto-snapshot
@@ -533,6 +720,36 @@ async def get_tracked_ideas(market: str = "IN") -> dict:
     from pipeline_core.backtest import runner
 
     return await runner.tracked_ideas_status(market)
+
+
+@mcp.tool
+async def mark_idea_action(ticker: str, horizon: str, market: str = "IN",
+                           action: str = "in", price: float = 0.0) -> dict:
+    """
+    Record what YOU actually did on a tracked idea — the 'you' side of the discipline scorecard.
+    action='in' stamps your entry, action='out' your exit, onto the most-recent open tracked record
+    for (ticker, horizon, market). price defaults to the live quote when 0/omitted. Pair with
+    get_discipline_scorecard to see how your real entries/exits compared to following the plan.
+    horizon ∈ {short, medium, long}; market ∈ {IN, US, METALS, CRYPTO}.
+    """
+    from pipeline_core.backtest import runner
+
+    return runner.mark_idea_action(ticker, horizon, market, action, price or None)
+
+
+@mcp.tool
+async def get_discipline_scorecard(market: str = "IN") -> dict:
+    """
+    'System vs you' for the market: how your ACTUAL entries/exits (paper trades + explicit
+    I'm-in/out marks) compared to following each idea's plan to its stop / target / expiry.
+    Returns per-trade rows (your exit vs the plan's, with a followed / early_cost / early_saved
+    verdict) and a scorecard — compounded 'you' vs 'plan' book returns, the net discipline delta,
+    and the cost/saved split of early exits. **Use for "am I sticking to the plan — is bailing
+    early helping or hurting?"** market ∈ {IN, US, METALS, CRYPTO}.
+    """
+    from pipeline_core import adherence
+
+    return await adherence.discipline_scorecard(market)
 
 
 @mcp.tool
@@ -796,8 +1013,8 @@ async def scan_crypto_bot(bot_id: str, timeframe: str = "15m", universe: str = "
 
 @mcp.tool
 async def crypto_intraday_ideas(
-    timeframe: str = "15m", universe: str = "Top 50", limit: int = 20, min_conviction: int = 1,
-    strict: bool = False, top_k: int = 5, min_score: float = 0.0, sentiment: bool = True,
+    timeframe: str = "4h", universe: str = "Top 50", limit: int = 20, min_conviction: int = 1,
+    strict: bool = True, top_k: int = 5, min_score: float = 0.0, sentiment: bool = True,
 ) -> dict:
     """
     Intraday crypto **Trade Ideas**: aggregate the signal-bot family on one timeframe into

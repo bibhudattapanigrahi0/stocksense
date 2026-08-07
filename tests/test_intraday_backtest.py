@@ -132,6 +132,43 @@ def test_edge_for_regime_fallback(monkeypatch):
     assert bt.edge_for("Fake", "15m", "trend", edge=edge)["trades"] == 40
 
 
+def test_bundle_by_regime_side():
+    # A bot whose SHORTs win but LONGs lose — the joint cells must separate them.
+    trades = [{"ret_pct": 8, "reason": "target", "bars_held": 3, "regime": "trend", "side": "short"},
+              {"ret_pct": 6, "reason": "target", "bars_held": 4, "regime": "trend", "side": "short"},
+              {"ret_pct": -5, "reason": "stop", "bars_held": 2, "regime": "trend", "side": "long"},
+              {"ret_pct": -4, "reason": "stop", "bars_held": 2, "regime": "range", "side": "long"}]
+    b = bt._bundle(trades)
+    assert set(b["by_regime_side"]) == {"trend", "range"}
+    assert set(b["by_regime_side"]["trend"]) == {"long", "short"}
+    assert b["by_regime_side"]["trend"]["short"]["trades"] == 2
+    assert b["by_regime_side"]["trend"]["short"]["expectancy_pct"] > 0    # the two winners
+    assert b["by_regime_side"]["trend"]["long"]["expectancy_pct"] < 0     # the loser
+
+
+def test_edge_for_side_specificity():
+    # SHORTs win (+0.6) but LONGs lose (−0.4) — regime-only lookup got this wrong.
+    entry = {"trades": 200, "expectancy_pct": 0.1, "enough": True,
+             "by_regime": {"trend": {"trades": 100, "expectancy_pct": 0.5, "enough": True}},
+             "by_side": {"long": {"trades": 100, "expectancy_pct": -0.4, "enough": True},
+                         "short": {"trades": 100, "expectancy_pct": 0.6, "enough": True}},
+             "by_regime_side": {"trend": {
+                 "long": {"trades": 60, "expectancy_pct": -0.45, "enough": True},
+                 "short": {"trades": 60, "expectancy_pct": 0.66, "enough": True}}}}
+    edge = {"bots": {"Fake|4h": entry}}
+    # Most specific joint cell wins when it has sample.
+    assert bt.edge_for("Fake", "4h", "trend", side="long", edge=edge)["expectancy_pct"] == -0.45
+    assert bt.edge_for("Fake", "4h", "trend", side="short", edge=edge)["expectancy_pct"] == 0.66
+    # No regime → side slice.
+    assert bt.edge_for("Fake", "4h", side="long", edge=edge)["expectancy_pct"] == -0.4
+    # Regime only (no side) → unchanged legacy behavior.
+    assert bt.edge_for("Fake", "4h", "trend", edge=edge)["expectancy_pct"] == 0.5
+    # Thin joint cell (< MIN_SAMPLE) → fall back to the side slice, not the misleading regime.
+    thin = {"bots": {"Fake|4h": {**entry, "by_regime_side": {"trend": {
+        "long": {"trades": 3, "expectancy_pct": 9.9, "enough": False}}}}}}
+    assert bt.edge_for("Fake", "4h", "trend", side="long", edge=thin)["expectancy_pct"] == -0.4
+
+
 # ── Closed-bar (no-repaint) fetch ───────────────────────────────────
 
 
@@ -153,9 +190,10 @@ def test_edge_weight_maps_expectancy():
     edge = {"bots": {
         "A|15m": {"expectancy_pct": 1.5, "win_rate": 66, "enough": True, "trades": 40, "by_regime": {}},
         "B|15m": {"expectancy_pct": -0.3, "win_rate": 38, "enough": True, "trades": 40, "by_regime": {}}}}
-    assert ideas_mod._edge_weight("A", "15m", "trend", edge)[0] == 3.0     # capped high
-    assert ideas_mod._edge_weight("B", "15m", "trend", edge)[0] == 0.0     # negative → no weight
-    assert ideas_mod._edge_weight("A", "15m", "trend", None)[0] == 1.0     # no backtest → neutral
+    # No by_side in these stubs → the side arg falls back to the overall expectancy.
+    assert ideas_mod._edge_weight("A", "15m", "trend", "long", edge)[0] == 3.0     # capped high
+    assert ideas_mod._edge_weight("B", "15m", "trend", "long", edge)[0] == 0.0     # negative → no weight
+    assert ideas_mod._edge_weight("A", "15m", "trend", "long", None)[0] == 1.0     # no backtest → neutral
 
 
 @pytest.mark.asyncio
@@ -229,12 +267,14 @@ async def test_edge_backed_flag(monkeypatch):
     monkeypatch.setattr(ideas_mod, "get_universe_tickers", lambda m, u: ["AAA"])
     monkeypatch.setattr(ideas_mod.crypto_data, "get_klines", lambda s, tf, bars, closed_only=True: down.copy())
 
+    # strict=False so the flag itself is what's under test (the default strict gate would hide the
+    # exploratory case below); with no by_side in _stat, the side lookup falls back to overall.
     monkeypatch.setattr(bt, "load_edge", lambda: {"bots": {"EMA Trend|15m": _stat(0.6)}})
-    pos = (await ideas_mod.intraday_ideas(timeframe="15m", universe="Top 50"))["short"][0]
+    pos = (await ideas_mod.intraday_ideas(timeframe="15m", universe="Top 50", strict=False))["short"][0]
     assert "EMA Trend" in pos["bots"] and pos["edge_backed"] is True and pos["quality"] == 0.6
 
     monkeypatch.setattr(bt, "load_edge", lambda: {"bots": {"EMA Trend|15m": _stat(-0.2)}})
-    neg = (await ideas_mod.intraday_ideas(timeframe="15m", universe="Top 50"))["short"][0]
+    neg = (await ideas_mod.intraday_ideas(timeframe="15m", universe="Top 50", strict=False))["short"][0]
     assert neg["edge_backed"] is False and neg["quality"] == -0.2      # lone measured bot never self-prunes
 
 
@@ -251,6 +291,57 @@ async def test_ideas_strict_hides_exploratory(monkeypatch):
 
     strict = await ideas_mod.intraday_ideas(timeframe="15m", universe="Top 50", strict=True)
     assert strict["strict"] is True and strict["counts"] == {"long": 0, "short": 0}   # stand aside
+
+
+# ── Side-aware edge attribution + honest gating (the P&L fixes) ──────
+
+
+def _side_edge(regime_exp, short_exp, long_exp=-0.9):
+    """One bot|15m entry: a regime number plus explicit per-side expectancy."""
+    return {"bots": {"EMA Trend|15m": {
+        "trades": 200, "expectancy_pct": -0.3, "win_rate": 42, "enough": True,
+        "by_regime": {"trend": {"trades": 100, "expectancy_pct": regime_exp, "win_rate": 44, "enough": True}},
+        "by_side": {"short": {"trades": 100, "expectancy_pct": short_exp, "win_rate": 55, "enough": True},
+                    "long": {"trades": 100, "expectancy_pct": long_exp, "win_rate": 33, "enough": True}}}}}
+
+
+@pytest.mark.asyncio
+async def test_ideas_quality_uses_side_not_regime(monkeypatch):
+    down = frame(np.cumprod(1 + np.concatenate([[0], np.full(159, -0.004)])) * 150)
+    monkeypatch.setattr(ideas_mod, "get_universe_tickers", lambda m, u: ["AAA"])
+    monkeypatch.setattr(ideas_mod.crypto_data, "get_klines", lambda s, tf, bars, closed_only=True: down.copy())
+    # Regime 'trend' is mildly negative (−0.2, keeps the lone bot eligible) but the SHORT side is
+    # genuinely +0.6. The down frame fires shorts, so quality must be the +0.6 side slice — the
+    # old regime-only lookup would have (wrongly) reported −0.2. Default strict must keep it.
+    monkeypatch.setattr(bt, "load_edge", lambda: _side_edge(regime_exp=-0.2, short_exp=0.6))
+    res = await ideas_mod.intraday_ideas(timeframe="15m", universe="Top 50")   # strict=True default
+    assert res["short"], "a genuinely positive-edge short must survive the default strict gate"
+    s = res["short"][0]
+    assert s["quality"] == 0.6 and s["edge_backed"] is True                    # side slice, not −0.2
+
+
+@pytest.mark.asyncio
+async def test_default_strict_stands_aside_on_negative_side(monkeypatch):
+    down = frame(np.cumprod(1 + np.concatenate([[0], np.full(159, -0.004)])) * 150)
+    monkeypatch.setattr(ideas_mod, "get_universe_tickers", lambda m, u: ["AAA"])
+    monkeypatch.setattr(ideas_mod.crypto_data, "get_klines", lambda s, tf, bars, closed_only=True: down.copy())
+    # SHORT side is a measured loser (−0.5) → not edge-backed → the default strict board stands aside.
+    monkeypatch.setattr(bt, "load_edge", lambda: _side_edge(regime_exp=-0.2, short_exp=-0.5))
+    res = await ideas_mod.intraday_ideas(timeframe="15m", universe="Top 50")   # strict=True default
+    assert res["counts"] == {"long": 0, "short": 0} and res["shortlist"] == []
+
+
+@pytest.mark.asyncio
+async def test_shortlist_floors_negative_measured_quality(monkeypatch):
+    down = frame(np.cumprod(1 + np.concatenate([[0], np.full(159, -0.004)])) * 150)
+    monkeypatch.setattr(ideas_mod, "get_universe_tickers", lambda m, u: ["AAA"])
+    monkeypatch.setattr(ideas_mod.crypto_data, "get_klines", lambda s, tf, bars, closed_only=True: down.copy())
+    monkeypatch.setattr(bt, "load_edge", lambda: _side_edge(regime_exp=-0.2, short_exp=-0.5))
+    # Non-strict still shows the exploratory idea in the book, but the curated shortlist floors the
+    # measured loser (quality ≤ 0) rather than ranking it as a "best-of" idea.
+    res = await ideas_mod.intraday_ideas(timeframe="15m", universe="Top 50", strict=False)
+    assert res["short"] and res["short"][0]["quality"] == -0.5
+    assert res["shortlist"] == []
 
 
 @pytest.fixture
