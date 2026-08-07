@@ -71,6 +71,11 @@ class Settings(BaseSettings):
     cot_lookback_weeks: int = 156           # ~3 years of weekly reports for the range normalization
     cot_index_high: float = 75.0
     cot_index_low: float = 25.0
+    # Crypto (Hyperliquid): aggregate the live positions of the top winning traders into a per-coin
+    # net-directional bias — the literal "copy better traders" signal (live only, no backtest series).
+    hl_top_traders: int = 40                # how many top-PnL accounts to read positions from
+    hl_window: str = "month"                # leaderboard window to rank winners by (day|week|month|allTime)
+    hl_min_account_usd: float = 1_000_000.0  # ignore small accounts — whale conviction, not noise
 
     # Cache TTL (seconds)
     cache_ttl_price: int = 900            # 15 minutes (history bars — effectively immutable intraday)

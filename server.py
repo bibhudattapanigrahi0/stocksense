@@ -550,6 +550,42 @@ async def get_trade_basket(market: str = "IN", max_per_bucket: int = 10) -> dict
 
 
 @mcp.tool
+async def get_smart_money(market: str = "IN", symbol: str = "") -> dict:
+    """
+    The **smart-money / coattail** signal for one symbol — who the proven, informed money is and whether
+    they're accumulating, normalized across markets. Use this to answer "is the smart money buying X?"
+
+      • US     — SEC 13F holdings of a basket of concentrated managers + famed gurus (QoQ delta);
+      • METALS — CFTC Commitments of Traders: are the commercial hedgers net-long their 3y range?;
+      • CRYPTO — Hyperliquid top-winning-traders' live net positioning in the coin;
+      • IN     — disclosed NSE bulk/block deals (a large buyer stepped in).
+
+    Returns direction (accumulate/distribute/neutral), conviction, actors, and a human `detail`.
+    `available: false` when no source covers the symbol. market ∈ {IN, US, METALS, CRYPTO}.
+    """
+    from pipeline_core.services import smart_money
+
+    sig = await asyncio.to_thread(smart_money.get_signal, market, symbol)
+    return sig or {"available": False, "market": market, "symbol": symbol}
+
+
+@mcp.tool
+async def get_smart_money_leaders(market: str = "CRYPTO", limit: int = 10) -> dict:
+    """
+    The **coattail leaders board** — who the smart money is buying *right now*, ranked:
+
+      • CRYPTO — the Hyperliquid top-trader book: coins where the best traders are most net long/short;
+      • METALS — the metals whose CFTC commercials sit at a positioning extreme;
+      • US     — the strongest 13F quarter-over-quarter accumulators in the tracked panel.
+
+    India bulk deals are per-symbol — use get_smart_money(symbol=...) there. market ∈ {IN, US, METALS, CRYPTO}.
+    """
+    from pipeline_core.services import smart_money
+
+    return await asyncio.to_thread(smart_money.get_leaders, market, limit)
+
+
+@mcp.tool
 async def track_trade_basket(market: str = "IN", max_per_bucket: int = 10) -> dict:
     """
     Commit the current curated basket as the day's anchor and track its members so their outcome can be

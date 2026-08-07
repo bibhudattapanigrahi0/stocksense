@@ -444,6 +444,29 @@ def _cot_exit(df: pd.DataFrame) -> pd.Series:
     return _fill((idx < 50) | _crosses_below(c, ind.sma(c, 50)))
 
 
+# ── NSE bulk-deal follow (India only) ───────────────────────────────
+# Reads `bulk_net_qty` that runner.py merges from disclosed NSE bulk/block deals (dated next-day,
+# no lookahead) — a fresh net BUY means a large trader stepped in. Confirm with price and ride it.
+# Absent on non-IN markets (or when NSE blocks the fetch) ⇒ inert. See services/in_smartmoney.py.
+
+def _has_bulk(df: pd.DataFrame) -> bool:
+    return "bulk_net_qty" in df.columns
+
+
+def _bulk_entry(df: pd.DataFrame) -> pd.Series:
+    if not _has_bulk(df):
+        return _never(df)
+    c, q = df["Close"], df["bulk_net_qty"]
+    return _fill((q > 0) & (c > ind.sma(c, 20)))
+
+
+def _bulk_exit(df: pd.DataFrame) -> pd.Series:
+    if not _has_bulk(df):
+        return _never(df)
+    c = df["Close"]
+    return _fill((df["bulk_net_qty"] < 0) | _crosses_below(c, ind.sma(c, 50)))
+
+
 # ── Strategy definitions ───────────────────────────────────────────
 
 STRATEGIES: list[StrategyDef] = [
@@ -854,6 +877,19 @@ STRATEGIES: list[StrategyDef] = [
                     "(released Fri for Tue), forward-filled — not a proxy. Inert without COT data.",
         entry=_cot_entry,
         exit=_cot_exit,
+        min_bars=260,
+    ),
+    StrategyDef(
+        id="bulk-deal-follow",
+        name="Bulk-Deal Accumulation (NSE)",
+        category="Accumulation",
+        description="India only. Coattail disclosed size: buy when a net BUY bulk/block deal is reported "
+                    "for the stock (a large trader stepped in, SEBI-disclosed after the close) and price "
+                    "confirms above the 20-DMA; exit on a net-sell disclosure, a 50-DMA break, or after "
+                    "40 days. Real NSE bulk deals, dated next-day (no lookahead). Inert without the data.",
+        entry=_bulk_entry,
+        exit=_bulk_exit,
+        max_holding_days=40,
         min_bars=260,
     ),
 ]

@@ -13,7 +13,8 @@ def _hermetic_llm(monkeypatch):
     .env: default every test to rules-only mode (no provider, no keys). Provider
     tests opt back in via their own monkeypatch, which runs after this fixture."""
     from pipeline_core.services import (
-        cot, earnings, edgar_13f, llm_service, market_regime, market_sentiment, sector, smart_money,
+        cot, crypto_smartmoney, earnings, edgar_13f, in_smartmoney, llm_service, market_regime,
+        market_sentiment, sector, smart_money,
     )
 
     monkeypatch.setattr(llm_service.settings, "llm_provider", "none")
@@ -54,6 +55,15 @@ def _hermetic_llm(monkeypatch):
     # CFTC COT (metals smart-money) is a live Socrata source; default to "no rows" so the metals
     # smart-money signal/strategy stay inert offline. Tests opt back in with their own monkeypatch.
     monkeypatch.setattr(cot, "_fetch_rows", lambda market_name: [])
+
+    # Crypto smart-money (Hyperliquid) is a live on-chain source; default to an empty book so the
+    # crypto signal is inert offline (also guards against a stale disk-cached book). Tests opt back in.
+    monkeypatch.setattr(crypto_smartmoney, "build_book",
+                        lambda force=False: {"coins": {}, "n_traders": 0, "window": "month", "as_of": None})
+
+    # India smart-money (NSE bulk deals) is a live, often-blocked source; default to "no deals" so the
+    # IN bulk-deal signal/strategy stay inert offline. Tests opt back in with their own monkeypatch.
+    monkeypatch.setattr(in_smartmoney, "_fetch_deals", lambda symbol: [])
 
     # Earnings dates are a live yfinance source (feeds the idea board's event-risk factor);
     # default to "no known earnings" so the ranking factor is neutral offline.

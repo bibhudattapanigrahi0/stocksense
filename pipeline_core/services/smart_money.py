@@ -191,6 +191,67 @@ def enrich_frames(market: Optional[str], df_by_ticker: dict) -> None:
         logger.warning("smart_money frame enrichment skipped (%s): %s", key, e)
 
 
+def get_leaders(market: Optional[str], limit: int = 10) -> dict:
+    """The coattail 'who is the smart money buying now' board for a market:
+      • CRYPTO — Hyperliquid top-trader net positioning per coin (the live copy-trade book);
+      • METALS — the metals whose CFTC commercials are at a positioning extreme;
+      • US     — the top 13F QoQ accumulators from the cached manager+guru panel.
+    India bulk deals are per-symbol only (use get_signal). Never raises."""
+    key = get_market(market).key
+    base = {"market": key, "available": False, "leaders": []}
+    if not settings.smart_money_enabled:
+        return base
+    try:
+        if key == "CRYPTO":
+            mod = _native_module("CRYPTO")
+            if mod is not None and hasattr(mod, "leaders"):
+                out = mod.leaders(limit)
+                out["market"] = key
+                out["available"] = bool(out.get("leaders"))
+                return out
+        elif key == "METALS":
+            return _metals_leaders(limit)
+        elif key == "US":
+            return _us_leaders(limit)
+    except Exception as e:
+        logger.warning("smart_money leaders failed (%s): %s", key, e)
+    base["note"] = "Per-symbol only for this market — query get_signal(symbol)."
+    return base
+
+
+def _metals_leaders(limit: int) -> dict:
+    from pipeline_core.services import metals_data
+    rows = []
+    for sym in ("GC=F", "SI=F", "PL=F", "PA=F", "HG=F"):
+        sig = get_signal("METALS", sym)
+        if sig and sig.get("family") == "cot" and sig.get("direction") in ("accumulate", "distribute"):
+            rows.append({"symbol": sym, "name": metals_data.display_name(sym),
+                         "direction": sig["direction"], "cot_index": sig.get("cot_index"),
+                         "detail": sig.get("detail")})
+    rows.sort(key=lambda r: abs((r.get("cot_index") or 50) - 50), reverse=True)
+    return {"market": "METALS", "available": bool(rows), "leaders": rows[:limit], "source": "cftc-cot"}
+
+
+def _us_leaders(limit: int) -> dict:
+    from pipeline_core.services import edgar_13f
+    panel = edgar_13f.get_panel()
+    if not panel:
+        return {"market": "US", "available": False, "leaders": [], "note": "13F panel not built."}
+    rows = []
+    for tk, recs in panel.items():
+        s = edgar_13f.series_from_records(recs)
+        if s is None or s.empty:
+            continue
+        last = s.iloc[-1]
+        qoq = last.get("qoq_change_pct")
+        if qoq is None or pd.isna(qoq) or float(qoq) <= 0:
+            continue
+        rows.append({"ticker": tk, "qoq_change_pct": round(float(qoq), 1),
+                     "n_managers": int(last["n_managers"]), "quarter": str(last.get("quarter"))})
+    rows.sort(key=lambda r: r["qoq_change_pct"], reverse=True)
+    return {"market": "US", "available": bool(rows), "leaders": rows[:limit], "source": "edgar-13f"}
+
+
 def has_family(market: Optional[str]) -> bool:
     """Whether this market has a smart-money signal family available to confirm ideas — drives
     the confluence denominator in runner.enrich_ideas_live. Equity markets always do (ownership

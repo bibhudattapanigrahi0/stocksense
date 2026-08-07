@@ -836,6 +836,26 @@ async def backtest_basket(max_per_bucket: int = 10, market: str = Query("IN")):
     return ideas.get("basket") or {"enabled": True, "items": [], "market": market}
 
 
+@app.get("/api/v1/smart-money")
+async def smart_money_signal(symbol: str = Query(..., min_length=1), market: str = Query("IN")):
+    """The smart-money / coattail signal for one symbol — who the proven money is and whether they're
+    accumulating, normalized across markets: SEC 13F + famed gurus (US), CFTC COT commercials (metals),
+    Hyperliquid top-trader positioning (crypto), NSE bulk/block deals (IN). Fields: direction,
+    conviction, actors, detail. `available: false` when no source covers the symbol."""
+    from pipeline_core.services import smart_money
+    sig = await asyncio.to_thread(smart_money.get_signal, market, symbol)
+    return sig or {"available": False, "market": market, "symbol": symbol}
+
+
+@app.get("/api/v1/smart-money/leaders")
+async def smart_money_leaders(market: str = Query("IN"), limit: int = Query(10, ge=1, le=50)):
+    """The coattail leaders board — who the smart money is buying now: the Hyperliquid top-trader book
+    (crypto), the metals whose CFTC commercials are at a positioning extreme (metals), or the top 13F
+    QoQ accumulators (US). India bulk deals are per-symbol — use /smart-money?symbol=."""
+    from pipeline_core.services import smart_money
+    return await asyncio.to_thread(smart_money.get_leaders, market, limit)
+
+
 @app.post("/api/v1/backtest/basket/track")
 async def backtest_basket_track(max_per_bucket: int = 10, market: str = Query("IN")):
     """Commit the current curated basket as the day's anchor and track its members (idempotent). Tagged

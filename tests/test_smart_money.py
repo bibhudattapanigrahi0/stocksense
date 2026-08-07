@@ -142,3 +142,25 @@ def test_us_gurus_fold_into_tracked_managers(monkeypatch):
     assert len(with_gurus) == len(e.TRACKED_MANAGERS) + len(e.GURU_MANAGERS)
     monkeypatch.setattr(e.settings, "sm_us_gurus_enabled", False)
     assert e.tracked_managers() == dict(e.TRACKED_MANAGERS)
+
+
+# ── get_leaders: the coattail 'who's buying now' board ──
+
+def test_get_leaders_disabled(monkeypatch):
+    monkeypatch.setattr(sm.settings, "smart_money_enabled", False)
+    out = sm.get_leaders("CRYPTO")
+    assert out["available"] is False and out["leaders"] == []
+
+
+def test_get_leaders_crypto_dispatches_to_native(monkeypatch):
+    monkeypatch.setattr(sm.settings, "smart_money_enabled", True)
+    fake = types.SimpleNamespace(leaders=lambda limit: {"leaders": [{"coin": "BTC"}], "n_traders": 5})
+    monkeypatch.setattr(sm, "_native_module", lambda key: fake if key == "CRYPTO" else None)
+    out = sm.get_leaders("CRYPTO", 5)
+    assert out["available"] is True and out["market"] == "CRYPTO" and out["leaders"][0]["coin"] == "BTC"
+
+
+def test_get_leaders_per_symbol_market_returns_note(monkeypatch):
+    monkeypatch.setattr(sm.settings, "smart_money_enabled", True)
+    out = sm.get_leaders("IN")                       # IN bulk deals are per-symbol only
+    assert out["available"] is False and "note" in out
