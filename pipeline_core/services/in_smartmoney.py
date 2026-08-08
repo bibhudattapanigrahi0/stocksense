@@ -164,8 +164,87 @@ def signal_from_deals(df: Optional[pd.DataFrame], asof: Optional[pd.Timestamp] =
     return _annotate_aces(sig, side_df, direction)
 
 
+# ── Ace-investor HOLDINGS from the quarterly shareholding pattern (flag-gated) ──
+# The deeper ace signal: a named investor holding >1% of a company is disclosed each quarter in the
+# shareholding pattern — a standing conviction footprint, stronger than a single bulk deal. The MATCHER
+# below is complete and tested; the live FETCH is best-effort — NSE's API surface shifts and blocks
+# servers (endpoints currently 404/503 from many hosts), so it degrades to [] wherever it's unreachable
+# and the signal simply doesn't fire. Point `_fetch_shareholders` at a working feed to activate it.
+
+def _parse_shareholders(data) -> list[dict]:
+    """Defensively extract [{name, pct}] named public shareholders from a shareholding-pattern payload.
+    Tolerant of key naming since the exact NSE shape varies; unknown shapes ⇒ []. Pure."""
+    rows = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return []
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        name = r.get("name") or r.get("shareholder") or r.get("holderName") or r.get("clientName")
+        raw_pct = (r.get("pct") if r.get("pct") is not None else r.get("percentage")
+                   if r.get("percentage") is not None else r.get("holding")
+                   if r.get("holding") is not None else r.get("shareholding"))
+        try:
+            pct = float(str(raw_pct).replace("%", "").replace(",", "").strip()) if raw_pct is not None else None
+        except (TypeError, ValueError):
+            pct = None
+        if name:
+            out.append({"name": name, "pct": pct})
+    return out
+
+
+def ace_holdings_from_shareholders(shareholders: list[dict]) -> Optional[dict]:
+    """Named >1% public shareholders → an ace-investor holdings signal, matching against ACE_INVESTORS.
+    A standing ace holding is a bullish coattail footprint. None if no ace matches. Pure — unit-tested."""
+    matches = []
+    for sh in shareholders or []:
+        name = _match_ace(sh.get("name"))
+        if name:
+            matches.append((name, sh.get("pct")))
+    if not matches:
+        return None
+    matches.sort(key=lambda m: (m[1] or 0), reverse=True)
+    names = list(dict.fromkeys(m[0] for m in matches))
+    top_pct = matches[0][1]
+    pct_txt = f" holds {top_pct:.1f}%" if top_pct is not None else " holds a >1% stake"
+    return {
+        "available": True, "source": "nse-shareholding", "family": "ace",
+        "direction": "accumulate",          # a disclosed ace holding is a standing bullish footprint
+        "net_delta_pct": None, "conviction": "high",
+        "actors": names, "n_actors": len(names), "label": "Ace holding", "ace": True,
+        "detail": f"{names[0]}{pct_txt}" + (f" (+{len(names) - 1} more ace investor{'s' if len(names) > 2 else ''})"
+                                            if len(names) > 1 else ""),
+        "as_of": None,
+    }
+
+
+def _fetch_shareholders(symbol: str) -> list[dict]:
+    """Best-effort named >1% shareholders from NSE's shareholding pattern (network leaf, patched in
+    tests). Graceful: any non-200 / shift in NSE's API / parse issue ⇒ []. Swap in a working feed
+    (an NSE-reachable proxy, a cached export, or a data vendor) to activate the ace-holdings signal."""
+    try:
+        from pipeline_core.markets import display_ticker
+        from pipeline_core.services import nse_data
+        session = nse_data._nse_session()
+        url = f"{nse_data.NSE_BASE}/api/corporate-shareholding?symbol={display_ticker(symbol)}"
+        resp = session.get(url, timeout=12)
+        if resp.status_code != 200:
+            return []
+        return _parse_shareholders(resp.json())
+    except Exception as e:
+        logger.warning("Shareholding fetch failed for %s: %s", symbol, e)
+        return []
+
+
 def live_signal(symbol: str) -> Optional[dict]:
-    """Live NSE bulk/block-deal footprint for an IN symbol (smart_money contract)."""
+    """Live NSE smart-money footprint for an IN symbol (smart_money contract). When ace tracking is on,
+    a disclosed ace HOLDING (>1% in the shareholding pattern) is the strongest signal and wins; otherwise
+    fall back to bulk/block-deal activity (which itself names an ace when one appears on a deal)."""
+    if getattr(settings, "sm_in_ace_enabled", False):
+        holdings = ace_holdings_from_shareholders(_fetch_shareholders(symbol))
+        if holdings:
+            return holdings
     return signal_from_deals(parse_deals(_fetch_deals(symbol)))
 
 

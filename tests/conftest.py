@@ -61,9 +61,10 @@ def _hermetic_llm(monkeypatch):
     monkeypatch.setattr(crypto_smartmoney, "build_book",
                         lambda force=False: {"coins": {}, "n_traders": 0, "window": "month", "as_of": None})
 
-    # India smart-money (NSE bulk deals) is a live, often-blocked source; default to "no deals" so the
-    # IN bulk-deal signal/strategy stay inert offline. Tests opt back in with their own monkeypatch.
+    # India smart-money (NSE bulk deals + shareholding pattern) are live, often-blocked sources; default
+    # to "no data" so the IN signals/strategy stay inert offline. Tests opt back in with their own monkeypatch.
     monkeypatch.setattr(in_smartmoney, "_fetch_deals", lambda symbol: [])
+    monkeypatch.setattr(in_smartmoney, "_fetch_shareholders", lambda symbol: [])
 
     # Earnings dates are a live yfinance source (feeds the idea board's event-risk factor);
     # default to "no known earnings" so the ranking factor is neutral offline.

@@ -91,3 +91,37 @@ def test_ace_is_noop_when_disabled(monkeypatch):
                         lambda symbol: [_deal("07-Aug-2026", "BUY", "100000", "MUKUL AGRAWAL")])
     sig = inm.live_signal("X")
     assert sig["source"] == "nse-bulk-deals" and sig["label"] == "Bulk deal" and "ace" not in sig
+
+
+# ── Ace-investor HOLDINGS from the shareholding pattern (flag-gated) ──
+
+def test_ace_holdings_matcher_ranks_and_names():
+    sig = inm.ace_holdings_from_shareholders([
+        {"name": "MUKUL MAHAVIRPRASAD AGRAWAL", "pct": 3.2},
+        {"name": "SOME MUTUAL FUND", "pct": 5.0},        # not an ace ⇒ ignored
+        {"name": "ASHISH KACHOLIA", "pct": 1.4},
+    ])
+    assert sig["source"] == "nse-shareholding" and sig["family"] == "ace" and sig["direction"] == "accumulate"
+    assert sig["actors"][0] == "Mukul Agrawal" and sig["n_actors"] == 2 and "3.2%" in sig["detail"]
+
+
+def test_ace_holdings_none_without_ace():
+    assert inm.ace_holdings_from_shareholders([{"name": "LIC OF INDIA", "pct": 7.0}]) is None
+    assert inm.ace_holdings_from_shareholders([]) is None
+
+
+def test_parse_shareholders_is_key_tolerant():
+    rows = inm._parse_shareholders({"data": [
+        {"name": "A", "percentage": "3.5"}, {"shareholder": "B", "holding": 2},
+        {"pct": 1.0},                                    # no name ⇒ dropped
+        "garbage",                                       # non-dict ⇒ dropped
+    ]})
+    assert rows == [{"name": "A", "pct": 3.5}, {"name": "B", "pct": 2.0}]
+
+
+def test_live_signal_prefers_ace_holdings_over_bulk_deals(monkeypatch):
+    monkeypatch.setattr(inm.settings, "sm_in_ace_enabled", True)
+    monkeypatch.setattr(inm, "_fetch_shareholders", lambda symbol: [{"name": "VIJAY KEDIA", "pct": 2.5}])
+    monkeypatch.setattr(inm, "_fetch_deals", lambda symbol: [])   # even with no bulk deals, holding wins
+    sig = inm.live_signal("X")
+    assert sig["source"] == "nse-shareholding" and "Vijay Kedia" in sig["actors"]
