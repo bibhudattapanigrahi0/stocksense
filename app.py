@@ -856,6 +856,21 @@ async def smart_money_leaders(market: str = Query("IN"), limit: int = Query(10, 
     return await asyncio.to_thread(smart_money.get_leaders, market, limit)
 
 
+@app.get("/api/v1/backtest/coattail-basket")
+async def backtest_coattail_basket(max_per_bucket: int = 10, market: str = Query("IN")):
+    """The COATTAIL basket — today's curated basket filtered to names the smart money is accumulating
+    (SEC 13F+gurus / CFTC commercials / Hyperliquid top traders / NSE bulk buyers). "What to buy that
+    the pros are buying too." Read-only; also rides along on `/api/v1/backtest/ideas` as `coattail_basket`."""
+    from pipeline_core.backtest import runner
+
+    ideas = runner.horizon_ideas(max_per_bucket, market)
+    if ideas is None:
+        return {"enabled": True, "items": [], "market": market,
+                "note": f"No {market} backtest yet — run one in the Strategy Lab first."}
+    ideas = await runner.enrich_ideas_live(ideas, market)
+    return ideas.get("coattail_basket") or {"enabled": True, "items": [], "market": market}
+
+
 @app.post("/api/v1/backtest/basket/track")
 async def backtest_basket_track(max_per_bucket: int = 10, market: str = Query("IN")):
     """Commit the current curated basket as the day's anchor and track its members (idempotent). Tagged

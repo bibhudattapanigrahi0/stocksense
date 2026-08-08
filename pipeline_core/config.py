@@ -243,6 +243,8 @@ class Settings(BaseSettings):
     hold_min_conviction: int = 2               # only names ≥ this many agreeing strategies are hold-worthy
     hold_hysteresis_margin: float = 0.30       # incumbent stickiness (vs the daily 0.10) — hold, don't churn
     hold_displacement_conviction_gap: int = 2  # a fresh name only bumps a holding if its conviction is ≥ this higher
+    # Coattail basket — the daily basket filtered to names the smart money is accumulating (smart_money).
+    coattail_basket_enabled: bool = True       # ride-along on the board as `coattail_basket`
     hold_size_min: int = 3                     # hold-book size in risk-off
     hold_size_max: int = 5                     # hold-book size in risk-on (neutral = midpoint)
     # (the per-horizon score tilt favouring longer holds lives in basket.HOLD_HORIZON_FACTOR)

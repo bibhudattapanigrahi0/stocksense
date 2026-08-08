@@ -586,6 +586,25 @@ async def get_smart_money_leaders(market: str = "CRYPTO", limit: int = 10) -> di
 
 
 @mcp.tool
+async def get_coattail_basket(market: str = "IN", max_per_bucket: int = 10) -> dict:
+    """
+    The **coattail basket** — today's curated best-of restricted to names the SMART MONEY is buying too
+    (SEC 13F + gurus / CFTC commercials / Hyperliquid top traders / NSE bulk buyers). Use this for
+    "what should I buy that the proven money is also accumulating right now?" Same sizing/scoring as the
+    daily basket (¼-Kelly book, diversified) but every pick has smart-money backing. `summary` carries
+    `smart_money_backed` (how many names qualified). market ∈ {IN, US, METALS, CRYPTO}.
+    """
+    from pipeline_core.backtest import runner
+
+    ideas = runner.horizon_ideas(max_per_bucket, market)
+    if ideas is None:
+        return {"enabled": True, "items": [], "market": market,
+                "note": f"No {market} backtest yet — call run_backtest."}
+    ideas = await runner.enrich_ideas_live(ideas, market)
+    return ideas.get("coattail_basket") or {"enabled": True, "items": [], "market": market}
+
+
+@mcp.tool
 async def track_trade_basket(market: str = "IN", max_per_bucket: int = 10) -> dict:
     """
     Commit the current curated basket as the day's anchor and track its members so their outcome can be

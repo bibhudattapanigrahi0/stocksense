@@ -1404,6 +1404,10 @@ async def enrich_ideas_live(ideas: Optional[dict], market: str = "IN") -> Option
         if settings.hold_basket_enabled:
             ideas["hold_basket"] = basket.build_basket(
                 ideas, clusters, load_hold_basket(mk), hold_mode=True)
+        # The COATTAIL basket — the daily basket filtered to names the smart money is accumulating
+        # (services/smart_money). Read-only ride-along; "what to buy that the pros are buying too".
+        if settings.coattail_basket_enabled:
+            ideas["coattail_basket"] = basket.build_basket(ideas, clusters, coattail_mode=True)
 
     ideas["live_priced_at"] = datetime.now(timezone.utc).isoformat()
     return ideas

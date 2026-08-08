@@ -2,6 +2,9 @@
 
 from pipeline_core.services import crypto_smartmoney as cs
 
+# conftest neutralises cs.build_book offline; capture the real one for the tests that exercise it.
+_real_build_book = cs.build_book
+
 
 def _lb_row(addr, pnl, av=2_000_000, window="month", name=""):
     return {"ethAddress": addr, "displayName": name, "accountValue": str(av),
@@ -71,3 +74,41 @@ def test_series_and_enrich_are_noops():
     assert cs.series("BTC-USD") is None
     frames = {"BTC-USD": object()}
     cs.enrich_frames(frames)                        # live-only ⇒ must be a no-op, must not raise
+
+
+# ── Wallet labels (flag-gated) ──
+
+def test_label_fallbacks():
+    assert cs._label("0xABCDEF1234567890AA", "Cobie") == "Cobie"      # self-set name
+    assert cs._label("0xABCDEF1234567890AA", None).startswith("0xABCD")  # shortened address
+    cs.HL_LABELS["0xabc"] = "Whale#1"
+    try:
+        assert cs._label("0xABC") == "Whale#1"                        # curated label, case-insensitive
+    finally:
+        cs.HL_LABELS.pop("0xabc", None)
+
+
+def test_build_book_adds_top_traders_only_when_labels_enabled(monkeypatch):
+    monkeypatch.setattr(cs.settings, "hl_min_account_usd", 1_000_000)
+    monkeypatch.setattr(cs.settings, "hl_top_traders", 5)
+    monkeypatch.setattr(cs.settings, "hl_window", "month")
+    monkeypatch.setattr(cs, "_fetch_leaderboard",
+                        lambda: [_lb_row("0xAAA", 900, name="Cobie"), _lb_row("0xBBB", 800, name="")])
+    monkeypatch.setattr(cs, "_fetch_positions", lambda addr: [_pos("BTC", 1.0, 100_000)])
+    monkeypatch.setattr(cs.cache, "get", lambda *a, **k: None)        # avoid disk cache in tests
+    monkeypatch.setattr(cs.cache, "set", lambda *a, **k: None)
+
+    monkeypatch.setattr(cs.settings, "sm_crypto_labels_enabled", False)
+    assert "top_traders" not in _real_build_book(force=True)
+
+    monkeypatch.setattr(cs.settings, "sm_crypto_labels_enabled", True)
+    book = _real_build_book(force=True)
+    assert book["top_traders"][0]["label"] == "Cobie" and book["top_traders"][0]["pnl"] == 900
+
+
+def test_leaders_passes_through_top_traders(monkeypatch):
+    book = {"coins": {"BTC": {"net_notional": 1, "gross": 1, "n_long": 1, "n_short": 0}},
+            "n_traders": 1, "window": "month", "as_of": "t",
+            "top_traders": [{"label": "Cobie", "pnl": 900}]}
+    monkeypatch.setattr(cs, "build_book", lambda force=False: book)
+    assert cs.leaders(5)["top_traders"][0]["label"] == "Cobie"

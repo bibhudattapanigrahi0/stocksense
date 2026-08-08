@@ -79,6 +79,55 @@ def series(symbol: str) -> Optional[pd.DataFrame]:
     return out[~out.index.duplicated(keep="last")].sort_index()
 
 
+# ── Ace-investor name matching (flag-gated: sm_in_ace_enabled) ───────
+# Bulk-deal client names are disclosed, so a curated list of India's marquee investors lets us turn
+# "a large buyer stepped in" into "Mukul Agrawal bought". Substring match on the uppercased client name
+# (best-effort — a curated list needs maintenance, hence default-off). This is the non-fragile half of
+# the ace signal; the deeper quarterly shareholding-pattern scrape (>1% holdings) is still a TODO.
+ACE_INVESTORS: dict[str, str] = {
+    "JHUNJHUNWALA": "Jhunjhunwala (RARE Enterprises)",
+    "KACHOLIA": "Ashish Kacholia",
+    "MUKUL": "Mukul Agrawal",
+    "KEDIA": "Vijay Kedia",
+    "DOLLY KHANNA": "Dolly Khanna",
+    "DAMANI": "RK Damani",
+    "KELA": "Madhusudan Kela",
+    "SINGHANIA": "Sunil Singhania (Abakkus)",
+    "GOEL": "Anil Kumar Goel",
+}
+
+
+def _match_ace(client) -> Optional[str]:
+    c = str(client or "").upper()
+    for frag, name in ACE_INVESTORS.items():
+        if frag in c:
+            return name
+    return None
+
+
+def _annotate_aces(sig: dict, side_df, direction: str) -> dict:
+    """When sm_in_ace_enabled, upgrade a bulk-deal signal that involves a known ace investor — name
+    them, raise conviction, and relabel. No-op when the flag is off or no ace matches."""
+    if not getattr(settings, "sm_in_ace_enabled", False):
+        return sig
+    aces = list(dict.fromkeys(n for n in (_match_ace(c) for c in side_df["client"]) if n))
+    if not aces:
+        return sig
+    verb = "bought" if direction == "accumulate" else "sold"
+    out = dict(sig)
+    out.update({
+        "source": "nse-ace-investors",
+        "label": "Ace investor",
+        "ace": True,
+        "actors": aces + [a for a in sig.get("actors", []) if a not in aces],
+        "n_actors": len(aces),
+        "conviction": "high" if direction == "accumulate" else sig.get("conviction"),
+        "detail": f"Ace investor {verb}: " + ", ".join(aces[:2])
+                  + (f" +{len(aces) - 2} more" if len(aces) > 2 else ""),
+    })
+    return out
+
+
 def signal_from_deals(df: Optional[pd.DataFrame], asof: Optional[pd.Timestamp] = None) -> Optional[dict]:
     """Recent tidy deals → normalized smart-money signal (accumulate on a recent net buy). Pure."""
     if df is None or df.empty:
@@ -93,11 +142,12 @@ def signal_from_deals(df: Optional[pd.DataFrame], asof: Optional[pd.Timestamp] =
     if net == 0:
         return None
     direction = "accumulate" if net > 0 else "distribute"
-    actors = list(dict.fromkeys(c for c in (buys if net > 0 else sells)["client"] if c))[:3]
-    n = int((buys if net > 0 else sells).shape[0])
+    side_df = buys if net > 0 else sells
+    actors = list(dict.fromkeys(c for c in side_df["client"] if c))[:3]
+    n = int(side_df.shape[0])
     verb = "bought" if net > 0 else "sold"
     who = (actors[0][:28] + ("…" if actors and len(actors[0]) > 28 else "")) if actors else "large traders"
-    return {
+    sig = {
         "available": True,
         "source": "nse-bulk-deals",
         "family": "bulk_deal",
@@ -111,6 +161,7 @@ def signal_from_deals(df: Optional[pd.DataFrame], asof: Optional[pd.Timestamp] =
                   + (f" +{len(actors) - 1} more" if len(actors) > 1 else ""),
         "as_of": (df["date"].max()).isoformat(),
     }
+    return _annotate_aces(sig, side_df, direction)
 
 
 def live_signal(symbol: str) -> Optional[dict]:

@@ -220,3 +220,22 @@ def test_hysteresis_drops_broken_incumbent(_size_one):
     b = basket.build_basket(board, clusters={}, prev_basket=prev)
     assert [it["ticker"] for it in b["items"]] == ["X"]
     assert all(not it.get("carried") for it in b["items"])
+
+
+# ── Coattail basket: keep only names the smart money is accumulating ─────────
+
+def test_coattail_basket_keeps_only_smart_money_backed():
+    board = _board({
+        "short": [_cand("AAA", smart_money={"direction": "accumulate"}), _cand("BBB")],  # BBB: no signal
+        "medium": [_cand("CCC", smart_money={"direction": "distribute"}),                # measured, not buying
+                   _cand("DDD", smart_money={"direction": "accumulate"})],
+    })
+    b = basket.build_basket(board, clusters={}, coattail_mode=True)
+    assert {it["ticker"] for it in b["items"]} == {"AAA", "DDD"}
+    assert b["coattail_mode"] is True and b["summary"]["smart_money_backed"] == 2
+
+
+def test_coattail_basket_empty_when_no_backing():
+    board = _board({"short": [_cand("AAA"), _cand("BBB", smart_money={"direction": "distribute"})]})
+    b = basket.build_basket(board, clusters={}, coattail_mode=True)
+    assert b["items"] == [] and "smart-money backing" in b["note"]

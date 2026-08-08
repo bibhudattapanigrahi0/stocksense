@@ -341,8 +341,17 @@ _ITEM_KEYS = (
 )
 
 
+def _coattail_supportive(c: dict) -> bool:
+    """True when the smart money is ACCUMULATING this name — the normalized smart_money signal
+    runner attaches (13F/gurus, COT commercials, Hyperliquid top traders, NSE bulk buyers) points
+    'accumulate'. The filter for the coattail basket."""
+    sig = c.get("smart_money")
+    return bool(sig) and sig.get("direction") == "accumulate"
+
+
 def build_basket(ideas: Optional[dict], clusters: Optional[dict] = None,
-                 prev_basket: Optional[dict] = None, *, hold_mode: bool = False) -> dict:
+                 prev_basket: Optional[dict] = None, *, hold_mode: bool = False,
+                 coattail_mode: bool = False) -> dict:
     """Distil an enriched horizon board into one curated, sized, sticky basket. Pure (no I/O).
 
     `ideas`       — the board from `runner.horizon_ideas` **after** `enrich_ideas_live` (so candidates
@@ -352,6 +361,8 @@ def build_basket(ideas: Optional[dict], clusters: Optional[dict] = None,
     `hold_mode`   — build the COMMITTED hold book instead of the daily basket: a conviction floor, a
                     longer-horizon score tilt, wider hysteresis, and the hold-book size range → a smaller,
                     higher-conviction, stickier set built for staying power. False ⇒ the daily basket, unchanged.
+    `coattail_mode` — build the COATTAIL basket: same daily sizing/scoring, but keep ONLY names the smart
+                    money is accumulating (services/smart_money) — "what to buy that the pros are buying too".
 
     Returns the basket dict (see `_empty` for the shape). Disabled or an empty board ⇒ an empty basket.
     """
@@ -373,8 +384,15 @@ def build_basket(ideas: Optional[dict], clusters: Optional[dict] = None,
     # Hold mode: only well-agreed names are hold-worthy (conviction floor).
     if hold_mode:
         pool = [c for c in pool if (c.get("conviction") or 0) >= settings.hold_min_conviction]
+    # Coattail mode: only names the smart money is accumulating.
+    n_backed = 0
+    if coattail_mode:
+        pool = [c for c in pool if _coattail_supportive(c)]
+        n_backed = len(pool)
     if not pool:
         note = ("No names meet the hold-book conviction floor right now." if hold_mode
+                else "No current ideas have smart-money backing — nobody notable is accumulating these yet."
+                if coattail_mode
                 else "Every current idea has already hit its stop or target — nothing fresh to enter.")
         return _empty(market, regime, note)
     _attach_scores(pool)
@@ -402,8 +420,10 @@ def build_basket(ideas: Optional[dict], clusters: Optional[dict] = None,
     items = [{k: c.get(k) for k in _ITEM_KEYS if k in c} for c in picks]
     summary = _summary(picks, size)
     summary["excluded_spent"] = spent      # ideas dropped because live price already hit stop/target
+    if coattail_mode:
+        summary["smart_money_backed"] = n_backed   # names with smart-money accumulation to choose from
     return {
-        "enabled": True, "market": market, "hold_mode": hold_mode,
+        "enabled": True, "market": market, "hold_mode": hold_mode, "coattail_mode": coattail_mode,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "size": size, "regime_state": (regime or {}).get("state"),
         "items": items,

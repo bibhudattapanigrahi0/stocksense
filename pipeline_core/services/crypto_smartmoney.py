@@ -35,6 +35,20 @@ INFO_URL = "https://api.hyperliquid.xyz/info"
 HL_TTL = 1800                 # 30 min — top-trader positioning is slow-moving relative to a build
 _HTTP_TIMEOUT = 20
 
+# Curated address → known label (flag-gated: sm_crypto_labels_enabled). Seeded empty on purpose — we
+# never fabricate an identity; the scaffold falls back to the trader's self-set Hyperliquid displayName
+# and then a shortened address. Paid label providers (Nansen/Arkham) could populate this later.
+HL_LABELS: dict[str, str] = {}
+
+
+def _label(address: str, display_name: Optional[str] = None) -> str:
+    lab = HL_LABELS.get((address or "").lower())
+    if lab:
+        return lab
+    if display_name and display_name.strip():
+        return display_name.strip()
+    return (address[:6] + "…" + address[-4:]) if address and len(address) > 12 else (address or "anon")
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -152,6 +166,10 @@ def build_book(force: bool = False) -> dict:
                     continue      # one unreachable account must not sink the build
     out = {"coins": aggregate_positions(positions), "n_traders": len(top),
            "window": window, "as_of": _now_iso()}
+    if getattr(settings, "sm_crypto_labels_enabled", False):
+        out["top_traders"] = [{"label": _label(t["addr"], t.get("name")),
+                               "pnl": round(t["pnl"], 0), "account_value": round(t["account_value"], 0)}
+                              for t in top[:10]]
     cache.set(key, out, expire=HL_TTL)
     return out
 
@@ -220,8 +238,11 @@ def leaders(limit: int = 10) -> dict:
             "bias": "long" if e["net_notional"] > 0 else "short" if e["net_notional"] < 0 else "flat",
         })
     coins.sort(key=lambda c: abs(c["net_notional"]), reverse=True)
-    return {"leaders": coins[:limit], "n_traders": book.get("n_traders", 0),
-            "window": book.get("window"), "as_of": book.get("as_of")}
+    out = {"leaders": coins[:limit], "n_traders": book.get("n_traders", 0),
+           "window": book.get("window"), "as_of": book.get("as_of")}
+    if book.get("top_traders"):        # present only when sm_crypto_labels_enabled
+        out["top_traders"] = book["top_traders"]
+    return out
 
 
 def series(symbol: str):

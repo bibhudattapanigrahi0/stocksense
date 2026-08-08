@@ -71,3 +71,23 @@ def test_strategy_fires_on_bulk_buy_with_price_confirm():
     q.iloc[-1] = 100000.0                               # a net-buy bulk deal on the last day
     df = pd.DataFrame({"Close": close.values, "bulk_net_qty": q.values})
     assert bool(st.entry(df).iloc[-1]) is True
+
+
+# ── Ace-investor name matching (flag-gated) ──
+
+def test_ace_annotation_when_enabled(monkeypatch):
+    monkeypatch.setattr(inm.settings, "sm_in_ace_enabled", True)
+    monkeypatch.setattr(inm, "_fetch_deals", lambda symbol: [
+        _deal("07-Aug-2026", "BUY", "100000", "MUKUL MAHAVIRPRASAD AGRAWAL"),
+        _deal("06-Aug-2026", "BUY", "5000", "SOME PROP DESK LLP")])
+    sig = inm.live_signal("X")
+    assert sig["source"] == "nse-ace-investors" and sig["label"] == "Ace investor" and sig.get("ace") is True
+    assert "Mukul Agrawal" in sig["actors"] and sig["conviction"] == "high"
+
+
+def test_ace_is_noop_when_disabled(monkeypatch):
+    monkeypatch.setattr(inm.settings, "sm_in_ace_enabled", False)
+    monkeypatch.setattr(inm, "_fetch_deals",
+                        lambda symbol: [_deal("07-Aug-2026", "BUY", "100000", "MUKUL AGRAWAL")])
+    sig = inm.live_signal("X")
+    assert sig["source"] == "nse-bulk-deals" and sig["label"] == "Bulk deal" and "ace" not in sig

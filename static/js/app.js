@@ -1753,6 +1753,33 @@ function renderBasketCard(b) {
     </div>`;
 }
 
+// ── Coattail Basket: the daily basket filtered to names the smart money is buying too ──
+// Read-only sibling of Today's Basket — reuses the same row/stat renderers. Only shows when at least
+// one current idea has smart-money backing (13F/gurus, COT commercials, HL top traders, NSE bulk buyers).
+function renderCoattailCard(b) {
+    if (!b || !b.enabled || !(b.items || []).length) return "";
+    const s = b.summary || {};
+    const exp = s.expected_return_pct;
+    const backed = s.smart_money_backed != null ? s.smart_money_backed : b.items.length;
+    const expTile = basketStat("Expected return", `${exp != null && exp >= 0 ? "+" : ""}${fmt(exp, 1)}%`,
+        exp != null && exp >= 0 ? "pos" : "neg", "Alloc-weighted expected return on capital — an estimate from measured edge.");
+    const investedTile = basketStat("Invested", `${fmt(s.total_alloc_pct, 0)}%`, "",
+        `${fmt(s.total_alloc_pct, 0)}% deployed, ${fmt(s.cash_pct, 0)}% cash.`);
+    const backedTile = basketStat("Smart-money names", `${backed}`, "",
+        "How many current ideas the smart money is accumulating — the pool this basket is drawn from.");
+    return `<div class="card basket-card coattail-card">
+        <div class="basket-head">
+            <div class="basket-title">
+                <h3>🤝 Coattail Basket <span class="pill">${b.items.length} trade${b.items.length === 1 ? "" : "s"}</span></h3>
+                <span class="muted small">Today's basket, kept to names the <b>smart money is accumulating</b> — SEC&nbsp;13F&nbsp;&amp;&nbsp;gurus, CFTC commercials, Hyperliquid top traders, or NSE bulk buyers. Point-in-time confirmation, not part of the backtest.</span>
+            </div>
+        </div>
+        <div class="basket-metrics">${expTile}${investedTile}${backedTile}</div>
+        <div class="basket-items">${b.items.map((it, i) => basketItemRow(it, i)).join("")}</div>
+        <div class="basket-foot muted small">${esc(b.note || "")}</div>
+    </div>`;
+}
+
 // Commit + track the whole curated basket (also advances the sticky anchor).
 async function trackBasket(e) {
     const btn = e.currentTarget;
@@ -2022,7 +2049,7 @@ function renderTradeIdeasTab() {
         box.innerHTML = `<div class="card"><p class="muted">No <b>${esc(mkt().label || MARKET.key)}</b> trade ideas yet — run a backtest for this market in the <b>Strategy Lab</b> tab first. It scans every strategy's current buy signals, which this tab groups by time horizon.</p></div>`;
         return;
     }
-    box.innerHTML = renderBasketCard(IDEAS_DATA.basket) + cryptoRiskBanner(IDEAS_DATA.risk_note) + regimeBanner(IDEAS_DATA.regime) + pillarsBanner(IDEAS_DATA.pillars) + rankingBanner(IDEAS_DATA.ranking) + calibrationBanner(IDEAS_DATA.calibration, IDEAS_DATA.fusion) + horizons.map((h) => renderHorizonColumn(buckets[h])).join("");
+    box.innerHTML = renderBasketCard(IDEAS_DATA.basket) + renderCoattailCard(IDEAS_DATA.coattail_basket) + cryptoRiskBanner(IDEAS_DATA.risk_note) + regimeBanner(IDEAS_DATA.regime) + pillarsBanner(IDEAS_DATA.pillars) + rankingBanner(IDEAS_DATA.ranking) + calibrationBanner(IDEAS_DATA.calibration, IDEAS_DATA.fusion) + horizons.map((h) => renderHorizonColumn(buckets[h])).join("");
     updateIdeasRunInfo();
 
     box.querySelectorAll(".idea-row, .basket-item[data-ticker]").forEach((row) =>
