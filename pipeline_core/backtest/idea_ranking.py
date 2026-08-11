@@ -32,7 +32,10 @@ from pipeline_core.config import settings
 EARNINGS_WINDOW_DAYS = 7      # penalty ramps over the N calendar days before earnings
 SECTOR_RS_SCALE = 10.0       # sector out/under-performance (pp, 3-month) that maps to a strong tilt
 
-FACTOR_NAMES = ("earnings", "news", "sector", "quality")
+FACTOR_NAMES = ("earnings", "news", "sector", "quality", "smart_money")
+
+# Smart-money signal conviction → factor magnitude (direction sets the sign).
+SMART_MONEY_CONVICTION = {"high": 1.0, "medium": 0.6, "low": 0.3}
 
 
 def _clamp(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
@@ -75,6 +78,28 @@ def quality_factor(quality_score: Optional[float]) -> Optional[float]:
     return round(_clamp((float(quality_score) - 50.0) / 50.0), 4)
 
 
+def smart_money_factor(sig: Optional[dict]) -> Optional[float]:
+    """Smart-money accumulation as a symmetric tilt (long-only board): the pros ACCUMULATING lifts
+    an idea, DISTRIBUTING trims it, scaled by the signal's conviction. Market-agnostic over the
+    normalized smart-money signal (services/smart_money): 13F QoQ (US), COT (metals), Hyperliquid
+    whale net-flow (crypto), bulk deals (IN). None → neutral (no signal / can't judge direction).
+
+    Prefers the signal's own `net_delta_pct` magnitude when present (a −100..+100 read → [−1, +1]),
+    else falls back to the discrete conviction bucket. Sign always comes from the direction."""
+    if not sig or not sig.get("available"):
+        return None
+    direction = sig.get("direction")
+    if direction not in ("accumulate", "distribute"):
+        return None
+    sign = 1.0 if direction == "accumulate" else -1.0
+    delta = sig.get("net_delta_pct", sig.get("qoq_change_pct"))
+    if delta is not None:
+        mag = min(abs(float(delta)) / 100.0, 1.0)               # |Δ| 100% → full strength
+    else:
+        mag = SMART_MONEY_CONVICTION.get(sig.get("conviction"), 0.3)
+    return round(_clamp(sign * max(mag, 0.15)), 4)              # floor so a confirmed signal always counts
+
+
 def quality_score(info: Optional[dict]) -> Optional[float]:
     """A simple 0–100 fundamental-quality read (50 neutral) from a `get_stock_info` dict: rewards
     high ROE, low leverage, and healthy profit margins. Each present metric contributes a ±1 sub-
@@ -104,6 +129,7 @@ def rank_weights() -> dict:
     return {
         "earnings": settings.rank_w_earnings, "news": settings.rank_w_news,
         "sector": settings.rank_w_sector, "quality": settings.rank_w_quality,
+        "smart_money": settings.rank_w_smart_money,
         "min_multiplier": settings.rank_min_multiplier,     # quality gate: drop below this
         "earnings_window_days": EARNINGS_WINDOW_DAYS, "sector_rs_scale": SECTOR_RS_SCALE,
     }
@@ -114,7 +140,8 @@ def composite_multiplier(factors: dict, weights: Optional[dict] = None) -> float
     A missing/None factor or a zero weight contributes ×1, so the result is 1.0 when nothing
     applies — leaving the base ranking untouched."""
     w = weights or {"earnings": settings.rank_w_earnings, "news": settings.rank_w_news,
-                    "sector": settings.rank_w_sector, "quality": settings.rank_w_quality}
+                    "sector": settings.rank_w_sector, "quality": settings.rank_w_quality,
+                    "smart_money": settings.rank_w_smart_money}
     mult = 1.0
     for name in FACTOR_NAMES:
         f = factors.get(name)

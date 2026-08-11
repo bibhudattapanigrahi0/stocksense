@@ -179,6 +179,11 @@ class Settings(BaseSettings):
     # Fundamental quality: lift high-ROE / low-leverage / healthy-margin names, trim weak-quality
     # technical breakouts (from get_stock_info; equity-only, ~4y statement history). 0 disables it.
     rank_w_quality: float = 0.15
+    # Smart money: lift ideas the smart money is ACCUMULATING and trim ones it's distributing —
+    # market-agnostic over the normalized signal (US 13F QoQ, metals COT, crypto Hyperliquid whale
+    # net-flow, IN bulk deals; services/smart_money). Scaled by the signal's conviction. Already
+    # fetched per-idea for the 🏦 badge + coattail basket, so this adds no new fetch. 0 disables it.
+    rank_w_smart_money: float = 0.20
     # Factor attribution — measure each soft factor's REALIZED lift from the closed-idea ledger
     # (win-rate when the factor was supportive vs adverse at entry). A factor's supportive/adverse
     # cohort must each reach this many closed trades before a lift number is reported (else "need

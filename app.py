@@ -81,6 +81,16 @@ async def _auto_refresh_loop() -> None:
                                     mk, res.get("total_buys"), res.get("added_tracked"))
                 except Exception as e:
                     logger.warning("Auto-refresh failed for %s: %s", mk, e)
+                # Evaluate open ideas forward so any that hit their stop / target / time-stop are
+                # CLOSED on schedule — even when nobody opens the tracker. Otherwise a setup that
+                # should have timed out lingers as a "carried" board idea and crowds out fresh
+                # signals (open ideas were accumulating unbounded). Persists closures in place.
+                try:
+                    st = await runner.tracked_ideas_status(mk)
+                    logger.info("Idea lifecycle %s: %d open, %d closed",
+                                mk, len(st.get("open", [])), len(st.get("closed", [])))
+                except Exception as e:
+                    logger.warning("Idea lifecycle eval failed for %s: %s", mk, e)
                 # Evaluate alert triggers off the freshly-refreshed state (idea closures, watch
                 # levels, new ideas for watched tickers). Persisted + de-duplicated by fingerprint.
                 try:

@@ -21,10 +21,12 @@ from pipeline_core.backtest import basket, idea_ranking
 from pipeline_core.backtest.data_loader import load_benchmark, load_universe_history
 from pipeline_core.backtest.discovery import get_discovered_strategy, promoted_strategies
 from pipeline_core.backtest.engine import backtest_strategy, simulate
-from pipeline_core.backtest.strategies import STRATEGIES, StrategyDef
+from pipeline_core.backtest.strategies import (
+    ALL_STRATEGIES, STRATEGIES, StrategyDef, strategies_for_market,
+)
 from pipeline_core.config import DATA_DIR, settings
 from pipeline_core import calibration, dedup, fusion, sizing
-from pipeline_core.services import market_regime, smart_money
+from pipeline_core.services import market_regime, market_sentiment, smart_money
 from pipeline_core.services.market_data import (
     aget_price_history,
     get_index_tickers,
@@ -87,6 +89,19 @@ signals_job_state: dict = {
 # ── Signal scanning ────────────────────────────────────────────────
 
 
+def _last_close(df) -> Optional[float]:
+    """Latest close as a positive, finite price — or None if the last bar is degenerate
+    (0 / NaN / inf). Newly-listed or delisted coins can carry a bad final bar; seeding a
+    buy signal off it produces an idea with entry_price 0 that can NEVER stop/target out
+    (`_evaluate_idea_path` treats a falsy entry as still-open), so it gets carried forever.
+    Guarding here at the source keeps those broken $0.00 cards off the board entirely."""
+    try:
+        px = float(df["Close"].iloc[-1])
+    except Exception:
+        return None
+    return round_price(px) if np.isfinite(px) and px > 0 else None
+
+
 def scan_current_signals(
     strategy: StrategyDef,
     df_by_ticker: dict[str, pd.DataFrame],
@@ -142,13 +157,15 @@ def scan_current_signals(
             entry_sig = strategy.entry(df).reindex(df.index).fillna(False).astype(bool)
             window = entry_sig.to_numpy()[-lookback_days:]
             if window.any():
-                fire_idx = int(np.flatnonzero(window)[-1])
-                fire_date = str(entry_sig.index[-lookback_days + fire_idx].date())
-                buys.append({
-                    "ticker": ticker,
-                    "signal_date": fire_date,
-                    "price": round_price(df["Close"].iloc[-1]),
-                })
+                px = _last_close(df)                 # skip a degenerate last bar (0/NaN)
+                if px is not None:
+                    fire_idx = int(np.flatnonzero(window)[-1])
+                    fire_date = str(entry_sig.index[-lookback_days + fire_idx].date())
+                    buys.append({
+                        "ticker": ticker,
+                        "signal_date": fire_date,
+                        "price": px,
+                    })
         except Exception:
             continue
 
@@ -177,13 +194,15 @@ def scan_fresh_buys(strategy: StrategyDef, df_by_ticker: dict[str, pd.DataFrame]
             continue
         window = entry_sig.to_numpy()[-lookback_days:]
         if window.any():
-            fire_idx = int(np.flatnonzero(window)[-1])
-            fire_date = str(entry_sig.index[-lookback_days + fire_idx].date())
-            buys.append({
-                "ticker": ticker,
-                "signal_date": fire_date,
-                "price": round_price(df["Close"].iloc[-1]),
-            })
+            px = _last_close(df)                     # skip a degenerate last bar (0/NaN)
+            if px is not None:
+                fire_idx = int(np.flatnonzero(window)[-1])
+                fire_date = str(entry_sig.index[-lookback_days + fire_idx].date())
+                buys.append({
+                    "ticker": ticker,
+                    "signal_date": fire_date,
+                    "price": px,
+                })
     buys.sort(key=lambda x: x["signal_date"], reverse=True)
     return buys
 
@@ -237,8 +256,9 @@ async def run_full_backtest(
         # No-op / inert on markets without a source. See services/smart_money.enrich_frames.
         smart_money.enrich_frames(m.key, df_by_ticker)
 
-        # Curated strategies + any user-promoted discovered ones (they run like built-ins).
-        available = list(STRATEGIES) + promoted_strategies(m.key)
+        # Curated strategies (market-scoped — crypto runs its own trend/momentum set) + any
+        # user-promoted discovered ones (they run like built-ins).
+        available = list(strategies_for_market(m.key)) + promoted_strategies(m.key)
         strategies = available if strategy_ids is None else [s for s in available if s.id in strategy_ids]
         results = []
 
@@ -299,7 +319,7 @@ async def run_robustness(
     from pipeline_core.markets import get_market
 
     m = get_market(market)
-    available = list(STRATEGIES) + promoted_strategies(m.key)
+    available = list(strategies_for_market(m.key)) + promoted_strategies(m.key)
     strat = next((s for s in available if s.id == strategy_id), None) or get_discovered_strategy(strategy_id, m.key)
     if strat is None:
         return {"error": f"unknown strategy '{strategy_id}' for {m.key}"}
@@ -386,7 +406,7 @@ async def refresh_current_signals(market: str = "IN", years: int = 2, lookback_d
         if not df_by_ticker:
             return {"updated": False, "note": "No fresh price history loaded."}
 
-        by_id = {s.id: s for s in STRATEGIES}
+        by_id = {s.id: s for s in strategies_for_market(mk)}
         for s in promoted_strategies(mk):        # promoted discovered strategies refresh too
             by_id.setdefault(s.id, s)
         as_of = ""
@@ -450,7 +470,7 @@ def _serialize(
     benchmark_label: str = "NIFTY 50",
 ) -> dict:
     benchmark_equity = next((r["benchmark_equity"] for r in results if not r["benchmark_equity"].empty), pd.Series(dtype=float))
-    by_id = {s.id: s for s in STRATEGIES}
+    by_id = {s.id: s for s in strategies_for_market(market)}
     for s in promoted_strategies(market):        # resolve promoted discovered strategies too
         by_id.setdefault(s.id, s)
     strategies_payload = []
@@ -610,7 +630,9 @@ SORT_KEY_MAP = {
 SORT_KEYS = list(SORT_KEY_MAP)
 
 
-_STRATEGY_BY_ID: dict[str, StrategyDef] = {s.id: s for s in STRATEGIES}
+# Union across markets so a persisted signal's id resolves regardless of which market produced it
+# (crypto ideas carry crypto-native ids that aren't in the default STRATEGIES list).
+_STRATEGY_BY_ID: dict[str, StrategyDef] = {s.id: s for s in ALL_STRATEGIES}
 
 
 def _strategy_plan(strategy_id: str, market: str = "IN") -> dict:
@@ -635,7 +657,7 @@ def strategy_library(market: str = "IN") -> list[dict]:
     lib = [
         {"id": s.id, "name": s.name, "category": s.category, "description": s.description,
          "plan": _strategy_plan(s.id), "discovered": False}
-        for s in STRATEGIES
+        for s in strategies_for_market(market)
     ]
     for s in promoted_strategies(market):
         lib.append({"id": s.id, "name": s.name, "category": s.category, "description": s.description,
@@ -1138,9 +1160,11 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
                 ),
             })
         # Carry over still-open tracked ideas not re-signalled this scan, so a good setup persists
-        # on the board (ranked by win rate alongside fresh ones) until it actually closes.
+        # on the board (ranked by win rate alongside fresh ones) until it actually closes. Skip any
+        # with a non-positive entry price — legacy broken records that render as $0.00 cards and can
+        # never close (they're purged separately); dropping them here keeps the board clean meanwhile.
         for t in open_tracked.get(h, []):
-            if t["ticker"] not in fresh_tickers:
+            if t["ticker"] not in fresh_tickers and (t.get("entry_price") or 0) > 0:
                 cands.append(_carried_candidate(t))
         # Crypto risk gate: a fresh idea only survives if a non-catastrophic strategy backs it
         # (eligible_conviction ≥ 1). Carried open positions are kept regardless. Never empties a
@@ -1349,6 +1373,9 @@ async def enrich_ideas_live(ideas: Optional[dict], market: str = "IN") -> Option
             # `smart_money`. The normalized signal is a superset, so the badge renders unchanged.
             c["inst_ownership"] = (own if own and own.get("available")
                                    and own.get("source") in ("edgar-13f", "yfinance") else None)
+            # Smart-money rank tilt: accumulation lifts the idea, distribution trims it (scaled by the
+            # signal's conviction). Same normalized signal the badge/coattail already use — no new fetch.
+            c["smart_money_factor"] = idea_ranking.smart_money_factor(c["smart_money"])
             # Earnings event risk: days to the next report + a soft rank penalty that ramps up inside
             # the window (idea_ranking.earnings_factor). None outside the window / non-equity markets.
             dte = days_earn.get(c["ticker"])
@@ -1471,11 +1498,15 @@ async def snapshot_current_ideas(max_per_bucket: int = 10, market: str = "IN") -
                 continue                               # already open — same live idea
             if key in last_exit and not (sig and sig > last_exit[key]):
                 continue                               # same closed cycle, not a re-entry
+            entry_px = c.get("price") or c.get("live_price")
+            if not entry_px or entry_px <= 0:
+                continue                               # never track a priceless idea — it can
+                                                       # never stop/target out and would carry forever
             tracked.append({
                 "ticker": c["ticker"],
                 "market": idea_market,
                 "horizon": h,
-                "entry_price": c["price"],
+                "entry_price": entry_px,
                 "buy_low": c.get("buy_low"),
                 "buy_high": c.get("buy_high"),
                 "stop_pct": c["stop_pct"],
@@ -1495,6 +1526,7 @@ async def snapshot_current_ideas(max_per_bucket: int = 10, market: str = "IN") -
                 "factors": {
                     "earnings": c.get("earnings_factor"), "news": c.get("news_factor"),
                     "sector": c.get("sector_factor"), "quality": c.get("quality_factor"),
+                    "smart_money": c.get("smart_money_factor"),
                     "rank_multiplier": c.get("rank_multiplier"), "regime_fit": c.get("regime_fit"),
                 },
             })

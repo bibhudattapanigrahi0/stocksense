@@ -44,6 +44,21 @@ def test_quality_score_from_fundamentals():
     assert ir.quality_factor(ir.quality_score(strong)) > 0.5                  # strong → positive tilt
 
 
+def test_smart_money_factor():
+    # accumulation lifts (magnitude tracks net_delta_pct), distribution trims
+    assert ir.smart_money_factor({"available": True, "direction": "accumulate", "net_delta_pct": 35.4}) == 0.354
+    assert ir.smart_money_factor({"available": True, "direction": "distribute", "conviction": "high"}) == -1.0
+    # falls back to the conviction bucket when there's no delta magnitude
+    assert ir.smart_money_factor({"available": True, "direction": "accumulate", "conviction": "medium"}) == 0.6
+    # a confirmed but tiny signal still counts (floored), and neutral/absent → None
+    assert ir.smart_money_factor({"available": True, "direction": "accumulate", "net_delta_pct": 2.0}) == 0.15
+    assert ir.smart_money_factor({"available": True, "direction": "hold"}) is None
+    assert ir.smart_money_factor(None) is None
+    assert ir.smart_money_factor({"available": False, "direction": "accumulate"}) is None
+    # it feeds the composite rank (accumulation → multiplier > 1)
+    assert ir.composite_multiplier({"smart_money": 1.0}, {"smart_money": 0.2}) == 1.2
+
+
 def test_composite_multiplier_neutral_is_one():
     assert ir.composite_multiplier({}) == 1.0
     assert ir.composite_multiplier({"earnings": None, "news": None}) == 1.0
@@ -293,4 +308,4 @@ def test_factor_attribution_empty():
     r = ir.factor_attribution([])
     assert r["sample"] == 0 and r["baseline"]["win_rate"] is None
     assert all(f["status"] == "insufficient" for f in r["factors"].values())
-    assert set(r["factors"]) == {"earnings", "news", "sector", "quality", "regime"}
+    assert set(r["factors"]) == {"earnings", "news", "sector", "quality", "smart_money", "regime"}

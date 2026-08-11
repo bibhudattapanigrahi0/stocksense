@@ -900,3 +900,128 @@ CATEGORIES = sorted({s.category for s in STRATEGIES})
 
 def get_strategy(strategy_id: str) -> StrategyDef:
     return _BY_ID[strategy_id]
+
+
+# ── Crypto-native strategies (regime-gated trend / breakout, wide stops) ──────────
+# Crypto used to run the full equity library unchanged, including 10 mean-reversion +
+# contrarian strategies that catch falling knives in crypto bear markets (−90%+ backtested
+# drawdowns) and dilute idea conviction with near-wipeout votes. For CRYPTO we instead run a
+# curated TREND / MOMENTUM / BREAKOUT subset (the regime-aware half of the library) plus the
+# crypto-tuned strategies below. Every long here is gated by a per-coin risk-on filter — price
+# above a *rising* long MA, since there's no BTC series inside a single-coin entry fn — and
+# carries a WIDE trailing stop, because crypto's ordinary noise shakes out equity-tight stops.
+
+
+def _crypto_regime_ok(df: pd.DataFrame, n: int = 100) -> pd.Series:
+    """Per-coin risk-on proxy: price above a *rising* long MA. Stands in for a market-wide
+    (BTC) regime filter, which isn't available inside a single-coin entry signal."""
+    c = df["Close"]
+    ma = ind.sma(c, n)
+    return (c > ma) & (ma > ma.shift(10))
+
+
+def _crypto_breakout_entry(df: pd.DataFrame) -> pd.Series:
+    """Donchian 20-day high breakout, taken only in a risk-on regime."""
+    c = df["Close"]
+    return _fill((c > ind.rolling_high(c, 20)) & _crypto_regime_ok(df, 100))
+
+
+def _crypto_trend_exit(df: pd.DataFrame) -> pd.Series:
+    """Structural exit: close crosses below the 50-DMA (trend broken)."""
+    c = df["Close"]
+    return _fill(_crosses_below(c, ind.sma(c, 50)))
+
+
+def _crypto_momentum_entry(df: pd.DataFrame) -> pd.Series:
+    """Strong 30-day momentum emerging (ROC crosses above +20%) in a risk-on regime."""
+    c = df["Close"]
+    return _fill(_crosses_above(ind.roc(c, 30), pd.Series(20.0, index=df.index))
+                 & _crypto_regime_ok(df, 100))
+
+
+def _crypto_supertrend_entry(df: pd.DataFrame) -> pd.Series:
+    """Supertrend bullish flip confirmed by a risk-on regime."""
+    up = ind.supertrend(df["High"], df["Low"], df["Close"], 10, 3.0)["uptrend"]
+    flip = up & ~up.shift(1).fillna(False).astype(bool)
+    return _fill(flip & _crypto_regime_ok(df, 100))
+
+
+_CRYPTO_NATIVE: list[StrategyDef] = [
+    StrategyDef(
+        id="crypto-breakout-regime",
+        name="Crypto Breakout (Regime-Gated)",
+        category="Breakout",
+        description="Crypto: buy a 20-day high breakout only while price is above a rising 100-DMA "
+                    "(risk-on); ride with a wide 15% trailing stop or exit on a 50-DMA break. The wide "
+                    "stop is deliberate — ordinary crypto noise shakes out equity-tight stops.",
+        entry=_crypto_breakout_entry,
+        exit=_crypto_trend_exit,
+        trailing_stop_pct=0.15,
+        max_holding_days=45,
+        min_bars=140,
+    ),
+    StrategyDef(
+        id="crypto-momentum-regime",
+        name="Crypto Momentum (Regime-Gated)",
+        category="Momentum",
+        description="Crypto: buy when 30-day momentum crosses above +20% in a risk-on regime (price "
+                    "above a rising 100-DMA); exit on a 50-DMA break or after 40 days. Wide 18% trail.",
+        entry=_crypto_momentum_entry,
+        exit=_crypto_trend_exit,
+        trailing_stop_pct=0.18,
+        max_holding_days=40,
+        min_bars=140,
+    ),
+    StrategyDef(
+        id="crypto-supertrend-regime",
+        name="Crypto Supertrend (Regime-Gated)",
+        category="Trend",
+        description="Crypto: enter on a Supertrend bullish flip confirmed by a risk-on regime (above a "
+                    "rising 100-DMA); exit on the bearish flip. Wide 20% trailing stop.",
+        entry=_crypto_supertrend_entry,
+        exit=_supertrend_flip_exit,
+        trailing_stop_pct=0.20,
+        min_bars=140,
+    ),
+]
+
+
+# The TREND / MOMENTUM / BREAKOUT / footprint-accumulation half of the library — regime-aware,
+# momentum-persistent, what actually works in crypto. Daily mean-reversion / contrarian strategies
+# and the market-specific accumulation strategies (13F / COT / bulk-deal) are excluded for crypto.
+_CRYPTO_REUSE_IDS = [
+    # Trend
+    "golden-cross", "ma-20-50-cross", "dma200-regime", "trend-pullback-50dma",
+    "ema-9-21-cross", "triple-ema-alignment", "supertrend-flip", "adx-trend-rider",
+    # Momentum
+    "rsi-momentum-thrust", "macd-bull-cross-200dma", "volume-surge-thrust",
+    "gap-up-continuation", "roc-momentum", "keltner-breakout",
+    # Breakout
+    "fifty-two-week-high-breakout", "donchian-20-breakout", "donchian-55-turtle",
+    "bollinger-upper-breakout", "volatility-squeeze-breakout", "nr7-breakout",
+    "inside-bar-breakout", "volatility-contraction-breakout",
+    # Volume / footprint accumulation (price/volume based, market-agnostic)
+    "obv-breakout", "institutional-accumulation", "accumulation-breakout", "money-flow-thrust",
+]
+
+CRYPTO_STRATEGIES: list[StrategyDef] = [_BY_ID[i] for i in _CRYPTO_REUSE_IDS] + _CRYPTO_NATIVE
+
+
+STRATEGIES_BY_MARKET: dict[str, list[StrategyDef]] = {
+    "CRYPTO": CRYPTO_STRATEGIES,
+}
+
+
+def strategies_for_market(market: str) -> list[StrategyDef]:
+    """The backtest strategy set for a market. Most markets run the full equity+shared library
+    (`STRATEGIES`); CRYPTO runs a curated trend/momentum/breakout set plus crypto-native
+    strategies (`CRYPTO_STRATEGIES`), because the daily mean-reversion strategies catch falling
+    knives in crypto bear markets. Definitions are shared objects — safe to read, never mutate."""
+    return STRATEGIES_BY_MARKET.get((market or "IN").upper(), STRATEGIES)
+
+
+# Union of every market's strategies, de-duplicated by id — the global lookup used to resolve a
+# persisted signal's id back to its StrategyDef regardless of which market produced it.
+ALL_STRATEGIES: list[StrategyDef] = list(
+    {s.id: s for lst in [STRATEGIES, *STRATEGIES_BY_MARKET.values()] for s in lst}.values()
+)
