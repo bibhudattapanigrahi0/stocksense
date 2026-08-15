@@ -33,11 +33,12 @@ _PAPER_SOURCES = ("idea", "basket", "multibagger")   # paper sources that carry 
 
 # ── Pure scoring core ───────────────────────────────────────────────
 
-def _pct(entry: Optional[float], exit_: Optional[float]) -> Optional[float]:
-    """Return % from entry to exit (long), or None if unpriceable."""
+def _pct(entry: Optional[float], exit_: Optional[float], side: str = "long") -> Optional[float]:
+    """Return % from entry to exit, or None if unpriceable. A SHORT earns the inverse move."""
     if not entry or exit_ is None or entry <= 0:
         return None
-    return round((exit_ - entry) / entry * 100, 2)
+    sign = -1 if side == "short" else 1
+    return round(sign * (exit_ - entry) / entry * 100, 2)
 
 
 def _compound(rets: list) -> Optional[float]:
@@ -48,13 +49,16 @@ def _compound(rets: list) -> Optional[float]:
     return round((prod(1 + r / 100.0 for r in vals) - 1) * 100, 2)
 
 
-def exit_delta(entry: Optional[float], your_exit: Optional[float], plan_exit: Optional[float]) -> dict:
+def exit_delta(entry: Optional[float], your_exit: Optional[float], plan_exit: Optional[float],
+               side: str = "long") -> dict:
     """Compare your exit to the plan's exit, entry held constant. Returns {delta_pct, verdict}.
-    verdict: 'followed' (≈ the plan), 'early_cost' (you got out below the plan), 'early_saved' (above it),
-    or 'unknown' when unpriceable."""
+    verdict: 'followed' (≈ the plan), 'early_cost' (you got out worse than the plan), 'early_saved'
+    (better than it), or 'unknown' when unpriceable. For a SHORT the P&L sign flips — covering ABOVE
+    the plan's exit costs you — so `delta` is measured on the short's return, not the raw price move."""
     if not entry or your_exit is None or plan_exit is None or entry <= 0:
         return {"delta_pct": None, "verdict": "unknown"}
-    delta = round((your_exit - plan_exit) / entry * 100, 2)
+    sign = -1 if side == "short" else 1
+    delta = round(sign * (your_exit - plan_exit) / entry * 100, 2)
     if abs(delta) < FOLLOWED_EPS:
         verdict = "followed"
     elif delta < 0:
@@ -66,18 +70,19 @@ def exit_delta(entry: Optional[float], your_exit: Optional[float], plan_exit: Op
 
 def build_row(*, ticker: str, horizon: Optional[str], source: str, entry: Optional[float],
               your_exit: Optional[float], plan_exit: Optional[float], plan_reason: Optional[str],
-              acted_out: bool) -> dict:
+              acted_out: bool, side: str = "long") -> dict:
     """One comparison row for the scorecard. `acted_out` False (you're still holding / following the
-    plan) ⇒ verdict 'followed', delta 0 — an ongoing hold is neither credited nor penalised."""
+    plan) ⇒ verdict 'followed', delta 0 — an ongoing hold is neither credited nor penalised. `side`
+    flips the P&L / delta sign for shorts."""
     if not acted_out:
-        return {"ticker": ticker, "horizon": horizon, "source": source, "entry": entry,
+        return {"ticker": ticker, "horizon": horizon, "source": source, "entry": entry, "side": side,
                 "your_exit": your_exit, "plan_exit": plan_exit, "plan_reason": plan_reason,
-                "your_return_pct": _pct(entry, your_exit), "plan_return_pct": _pct(entry, plan_exit),
+                "your_return_pct": _pct(entry, your_exit, side), "plan_return_pct": _pct(entry, plan_exit, side),
                 "delta_pct": 0.0, "verdict": "followed", "acted_out": False}
-    d = exit_delta(entry, your_exit, plan_exit)
-    return {"ticker": ticker, "horizon": horizon, "source": source, "entry": entry,
+    d = exit_delta(entry, your_exit, plan_exit, side)
+    return {"ticker": ticker, "horizon": horizon, "source": source, "entry": entry, "side": side,
             "your_exit": your_exit, "plan_exit": plan_exit, "plan_reason": plan_reason,
-            "your_return_pct": _pct(entry, your_exit), "plan_return_pct": _pct(entry, plan_exit),
+            "your_return_pct": _pct(entry, your_exit, side), "plan_return_pct": _pct(entry, plan_exit, side),
             "delta_pct": d["delta_pct"], "verdict": d["verdict"], "acted_out": True}
 
 
@@ -136,7 +141,7 @@ async def discipline_scorecard(market: Optional[str] = None, user_id: Optional[s
         rows.append(build_row(
             ticker=it.get("ticker"), horizon=it.get("horizon"), source="tracked",
             entry=entry, your_exit=your_exit, plan_exit=plan_exit,
-            plan_reason=it.get("exit_reason"), acted_out=acted_out))
+            plan_reason=it.get("exit_reason"), acted_out=acted_out, side=it.get("side", "long")))
 
     # 2) Paper path — idea/basket/multibagger-sourced paper trades vs the plan replayed on price history.
     acct = await run_store.get_paper(mk or "IN", user_id=user_id) if mk else None
@@ -156,6 +161,7 @@ async def discipline_scorecard(market: Optional[str] = None, user_id: Optional[s
                                              runner._period_for_days(days + 10), "1d", paper_mk)
             pseudo = {"entry_price": pos["entry_price"], "stop_price": pos["stop"],
                       "target_price": pos["target"], "signal_date": opened,
+                      "side": pos.get("side", "long"),      # replay the short's stop/target correctly
                       "horizon": _horizon_from_source(pos.get("source")) or "medium"}
             outcome = runner._evaluate_idea_path(pseudo, df)
             if outcome:                                   # plan closed on stop/target/time
@@ -174,6 +180,6 @@ async def discipline_scorecard(market: Optional[str] = None, user_id: Optional[s
                 ticker=pos.get("ticker"), horizon=_horizon_from_source(pos.get("source")),
                 source=pos.get("source", "paper"), entry=pos.get("entry_price"),
                 your_exit=your_exit, plan_exit=plan_exit, plan_reason=plan_reason,
-                acted_out=acted_out))
+                acted_out=acted_out, side=pos.get("side", "long")))
 
     return {"market": mk, "rows": rows, "scorecard": scorecard(rows)}

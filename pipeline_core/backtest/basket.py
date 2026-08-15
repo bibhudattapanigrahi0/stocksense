@@ -166,15 +166,20 @@ def score_candidate(idea: dict, rank_norm: float, weights: Optional[dict] = None
 
 # ── Pool + score the whole board ────────────────────────────────────
 
-def _pool(ideas: dict) -> list[dict]:
+def _pool(ideas: dict, side: str = "long") -> list[dict]:
     """Flatten every horizon's shown candidates into one list of COPIES, each tagged with its
-    `horizon`/`horizon_label` (copies so basket sizing never mutates the board candidates below)."""
+    `horizon`/`horizon_label` (copies so basket sizing never mutates the board candidates below).
+    `side="long"` (default) keeps long ideas only — the curated/coattail/hold baskets are long books;
+    `side="short"` keeps shorts only — the sell-side coattail SHORT sleeve (crypto)."""
+    want_short = side == "short"
     pool: list[dict] = []
     buckets = ideas.get("buckets") or {}
     for h in ideas.get("horizons", []):
         b = buckets.get(h) or {}
         label = b.get("label", h)
         for c in b.get("candidates", []):
+            if (c.get("side") == "short") != want_short:
+                continue                     # keep only the requested direction
             d = copy(c)
             d["horizon"] = h
             d["horizon_label"] = label
@@ -199,12 +204,15 @@ def _attach_scores(pool: list[dict]) -> None:
 
 # ── Selection: greedy, diversified, hysteresis-aware ────────────────
 
-def _basket_size(regime: Optional[dict], hold_mode: bool = False) -> int:
+def _basket_size(regime: Optional[dict], hold_mode: bool = False, invert: bool = False) -> int:
     """Regime-scaled target size: risk-on → max, risk-off → min, neutral/offline → the midpoint.
-    Hold mode uses the (typically tighter) hold-book size range."""
+    Hold mode uses the (typically tighter) hold-book size range. `invert` flips risk-on/off for a SHORT
+    book — a risk-OFF tide is a tailwind for shorts, so it should surface MORE of them, not fewer."""
     lo = settings.hold_size_min if hold_mode else settings.basket_size_min
     hi = settings.hold_size_max if hold_mode else settings.basket_size_max
     state = (regime or {}).get("state")
+    if invert:
+        state = "risk-on" if state == "risk-off" else "risk-off" if state == "risk-on" else state
     if state == "risk-on":
         return hi
     if state == "risk-off":
@@ -338,6 +346,7 @@ _ITEM_KEYS = (
     "win_prob", "win_prob_source", "expected_return_pct", "basket_score", "basket_terms",
     "alloc_pct", "risk_pct", "kelly_used", "regime_fit", "regime_size_factor",
     "is_new", "carried", "zone", "live_price", "live_change_pct", "cluster", "cluster_peers",
+    "side", "smart_money",
 )
 
 
@@ -349,9 +358,16 @@ def _coattail_supportive(c: dict) -> bool:
     return bool(sig) and sig.get("direction") == "accumulate"
 
 
+def _coattail_distributing(c: dict) -> bool:
+    """True when the smart money is DISTRIBUTING (selling / net-short) this name — the sell-side mirror
+    of `_coattail_supportive`. The filter for the coattail SHORT sleeve (crypto whales net-short)."""
+    sig = c.get("smart_money")
+    return bool(sig) and sig.get("direction") == "distribute"
+
+
 def build_basket(ideas: Optional[dict], clusters: Optional[dict] = None,
                  prev_basket: Optional[dict] = None, *, hold_mode: bool = False,
-                 coattail_mode: bool = False) -> dict:
+                 coattail_mode: bool = False, distribute_mode: bool = False) -> dict:
     """Distil an enriched horizon board into one curated, sized, sticky basket. Pure (no I/O).
 
     `ideas`       — the board from `runner.horizon_ideas` **after** `enrich_ideas_live` (so candidates
@@ -363,6 +379,9 @@ def build_basket(ideas: Optional[dict], clusters: Optional[dict] = None,
                     higher-conviction, stickier set built for staying power. False ⇒ the daily basket, unchanged.
     `coattail_mode` — build the COATTAIL basket: same daily sizing/scoring, but keep ONLY names the smart
                     money is accumulating (services/smart_money) — "what to buy that the pros are buying too".
+    `distribute_mode` — build the sell-side COATTAIL SHORT sleeve: pool SHORT ideas and keep ONLY names the
+                    smart money is DISTRIBUTING (crypto whales net-short) — "the short book the pros are on".
+                    Regime size + risk haircut are inverted (a risk-off tide is a tailwind for shorts).
 
     Returns the basket dict (see `_empty` for the shape). Disabled or an empty board ⇒ an empty basket.
     """
@@ -373,9 +392,11 @@ def build_basket(ideas: Optional[dict], clusters: Optional[dict] = None,
     if not ideas or not ideas.get("buckets"):
         return _empty(market, regime, "No trade ideas yet — run a backtest for this market first.")
 
-    pool = _pool(ideas)
+    pool = _pool(ideas, side="short" if distribute_mode else "long")
     if not pool:
-        return _empty(market, regime, "No current buy signals to curate.")
+        return _empty(market, regime,
+                      "No current short signals to curate." if distribute_mode
+                      else "No current buy signals to curate.")
     # A basket is "enter these now", so drop names whose live price has already SPENT the plan — broken
     # its stop or reached its target (a bad fresh entry). Offline (zone=None) nothing is dropped. The
     # full board below still shows them with their zone pill.
@@ -384,15 +405,21 @@ def build_basket(ideas: Optional[dict], clusters: Optional[dict] = None,
     # Hold mode: only well-agreed names are hold-worthy (conviction floor).
     if hold_mode:
         pool = [c for c in pool if (c.get("conviction") or 0) >= settings.hold_min_conviction]
-    # Coattail mode: only names the smart money is accumulating.
+    # Coattail mode: only names the smart money is accumulating. Distribute mode: only shorts the smart
+    # money is distributing (the sell-side mirror).
     n_backed = 0
     if coattail_mode:
         pool = [c for c in pool if _coattail_supportive(c)]
+        n_backed = len(pool)
+    elif distribute_mode:
+        pool = [c for c in pool if _coattail_distributing(c)]
         n_backed = len(pool)
     if not pool:
         note = ("No names meet the hold-book conviction floor right now." if hold_mode
                 else "No current ideas have smart-money backing — nobody notable is accumulating these yet."
                 if coattail_mode
+                else "No shorts have smart-money backing — the pros aren't notably net-short these yet."
+                if distribute_mode
                 else "Every current idea has already hit its stop or target — nothing fresh to enter.")
         return _empty(market, regime, note)
     _attach_scores(pool)
@@ -402,8 +429,10 @@ def build_basket(ideas: Optional[dict], clusters: Optional[dict] = None,
             c["basket_score"] = round((c.get("basket_score") or 0.0)
                                       * HOLD_HORIZON_FACTOR.get(c.get("horizon"), 1.0), 4)
 
-    size = _basket_size(regime, hold_mode)
+    size = _basket_size(regime, hold_mode, invert=distribute_mode)
     tilt = (regime or {}).get("tilt") or 0.0
+    if distribute_mode:
+        tilt = -tilt          # a short book's tailwind is the market's headwind (risk-off favours shorts)
     incumbents = _incumbent_keys(prev_basket, pool)
     margin = settings.hold_hysteresis_margin if hold_mode else settings.basket_hysteresis_margin
 
@@ -420,10 +449,11 @@ def build_basket(ideas: Optional[dict], clusters: Optional[dict] = None,
     items = [{k: c.get(k) for k in _ITEM_KEYS if k in c} for c in picks]
     summary = _summary(picks, size)
     summary["excluded_spent"] = spent      # ideas dropped because live price already hit stop/target
-    if coattail_mode:
-        summary["smart_money_backed"] = n_backed   # names with smart-money accumulation to choose from
+    if coattail_mode or distribute_mode:
+        summary["smart_money_backed"] = n_backed   # names with smart-money backing to choose from
     return {
         "enabled": True, "market": market, "hold_mode": hold_mode, "coattail_mode": coattail_mode,
+        "distribute_mode": distribute_mode,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "size": size, "regime_state": (regime or {}).get("state"),
         "items": items,
@@ -526,3 +556,134 @@ def hold_rebalance_plan(held: list[dict], fresh_items: list[dict], *, target_siz
         counts[a["action"]] = counts.get(a["action"], 0) + 1
     target = [h["ticker"] for h in surviving] + [it["ticker"] for it in adds]
     return {"actions": actions, "material": material, "counts": counts, "target": target}
+
+
+# ── Best-Odds board — the day's highest-win-probability trades ───────
+# The simplest possible answer to "what's most likely to WIN": rank the whole board's fresh setups
+# PURELY by win probability and take the top few. No portfolio construction (no ¼-Kelly sizing, no
+# regime scaling, no stickiness) — that's `build_basket`'s job (the diversified book to hold). This is
+# the "pick-one-and-go" leaderboard. It shares the basket's per-idea win-prob numbers (via
+# `_attach_scores` → `sizing._win_prob`: learned-fusion → calibrated → advertised), so the two views
+# never disagree on an idea's odds.
+
+_BEST_ODDS_DISCLAIMER = ("Ranked purely by each setup's best-available win rate (learned/calibrated "
+                         "where we have the history, else the backtest's advertised rate — see the ✓). "
+                         "A high hit-rate is not a high return; check the plan and reward:risk. "
+                         "Decision-support, not advice.")
+
+# Fields carried onto a Best-Odds item — the win-probability view (no portfolio-sizing fields).
+_BEST_ODDS_KEYS = tuple(k for k in _ITEM_KEYS if k not in ("alloc_pct", "risk_pct", "kelly_used")) + (
+    "pillar_count", "tier", "pillars", "typical_drawdown_pct", "deep_drawdown_pct",
+)
+
+
+def best_odds_params() -> dict:
+    """The active Best-Odds board configuration — attached to the payload so the UI can explain it."""
+    return {
+        "enabled": settings.best_odds_enabled,
+        "size": settings.best_odds_size,
+        "cluster_dedup": settings.best_odds_cluster_dedup,
+    }
+
+
+def _best_odds_summary(picks: list[dict]) -> dict:
+    """Board roll-up: count, mean win prob, aggregate reward:risk, and a win-prob SOURCE tally so the UI
+    can disclose how many odds are model/calibrated-backed vs raw advertised backtest rates."""
+    wins = [c["win_prob"] for c in picks if c.get("win_prob") is not None]
+    rr = [c["risk_reward"] for c in picks if c.get("risk_reward") is not None]
+    sources: dict[str, int] = {}
+    for c in picks:
+        src = c.get("win_prob_source")
+        if src:
+            sources[src] = sources.get(src, 0) + 1
+    return {
+        "count": len(picks),
+        "avg_win_pct": round(sum(wins) / len(wins), 1) if wins else None,
+        "avg_reward_risk": round(sum(rr) / len(rr), 2) if rr else None,
+        "win_prob_sources": sources,        # e.g. {"learned": 2, "calibrated": 1, "advertised": 2}
+        "backed_count": sum(n for s, n in sources.items() if s in ("learned", "calibrated")),
+    }
+
+
+def _empty_best_odds(market: str, regime: Optional[dict], size: int, note: str) -> dict:
+    return {
+        "enabled": settings.best_odds_enabled, "market": market,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "size": size, "regime_state": (regime or {}).get("state"),
+        "items": [], "summary": _best_odds_summary([]), "params": best_odds_params(),
+        "note": note,
+    }
+
+
+def build_best_odds(ideas: Optional[dict], clusters: Optional[dict] = None, *,
+                    top_n: Optional[int] = None) -> dict:
+    """Rank the enriched board's fresh setups PURELY by win probability and surface the top few. Pure
+    (no I/O). Same win-prob/EV numbers as `build_basket` (via `_attach_scores`), so odds never disagree.
+
+    `ideas`    — the board from `runner.horizon_ideas` **after** `enrich_ideas_live`.
+    `clusters` — the board-wide symbol→cluster map (cross-horizon de-dup), so the picks are DISTINCT
+                 bets rather than variants of one name. None ⇒ ticker-level de-dup only.
+    `top_n`    — how many to surface (default `settings.best_odds_size`).
+
+    Returns the board dict (see `_empty_best_odds`); disabled / empty ⇒ an empty board.
+    """
+    market = (ideas or {}).get("market", "IN") if ideas else "IN"
+    regime = (ideas or {}).get("regime")
+    n = int(top_n if top_n is not None else settings.best_odds_size)
+    if not settings.best_odds_enabled:
+        return _empty_best_odds(market, regime, n, "Best-Odds board disabled.")
+    if not ideas or not ideas.get("buckets"):
+        return _empty_best_odds(market, regime, n,
+                                "No trade ideas yet — run a backtest for this market first.")
+
+    pool = _pool(ideas)
+    # Only fresh entries: drop names whose live price already SPENT the plan (stopped / hit target) —
+    # a bad fresh entry. Offline (zone=None) nothing is dropped; the full board still shows them.
+    pool = [c for c in pool if c.get("zone") not in _BROKEN_ZONES]
+    if not pool:
+        return _empty_best_odds(market, regime, n,
+                                "Every current idea has already hit its stop or target — nothing fresh to enter.")
+    _attach_scores(pool)      # sets win_prob (%) / win_prob_source / expected_return_pct
+
+    # Rank PURELY by win probability (desc). Deterministic tie-breaks: reward:risk, then EV. A missing
+    # win prob sinks to the bottom (an idea we can't estimate shouldn't top a "most likely to win" board).
+    pool.sort(key=lambda c: (
+        c.get("win_prob") if c.get("win_prob") is not None else -1.0,
+        c.get("risk_reward") or 0.0,
+        c.get("expected_return_pct") or 0.0,
+    ), reverse=True)
+
+    # De-dup to DISTINCT names: one row per ticker (a name recurs across horizons — its highest-win-prob
+    # copy is first after the sort) and one per correlation cluster when enabled. De-dup is about
+    # distinctness, NOT ranking — the order above is untouched.
+    picks: list[dict] = []
+    seen_tickers: set = set()
+    seen_clusters: set = set()
+    for c in pool:
+        tk = c["ticker"]
+        if tk in seen_tickers:
+            continue
+        cid = clusters.get(tk) if clusters else None
+        if settings.best_odds_cluster_dedup and cid is not None and cid in seen_clusters:
+            continue
+        picks.append(c)
+        seen_tickers.add(tk)
+        if cid is not None:
+            seen_clusters.add(cid)
+        if len(picks) >= n:
+            break
+
+    items = []
+    for i, c in enumerate(picks, 1):
+        it = {k: c.get(k) for k in _BEST_ODDS_KEYS if k in c}
+        it["rank"] = i
+        items.append(it)
+    return {
+        "enabled": True, "market": market,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "size": n, "regime_state": (regime or {}).get("state"),
+        "items": items,
+        "summary": _best_odds_summary(picks),
+        "params": best_odds_params(),
+        "note": _BEST_ODDS_DISCLAIMER,
+    }

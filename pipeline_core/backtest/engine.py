@@ -36,12 +36,13 @@ class Trade:
     exit_date: Optional[str]
     entry_price: float
     exit_price: Optional[float]
-    ret_pct: float          # net of costs (unrealized mark if open)
+    ret_pct: float          # net of costs (unrealized mark if open); position return — already inverted for shorts
     holding_days: int
     exit_reason: str        # signal | stop | trailing | target | time | end_of_data | open
     is_open: bool = False
     mae_pct: float = 0.0    # max adverse excursion: worst intrabar drawdown from entry (≤0, gross of cost)
     mfe_pct: float = 0.0    # max favorable excursion: best intrabar gain from entry (≥0, gross of cost)
+    side: str = "long"      # "long" | "short" — the position direction (short = profit when price falls)
 
 
 @dataclass
@@ -58,6 +59,7 @@ def simulate(
     cost_roundtrip_bps: float = 25.0,
     entry_start=None,
     entry_end=None,
+    funding_bps_per_day: float = 0.0,
 ) -> SimResult:
     """
     Simulate one strategy on one stock's OHLCV history.
@@ -92,6 +94,12 @@ def simulate(
     dates = df.index
     n = len(df)
     cost = cost_roundtrip_bps / 10_000.0
+    # Direction: long (default) profits when price rises; short profits when it falls, so its stop
+    # is ABOVE entry, target BELOW, and its trailing stop rides the trough (not the peak). The long
+    # branch below is byte-for-byte the original; the short branch mirrors every comparison.
+    is_short = getattr(strategy, "direction", "long") == "short"
+    # Per-day holding drag a SHORT pays (perp funding / borrow) that a long never does. 0 for longs.
+    funding = (funding_bps_per_day / 10_000.0) if is_short else 0.0
 
     result = SimResult()
     i = 0
@@ -106,9 +114,10 @@ def simulate(
             i += 1
             continue
 
-        peak = entry_px
-        worst = 0.0        # max adverse excursion (most-negative close-vs-entry seen while held)
-        best = 0.0         # max favorable excursion (best close-vs-entry seen while held)
+        peak = entry_px    # long: highest close since entry (trailing stop anchor)
+        trough = entry_px  # short: lowest close since entry (trailing stop anchor)
+        worst = 0.0        # max adverse excursion (most-negative POSITION return seen while held)
+        best = 0.0         # max favorable excursion (best POSITION return seen while held)
         exit_i: Optional[int] = None
         reason = "signal"
 
@@ -117,21 +126,38 @@ def simulate(
             if not np.isfinite(c):
                 continue
             peak = max(peak, c)
-            ret = c / entry_px - 1.0
+            trough = min(trough, c)
+            # Position return, defined as the exact mirror so a short is −(the long return): long =
+            # c/entry−1, short = (entry−c)/entry. Keeps the short's target/stop geometry identical to
+            # _idea_target/_idea_stop (target at entry·(1−t), stop at entry·(1+s)) and its realized
+            # P&L identical to the tracker's (entry−exit)/entry.
+            ret = ((entry_px - c) / entry_px) if is_short else (c / entry_px - 1.0)
             worst = min(worst, ret)
             best = max(best, ret)
             held = j - entry_i
 
-            if strategy.stop_loss_pct and c <= entry_px * (1 - strategy.stop_loss_pct):
-                exit_i, reason = j + 1, "stop"
-            elif strategy.trailing_stop_pct and c <= peak * (1 - strategy.trailing_stop_pct):
-                exit_i, reason = j + 1, "trailing"
-            elif strategy.target_pct and ret >= strategy.target_pct:
-                exit_i, reason = j + 1, "target"
-            elif strategy.max_holding_days and held >= strategy.max_holding_days:
-                exit_i, reason = j + 1, "time"
-            elif exit_sig[j]:
-                exit_i, reason = j + 1, "signal"
+            if is_short:
+                if strategy.stop_loss_pct and c >= entry_px * (1 + strategy.stop_loss_pct):
+                    exit_i, reason = j + 1, "stop"
+                elif strategy.trailing_stop_pct and c >= trough * (1 + strategy.trailing_stop_pct):
+                    exit_i, reason = j + 1, "trailing"
+                elif strategy.target_pct and ret >= strategy.target_pct:
+                    exit_i, reason = j + 1, "target"
+                elif strategy.max_holding_days and held >= strategy.max_holding_days:
+                    exit_i, reason = j + 1, "time"
+                elif exit_sig[j]:
+                    exit_i, reason = j + 1, "signal"
+            else:
+                if strategy.stop_loss_pct and c <= entry_px * (1 - strategy.stop_loss_pct):
+                    exit_i, reason = j + 1, "stop"
+                elif strategy.trailing_stop_pct and c <= peak * (1 - strategy.trailing_stop_pct):
+                    exit_i, reason = j + 1, "trailing"
+                elif strategy.target_pct and ret >= strategy.target_pct:
+                    exit_i, reason = j + 1, "target"
+                elif strategy.max_holding_days and held >= strategy.max_holding_days:
+                    exit_i, reason = j + 1, "time"
+                elif exit_sig[j]:
+                    exit_i, reason = j + 1, "signal"
 
             if exit_i is not None:
                 if exit_i >= n:  # no next bar → exit at this close
@@ -141,7 +167,11 @@ def simulate(
         if exit_i is None:
             # Still in position at the last bar → open trade, marked to market
             last_close = closes[-1]
-            ret = last_close / entry_px - 1.0 - cost / 2 if np.isfinite(last_close) else 0.0
+            if np.isfinite(last_close):
+                mark = ((entry_px - last_close) / entry_px) if is_short else (last_close / entry_px - 1.0)
+                ret = mark - cost / 2 - funding * (n - 1 - entry_i)   # funding accrues while held (short only)
+            else:
+                ret = 0.0
             result.open_trade = Trade(
                 ticker=ticker,
                 entry_date=str(dates[entry_i].date()),
@@ -154,14 +184,15 @@ def simulate(
                 is_open=True,
                 mae_pct=round(worst * 100, 2),
                 mfe_pct=round(best * 100, 2),
+                side="short" if is_short else "long",
             )
             break
 
         exit_px = opens[exit_i] if reason != "end_of_data" else closes[exit_i]
         if not np.isfinite(exit_px) or exit_px <= 0:
             exit_px = closes[exit_i]
-        gross = exit_px / entry_px - 1.0
-        net = gross - cost
+        gross = ((entry_px - exit_px) / entry_px) if is_short else (exit_px / entry_px - 1.0)
+        net = gross - cost - funding * (exit_i - entry_i)      # funding accrues while held (short only)
 
         result.trades.append(
             Trade(
@@ -175,6 +206,7 @@ def simulate(
                 exit_reason=reason,
                 mae_pct=round(worst * 100, 2),
                 mfe_pct=round(best * 100, 2),
+                side="short" if is_short else "long",
             )
         )
         i = exit_i  # next signal search resumes after this exit
@@ -201,8 +233,9 @@ def build_daily_positions(all_results: dict[str, SimResult], df_by_ticker: dict[
             start = pd.Timestamp(trade.entry_date)
             end = pd.Timestamp(trade.exit_date) if trade.exit_date else df.index[-1]
             window = close_ret.loc[start:end].dropna()
+            sign = -1.0 if getattr(trade, "side", "long") == "short" else 1.0  # short earns the inverse move
             for dt, r in window.items():
-                daily_rets.setdefault(dt, []).append(float(r))
+                daily_rets.setdefault(dt, []).append(sign * float(r))
 
     if not daily_rets:
         return pd.Series(dtype=float)
@@ -301,6 +334,7 @@ def backtest_strategy(
     cost_roundtrip_bps: float = 25.0,
     entry_start=None,
     entry_end=None,
+    funding_bps_per_day: float = 0.0,
 ) -> dict:
     """Run one strategy across the whole universe and aggregate.
 
@@ -310,7 +344,8 @@ def backtest_strategy(
     results: dict[str, SimResult] = {}
     for ticker, df in df_by_ticker.items():
         try:
-            res = simulate(ticker, df, strategy, cost_roundtrip_bps, entry_start, entry_end)
+            res = simulate(ticker, df, strategy, cost_roundtrip_bps, entry_start, entry_end,
+                           funding_bps_per_day)
             if res.trades or res.open_trade:
                 results[ticker] = res
         except Exception:

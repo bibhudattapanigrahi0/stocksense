@@ -66,6 +66,15 @@ class Settings(BaseSettings):
     sm_in_bulk_deals_enabled: bool = True   # NSE/BSE bulk & block deals + FII/DII flows (Phase 3)
     sm_in_ace_enabled: bool = False         # fragile: ace-investor shareholding-pattern scrape (Phase 4)
     sm_crypto_labels_enabled: bool = False  # best-effort/paid: on-chain smart-money wallet labels (Phase 4)
+    sm_us_congress_enabled: bool = True     # US congressional trades (House Clerk PTR disclosures) as a 2nd US actor family
+    congress_lookback_years: int = 2        # how many years of House disclosure filings to aggregate
+    congress_max_filings: int = 250         # cap the panel build to the most-recently-disclosed N PTRs (~1 PDF each)
+    congress_flow_window_days: int = 120    # trailing window for the net buy−sell dollar flow → direction
+    congress_conviction_amount: float = 100000.0  # net flow at/above this (or ≥3 members) ⇒ high conviction
+    # Sell-side surfacing — the smart-money signal already scores DISTRIBUTION (pros trimming) negative for
+    # longs and positive for shorts; these flags SURFACE it: a visible avoid/whale-short flag on ideas + an
+    # exit alert when the pros flip to distribute on a name you already hold. Off ⇒ distribution stays silent.
+    smart_money_distribution_enabled: bool = True
     # CFTC COT (metals): the commercial net position is normalized to a 0–100 COT index over this
     # lookback; ≥ high ⇒ commercials heavily net-long (bullish coattail), ≤ low ⇒ net-short (bearish).
     cot_lookback_weeks: int = 156           # ~3 years of weekly reports for the range normalization
@@ -148,12 +157,53 @@ class Settings(BaseSettings):
     regime_size_weight: float = 0.5           # risk-off size haircut strength (applied only when tilt<0)
     regime_size_floor: float = 0.4            # never trim a position below this fraction of its base size
 
+    # Fear & Greed gauge — the market-mood companion to the regime tide, shown in the daily board's
+    # "Market Conditions" header. Per-market source (see services/market_sentiment.py): CRYPTO ⇒
+    # alternative.me, US ⇒ the real CNN index, IN/other ⇒ a derived blend of benchmark momentum and an
+    # inverted vol-index percentile. Display-only (no ranking/sizing effect); degrades to a neutral 50.
+    fear_greed_enabled: bool = True           # attach the Fear & Greed reading to the ideas payload
+    fear_greed_cnn_enabled: bool = True       # US: use CNN's index (off ⇒ fall back to the derived blend)
+    fng_w_momentum: float = 0.6               # derived mood: benchmark momentum weight
+    fng_w_volatility: float = 0.4             # derived mood: inverted vol-index percentile weight
+
     # Crypto daily-idea risk gate — crypto strategies backtest with catastrophic drawdowns (−74%…−100%),
     # so a strategy's BUY signal only counts toward an idea's conviction when its backtested risk clears
     # these floors. Applied only for the CRYPTO market; equities (modest DDs) are unaffected. Never
     # empties a bucket — if all would be gated, the least-bad by drawdown are kept.
     crypto_idea_dd_floor: float = -95.0       # drop votes from strategies with max_drawdown_pct ≤ this
     crypto_idea_sharpe_floor: float = 0.2     # …and from strategies below this backtested Sharpe
+    # Crypto trades both ways: when on, the CRYPTO board additionally runs a small bearish-mirror SHORT
+    # strategy set and surfaces short ideas (side="short") alongside longs. CRYPTO-only; every other
+    # market stays long-only. Off ⇒ the board is long-only exactly as before.
+    crypto_shorts_enabled: bool = True
+    # Crypto shorts are surfaced as ACTIONABLE (not just watchlist): in a risk-off tide a regime-aligned
+    # short is the trade the tide favours, so it should clear the confluence bar like a long would. Off ⇒
+    # short candidates are force-pinned to the WATCHLIST regardless of pillars (the earlier cautious mode).
+    crypto_shorts_actionable: bool = True
+    # No crypto SHORT strategy currently clears the backtest risk gate (they lose over a 10y bull sample),
+    # so shorts would never surface. But in a genuinely BEARISH market a short still has *some potential*,
+    # so when the market regime tide is risk-off we surface the best few as SPECULATIVE watchlist ideas
+    # (flagged, never sized like a proven edge), ranked by their raw bearish agreement. Off ⇒ shorts only
+    # ever show if a short strategy actually clears the gate.
+    crypto_shorts_regime_surface: bool = True
+    crypto_shorts_regime_tilt: float = -0.2   # only surface shorts when the regime tilt is ≤ this (bearish)
+    crypto_shorts_max_speculative: int = 3    # cap on speculative shorts per horizon (show the best few)
+
+    # ── Realistic trading cost (replaces the old flat 25 bps) ──────────────────────────────────
+    # Round-trip cost in bps per market: spread + slippage + fees/taxes. Equity delivery ~25 (IN incl
+    # STT), US ~10, metals ETF ~15, crypto spot ~35 (wider spreads). run_full_backtest resolves the
+    # market's cost when the caller doesn't pass an explicit override; see markets/market_cost_bps.
+    cost_bps_in: float = 25.0
+    cost_bps_us: float = 10.0
+    cost_bps_metals: float = 15.0
+    cost_bps_crypto: float = 35.0
+    # Crypto shorts pay perpetual funding / borrow WHILE HELD — a per-day drag longs never pay. ~10 bps/day
+    # is a conservative long-run average (funding swings, but a persistent short pays it more than it earns).
+    crypto_funding_bps_per_day: float = 10.0
+    # A documented, honest haircut on the board's advertised win-rate to offset SURVIVORSHIP bias (the
+    # backtest universe is today's index members applied over history). An estimate until a point-in-time
+    # universe lands; applied to the win-prob the ranking/sizing read + disclosed in the UI. 0 = off.
+    survivorship_haircut_pp: float = 4.0
 
     # Daily-idea composite ranking — soft accuracy factors layered on conviction × regime, each a
     # bounded ± multiplier (see pipeline_core/backtest/idea_ranking.py). 0 disables a factor; all-zero
@@ -189,6 +239,11 @@ class Settings(BaseSettings):
     # cohort must each reach this many closed trades before a lift number is reported (else "need
     # more data"). Kept modest since the closed set splits several ways; raise for stricter evidence.
     attribution_min_samples: int = 8
+    # Rank efficiency (the north-star) — the Spearman IC between an idea's entry rank and its realized
+    # return + the top-vs-bottom rank-quintile return spread, over closed ideas. Reported only once this
+    # many closed ideas carry an entry rank (`idea_ranking.rank_efficiency`). Every ranking change is
+    # judged by whether it moves this, not by backtest aesthetics.
+    rank_ic_min_samples: int = 8
 
     # Multi-pillar confluence — reframe "quality" from DEPTH in one family (conviction = how many
     # technical strategies agree) to BREADTH across independent families (technical + fundamental
@@ -198,6 +253,13 @@ class Settings(BaseSettings):
     # thin-pillar markets (crypto/metals) still surface actionable ideas. See idea_ranking.idea_pillars.
     pillar_tiering_enabled: bool = True        # split the board into Actionable / Watchlist tiers
     pillar_min_actionable: int = 3             # families an idea must confirm (technical + ≥2 more)
+    # Crypto carries only ~3 possible families (technical + smart-money + regime) — no fundamental
+    # quality / news / sector pillars — so the equity bar of 3 is effectively unreachable there: a
+    # regime-aligned crypto short tops out at technical + regime = 2, and a long at technical +
+    # smart-money = 2. Use a market-specific bar of 2 for crypto so those genuinely confirmed setups
+    # surface as actionable instead of every idea collapsing onto the watchlist. Still clamped to the
+    # families actually available (idea_ranking.pillar_tier).
+    pillar_min_actionable_crypto: int = 2
 
     # "Normal drawdown" band — surface how far a WINNING backtest trade of the backing strategies
     # typically dipped before it worked (median |max-adverse-excursion|), as hold-through guidance on
@@ -221,6 +283,12 @@ class Settings(BaseSettings):
     basket_w_quality: float = 0.25             # weight on the idea's per-horizon-normalized rank_score
     basket_sector_cap: int = 2                 # soft cap: at most this many names per sector (equity)
     basket_hysteresis_margin: float = 0.10     # a challenger must beat an incumbent's score by >this to swap it in
+    # Best-Odds board — the daily board's fresh setups ranked PURELY by win probability (best-available:
+    # learned-fusion → calibrated → advertised), top N, de-duped to distinct names. The "which trades are
+    # most likely to win" answer (vs the balanced/sized/sticky basket above). See basket.build_best_odds.
+    best_odds_enabled: bool = True             # attach the Best-Odds board to the ideas payload
+    best_odds_size: int = 5                    # how many top-win-probability setups to surface
+    best_odds_cluster_dedup: bool = True       # also drop correlated names so the picks are distinct bets
     # Deploy the basket as a NAV-tracked Portfolio (reuses the portfolio layer). The live deployed book
     # re-syncs on a weekly cadence (idempotent, cost-basis-preserving) so it tracks the sticky basket
     # without churning; NAV still snapshots daily. See runner.deploy_basket / bots/crypto_momentum.deploy.
@@ -250,6 +318,9 @@ class Settings(BaseSettings):
     hold_displacement_conviction_gap: int = 2  # a fresh name only bumps a holding if its conviction is ≥ this higher
     # Coattail basket — the daily basket filtered to names the smart money is accumulating (smart_money).
     coattail_basket_enabled: bool = True       # ride-along on the board as `coattail_basket`
+    # Coattail SHORT sleeve — the sell-side mirror: SHORT ideas the smart money is DISTRIBUTING (crypto in
+    # practice, the only board that trades both ways). "The short book the top traders are positioned for."
+    coattail_short_basket_enabled: bool = True # ride-along on the board as `coattail_short_basket`
     hold_size_min: int = 3                     # hold-book size in risk-off
     hold_size_max: int = 5                     # hold-book size in risk-on (neutral = midpoint)
     # (the per-horizon score tilt favouring longer holds lives in basket.HOLD_HORIZON_FACTOR)
@@ -303,3 +374,12 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def market_cost_bps(market: str | None) -> float:
+    """Round-trip trading cost (bps) for a market — the realistic per-market default the backtest uses
+    when no explicit cost is passed. Crypto is the most expensive (wider spreads); US the cheapest."""
+    return {
+        "IN": settings.cost_bps_in, "US": settings.cost_bps_us,
+        "METALS": settings.cost_bps_metals, "CRYPTO": settings.cost_bps_crypto,
+    }.get((market or "IN").upper(), settings.cost_bps_in)

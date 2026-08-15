@@ -569,7 +569,7 @@ class BacktestRunRequest(BaseModel):
     market: str = "IN"
     index: Optional[str] = None   # None → the market's default universe
     years: int = Field(default=10, ge=2, le=15)
-    cost_roundtrip_bps: float = Field(default=25.0, ge=0, le=200)
+    cost_roundtrip_bps: Optional[float] = Field(default=None, ge=0, le=200)  # None → market's realistic default
     strategy_ids: Optional[list[str]] = None  # None → all strategies
 
 
@@ -764,10 +764,12 @@ async def backtest_ideas(max_per_bucket: int = 10, market: str = Query("IN"),
     with a fresh live quote (adds live_price/live_change_pct/zone/live_levels without changing
     the generated plan). Empty until a backtest has run.
 
-    A top-level `regime` block gives the market's risk-on/off tide (benchmark 200-DMA + a vol/macro
-    factor — VIX, DXY, or crypto Fear & Greed): regime-aligned longs rank first (each idea tagged
-    `regime_fit`), and in risk-off the book is sized down (`regime_size_factor` per idea + on the
-    bucket sizing). A neutral/offline reading leaves ordering and sizing unchanged."""
+    Two top-level "market conditions" blocks head the payload. `regime` gives the risk-on/off tide
+    (benchmark 200-DMA + a vol/macro factor — VIX, DXY, or crypto Fear & Greed): regime-aligned longs
+    rank first (each idea tagged `regime_fit`), and in risk-off the book is sized down
+    (`regime_size_factor` per idea + on the bucket sizing). `fear_greed` gives the market's 0-100 mood
+    (US ⇒ the real CNN index, CRYPTO ⇒ alternative.me, IN/other ⇒ a derived blend), display-only. A
+    neutral/offline reading leaves ordering and sizing unchanged."""
     from pipeline_core.backtest import runner
 
     ideas = runner.horizon_ideas(max_per_bucket, market)
@@ -846,6 +848,26 @@ async def backtest_basket(max_per_bucket: int = 10, market: str = Query("IN")):
     return ideas.get("basket") or {"enabled": True, "items": [], "market": market}
 
 
+@app.get("/api/v1/backtest/best-odds")
+async def backtest_best_odds(max_per_bucket: int = 10, top_n: int = Query(None, ge=1, le=10),
+                             market: str = Query("IN")):
+    """The **Best-Odds board** — the day's fresh setups ranked PURELY by win probability (best-available:
+    learned-fusion → calibrated → advertised), de-duped to `top_n` distinct names (default 5). The
+    "which trades are most likely to win" answer, vs the balanced/sized `basket`. Each item carries its
+    `win_prob` + `win_prob_source` (✓ when model/calibrated-backed) and the plan; `summary.win_prob_sources`
+    tallies the source mix. Also rides along on `/api/v1/backtest/ideas` as `best_odds`."""
+    from pipeline_core.backtest import runner
+
+    ideas = runner.horizon_ideas(max_per_bucket, market)
+    if ideas is None:
+        return {"enabled": True, "items": [], "market": market,
+                "note": f"No {market} backtest yet — run one in the Strategy Lab first."}
+    ideas = await runner.enrich_ideas_live(ideas, market)
+    from pipeline_core.backtest import basket
+    return (basket.build_best_odds(ideas, None, top_n=top_n) if top_n
+            else ideas.get("best_odds")) or {"enabled": True, "items": [], "market": market}
+
+
 @app.get("/api/v1/smart-money")
 async def smart_money_signal(symbol: str = Query(..., min_length=1), market: str = Query("IN")):
     """The smart-money / coattail signal for one symbol — who the proven money is and whether they're
@@ -866,6 +888,18 @@ async def smart_money_leaders(market: str = Query("IN"), limit: int = Query(10, 
     return await asyncio.to_thread(smart_money.get_leaders, market, limit)
 
 
+@app.post("/api/v1/smart-money/congress/refresh")
+async def smart_money_congress_refresh(max_filings: int | None = None):
+    """Build (or rebuild) the US congressional-trades panel from the House Clerk PTR disclosures. Bounded
+    to the most-recently-disclosed `max_filings` reports (each a PDF fetch); per-filing caching makes a
+    daily rebuild incremental. Heavy on first run — call once, then congress signals ride along on the US
+    board / coattail / 🏦 badge / smart-money leaders. No-op if pypdf isn't installed."""
+    from pipeline_core.services import us_congress
+    panel = await asyncio.to_thread(us_congress.build_panel, None, max_filings, True)
+    return {"built": bool(panel), "tickers": len(panel or {}),
+            "leaders": us_congress.leaders(10).get("leaders", [])}
+
+
 @app.get("/api/v1/backtest/coattail-basket")
 async def backtest_coattail_basket(max_per_bucket: int = 10, market: str = Query("IN")):
     """The COATTAIL basket — today's curated basket filtered to names the smart money is accumulating
@@ -879,6 +913,21 @@ async def backtest_coattail_basket(max_per_bucket: int = 10, market: str = Query
                 "note": f"No {market} backtest yet — run one in the Strategy Lab first."}
     ideas = await runner.enrich_ideas_live(ideas, market)
     return ideas.get("coattail_basket") or {"enabled": True, "items": [], "market": market}
+
+
+@app.get("/api/v1/backtest/coattail-short-basket")
+async def backtest_coattail_short_basket(max_per_bucket: int = 10, market: str = Query("IN")):
+    """The sell-side COATTAIL SHORT sleeve — today's curated SHORT ideas the smart money is DISTRIBUTING
+    (crypto whales net-short). "The short book the pros are positioned for." Empty on long-only markets /
+    risk-on tides. Read-only; also rides along on `/api/v1/backtest/ideas` as `coattail_short_basket`."""
+    from pipeline_core.backtest import runner
+
+    ideas = runner.horizon_ideas(max_per_bucket, market)
+    if ideas is None:
+        return {"enabled": True, "items": [], "market": market,
+                "note": f"No {market} backtest yet — run one in the Strategy Lab first."}
+    ideas = await runner.enrich_ideas_live(ideas, market)
+    return ideas.get("coattail_short_basket") or {"enabled": True, "items": [], "market": market}
 
 
 @app.post("/api/v1/backtest/basket/track")

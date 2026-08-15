@@ -293,6 +293,7 @@ select.input { cursor: pointer; }
 .pill-hold, .pill-medium { color: var(--warn); border-color: var(--warn); background: var(--warn-tint); }
 .pill-sell, .pill-high { color: var(--neg); border-color: var(--neg); background: var(--neg-tint); }
 .pill-accent { color: var(--brand-2); border-color: var(--brand-2); background: var(--brand-2-tint); }
+.pill-warn { color: var(--warn); border-color: var(--warn); background: var(--warn-tint); }
 .pill-muted { color: var(--text-dim); border-color: var(--border); background: var(--bg-3); }
 
 /* score bars */
@@ -613,6 +614,16 @@ details.filter-detail summary:hover { color: var(--text); }
 .ideas-watchlist[open] > summary::before { content: "▾"; }
 .ideas-watchlist[open] > summary { margin-bottom: 6px; }
 .ideas-watchlist .idea-row { opacity: 0.82; }
+
+/* Crypto SHORT subgroup — a bearish counterpart below the longs in a horizon column */
+.ideas-shorts { margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 6px; }
+.ideas-shorts-head {
+    font-weight: 700; color: var(--neg); letter-spacing: 0.02em;
+    padding: 2px 12px 4px; cursor: help;
+}
+.ideas-shorts-head b { color: var(--neg); }
+/* SHORT direction pill on an idea row (reuses the sell/red pill palette) */
+.idea-side-pill { font-size: 9px; padding: 1px 5px; vertical-align: middle; }
 
 /* Tracker "normal drawdown" band badge — within (reassuring) vs beyond (early warning) */
 .dd-badge {
@@ -1118,10 +1129,57 @@ svg.spark { display: block; border: 1px solid var(--border); border-radius: 6px;
 .horizon-chip { font-weight: 600; }
 .basket-foot { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); line-height: 1.5; }
 
+/* Best Odds — the win-probability leaderboard. Reuses the basket card/row chrome; each row leads with
+   the win% (in place of the allocation weight). Green = higher odds; the ✓ marks a model/calibrated rate. */
+.bo-win { flex: none; width: 66px; text-align: center; border-right: 1px solid var(--border); padding-right: 12px; }
+.bo-win-pct { display: block; font-size: 21px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.05; }
+.bo-win-lbl { display: block; font-size: 10px; color: var(--text-mute); text-transform: uppercase; letter-spacing: .05em; }
+.bo-check { color: var(--pos); font-weight: 700; }
+
 @media (max-width: 640px) {
     .basket-metrics { grid-template-columns: repeat(2, 1fr); }
     .basket-item { flex-wrap: wrap; }
-    .bi-alloc { border-right: none; }
+    .bi-alloc, .bo-win { border-right: none; }
+}
+
+/* ── Market Conditions — the mood + direction header atop Trade Ideas. ──
+   Deliberately quieter chrome than the brand basket card (neutral border), so the basket stays the
+   hero action; this reads as context. Fear/greed uses the red→amber→green mood ramp; the direction
+   arrow/state reuse the regime risk-on = green / risk-off = red semantics. */
+.market-conditions { margin-bottom: 16px; }
+.mc-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: stretch; }
+.mc-cell { min-width: 0; }
+.mc-cell.mc-dir { border-left: 1px solid var(--border); padding-left: 18px; }
+.mc-head-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.mc-label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .05em; font-weight: 600; }
+.fng-source {
+    font-size: 10px; font-weight: 700; letter-spacing: .03em; color: var(--text-mute);
+    border: 1px solid var(--border); background: var(--bg-3); border-radius: var(--r-pill); padding: 1px 7px;
+}
+.fng-value { font-size: 30px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; display: flex; align-items: baseline; gap: 9px; }
+.fng-class { font-size: 13px; font-weight: 700; color: var(--text-dim); letter-spacing: .01em; }
+.fng-meter {
+    position: relative; height: 9px; margin: 12px 0 5px; border-radius: 99px;
+    background: linear-gradient(90deg, #e5484d 0%, #f5a524 30%, #8a8f98 50%, #46a758 70%, #30a46c 100%);
+}
+.fng-marker {
+    position: absolute; top: -3px; width: 4px; height: 15px; border-radius: 2px;
+    background: var(--text); outline: 2px solid var(--bg-2); transform: translateX(-50%);
+}
+.fng-scale { display: flex; justify-content: space-between; }
+.fng-factors { margin-top: 7px; }
+.fng-stale { color: var(--warn); }
+
+.mc-dir-headline { display: flex; align-items: baseline; gap: 8px; }
+.mc-arrow { font-size: 20px; line-height: 1; }
+.mc-state { font-size: 22px; font-weight: 800; text-transform: capitalize; }
+.mc-dir-detail { margin-top: 6px; font-variant-numeric: tabular-nums; }
+.mc-factors { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+.mc-foot { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); line-height: 1.5; }
+
+@media (max-width: 640px) {
+    .mc-grid { grid-template-columns: 1fr; gap: 14px; }
+    .mc-cell.mc-dir { border-left: none; padding-left: 0; border-top: 1px solid var(--border); padding-top: 14px; }
 }
 
 /* My Hold Basket — committed book + material-change diff. */

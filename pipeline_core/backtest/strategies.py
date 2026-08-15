@@ -38,6 +38,8 @@ class StrategyDef:
     trailing_stop_pct: Optional[float] = None
     target_pct: Optional[float] = None
     min_bars: int = 260  # history needed before signals are trusted
+    direction: str = "long"  # "long" (default) | "short" — a short profits when price falls
+                             # (stop above entry, target below); the engine mirrors every comparison.
 
 
 def _crosses_above(a: pd.Series, b: pd.Series) -> pd.Series:
@@ -442,6 +444,35 @@ def _cot_exit(df: pd.DataFrame) -> pd.Series:
     c, idx = df["Close"], df["cot_index"]
     # Leave when the commercial edge fades (COT back to mid-range) or the trend breaks (loses 50-DMA).
     return _fill((idx < 50) | _crosses_below(c, ind.sma(c, 50)))
+
+
+# ── US congressional-trades follow (US only) ────────────────────────
+# Reads `congress_net` that runner.py merges from House Clerk PTR disclosures (a trailing net buy−sell
+# dollar flow, dated by the PUBLIC disclosure date so there's no lookahead) — net positive means members
+# of Congress have, on balance, been BUYING the name lately. Coattail it with a price-trend confirmation.
+# Absent on non-US markets, names no member traded, or when the panel isn't built ⇒ inert.
+# See pipeline_core/services/us_congress.py.
+
+def _has_congress(df: pd.DataFrame) -> bool:
+    return "congress_net" in df.columns
+
+
+def _congress_entry(df: pd.DataFrame) -> pd.Series:
+    if not _has_congress(df):
+        return _never(df)
+    c, net = df["Close"], df["congress_net"]
+    # Setup: net congressional buying just turned positive (fresh disclosed accumulation). Trigger: price
+    # confirms the trend (above its 50-DMA). Disclosure-lagged data, so the trend filter avoids chasing.
+    setup = _crosses_above(net.fillna(0.0), 0.0)
+    return _fill(setup & (c > ind.sma(c, 50)))
+
+
+def _congress_exit(df: pd.DataFrame) -> pd.Series:
+    if not _has_congress(df):
+        return _never(df)
+    c, net = df["Close"], df["congress_net"]
+    # Leave when the disclosed buying flips to net selling or the trend breaks (loses the 50-DMA).
+    return _fill((net.fillna(0.0) < 0) | _crosses_below(c, ind.sma(c, 50)))
 
 
 # ── NSE bulk-deal follow (India only) ───────────────────────────────
@@ -892,6 +923,19 @@ STRATEGIES: list[StrategyDef] = [
         max_holding_days=40,
         min_bars=260,
     ),
+    StrategyDef(
+        id="congress-buy-follow",
+        name="Congressional Buying (House PTR)",
+        category="Accumulation",
+        description="US only. Coattail disclosed political-insider buying: when members of Congress have, "
+                    "on balance, been BUYING a stock (net positive House PTR flow just turned up) and price "
+                    "confirms above the 50-DMA, buy it; exit when the disclosed flow flips to net selling or "
+                    "the trend breaks (loses the 50-DMA). Real House Clerk filings, dated by the public "
+                    "disclosure date (~45-day reporting lag, no lookahead). Inert without the congress panel.",
+        entry=_congress_entry,
+        exit=_congress_exit,
+        min_bars=260,
+    ),
 ]
 
 _BY_ID = {s.id: s for s in STRATEGIES}
@@ -913,17 +957,38 @@ def get_strategy(strategy_id: str) -> StrategyDef:
 
 
 def _crypto_regime_ok(df: pd.DataFrame, n: int = 100) -> pd.Series:
-    """Per-coin risk-on proxy: price above a *rising* long MA. Stands in for a market-wide
-    (BTC) regime filter, which isn't available inside a single-coin entry signal."""
+    """Per-coin risk-on proxy: price above a *rising* long MA. The FALLBACK for the market-wide gate
+    below when the injected BTC-regime column is absent (unit tests / non-crypto paths)."""
     c = df["Close"]
     ma = ind.sma(c, n)
     return (c > ma) & (ma > ma.shift(10))
 
 
+# ── Market-wide regime gate ──────────────────────────────────────────────────────────────────────
+# runner.run_full_backtest injects a boolean `MKT_RISK_ON` column (the market-wide BTC regime, from
+# services/market_regime.enrich_frames_with_market) onto every crypto frame, so a single-coin entry/exit
+# can respect the market-wide tide — crypto's dominant risk factor. When the column is ABSENT (unit tests,
+# non-crypto, any path that didn't inject) both helpers fall back to the per-coin proxy, so the entries
+# reduce EXACTLY to the prior per-coin behaviour. `_mkt_risk_off` references `_crypto_regime_off` (defined
+# with the shorts below); module-level functions resolve at call time so the forward reference is fine.
+def _mkt_risk_on(df: pd.DataFrame) -> pd.Series:
+    """True where the market-wide benchmark (BTC) is risk-on; per-coin proxy when the column is absent."""
+    if "MKT_RISK_ON" in df.columns:
+        return df["MKT_RISK_ON"].astype(bool)
+    return _crypto_regime_ok(df)
+
+
+def _mkt_risk_off(df: pd.DataFrame) -> pd.Series:
+    """True where the market-wide benchmark (BTC) is risk-off; per-coin proxy when the column is absent."""
+    if "MKT_RISK_ON" in df.columns:
+        return ~df["MKT_RISK_ON"].astype(bool)
+    return _crypto_regime_off(df)
+
+
 def _crypto_breakout_entry(df: pd.DataFrame) -> pd.Series:
-    """Donchian 20-day high breakout, taken only in a risk-on regime."""
+    """Donchian 20-day high breakout, taken only when the coin AND the market (BTC) are risk-on."""
     c = df["Close"]
-    return _fill((c > ind.rolling_high(c, 20)) & _crypto_regime_ok(df, 100))
+    return _fill((c > ind.rolling_high(c, 20)) & _crypto_regime_ok(df, 100) & _mkt_risk_on(df))
 
 
 def _crypto_trend_exit(df: pd.DataFrame) -> pd.Series:
@@ -932,18 +997,44 @@ def _crypto_trend_exit(df: pd.DataFrame) -> pd.Series:
     return _fill(_crosses_below(c, ind.sma(c, 50)))
 
 
+def _crypto_regime_exit(df: pd.DataFrame) -> pd.Series:
+    """Long exit: the structural 50-DMA break OR the market flipping risk-off — get to cash when BTC
+    rolls over, which is what turns the ~−90% crypto-winter drawdowns into flat equity. Without the
+    injected column the market term is a no-op, so this reduces to the plain 50-DMA exit."""
+    base = _crypto_trend_exit(df)
+    if "MKT_RISK_ON" in df.columns:
+        base = base | (~df["MKT_RISK_ON"].astype(bool))
+    return _fill(base)
+
+
 def _crypto_momentum_entry(df: pd.DataFrame) -> pd.Series:
-    """Strong 30-day momentum emerging (ROC crosses above +20%) in a risk-on regime."""
+    """Strong 30-day momentum emerging (ROC crosses above +20%) with the coin AND market (BTC) risk-on."""
     c = df["Close"]
     return _fill(_crosses_above(ind.roc(c, 30), pd.Series(20.0, index=df.index))
-                 & _crypto_regime_ok(df, 100))
+                 & _crypto_regime_ok(df, 100) & _mkt_risk_on(df))
 
 
 def _crypto_supertrend_entry(df: pd.DataFrame) -> pd.Series:
-    """Supertrend bullish flip confirmed by a risk-on regime."""
+    """Supertrend bullish flip confirmed by the coin AND market (BTC) being risk-on."""
     up = ind.supertrend(df["High"], df["Low"], df["Close"], 10, 3.0)["uptrend"]
     flip = up & ~up.shift(1).fillna(False).astype(bool)
-    return _fill(flip & _crypto_regime_ok(df, 100))
+    return _fill(flip & _crypto_regime_ok(df, 100) & _mkt_risk_on(df))
+
+
+def _crypto_supertrend_regime_exit(df: pd.DataFrame) -> pd.Series:
+    """Long exit for the Supertrend strategy: the bearish flip OR the market flipping risk-off (no-op
+    without the injected column, so it reduces to the plain flip exit)."""
+    base = _supertrend_flip_exit(df)
+    if "MKT_RISK_ON" in df.columns:
+        base = base | (~df["MKT_RISK_ON"].astype(bool))
+    return _fill(base)
+
+
+def _crypto_regime_trend_entry(df: pd.DataFrame) -> pd.Series:
+    """100-day Donchian high breakout, taken only while the market (BTC) is risk-on — trend-follow the
+    strongest coins in a bull market and sit out the winter."""
+    c = df["Close"]
+    return _fill((c > ind.rolling_high(c, 100)) & _mkt_risk_on(df))
 
 
 _CRYPTO_NATIVE: list[StrategyDef] = [
@@ -951,11 +1042,11 @@ _CRYPTO_NATIVE: list[StrategyDef] = [
         id="crypto-breakout-regime",
         name="Crypto Breakout (Regime-Gated)",
         category="Breakout",
-        description="Crypto: buy a 20-day high breakout only while price is above a rising 100-DMA "
-                    "(risk-on); ride with a wide 15% trailing stop or exit on a 50-DMA break. The wide "
-                    "stop is deliberate — ordinary crypto noise shakes out equity-tight stops.",
+        description="Crypto: buy a 20-day high breakout only while the coin AND the market (BTC) are "
+                    "risk-on; ride with a wide 15% trailing stop, or exit on a 50-DMA break OR when BTC "
+                    "flips risk-off. The market gate is what avoids buying alts into a crypto winter.",
         entry=_crypto_breakout_entry,
-        exit=_crypto_trend_exit,
+        exit=_crypto_regime_exit,
         trailing_stop_pct=0.15,
         max_holding_days=45,
         min_bars=140,
@@ -964,10 +1055,10 @@ _CRYPTO_NATIVE: list[StrategyDef] = [
         id="crypto-momentum-regime",
         name="Crypto Momentum (Regime-Gated)",
         category="Momentum",
-        description="Crypto: buy when 30-day momentum crosses above +20% in a risk-on regime (price "
-                    "above a rising 100-DMA); exit on a 50-DMA break or after 40 days. Wide 18% trail.",
+        description="Crypto: buy when 30-day momentum crosses above +20% with the coin AND market (BTC) "
+                    "risk-on; exit on a 50-DMA break, a BTC risk-off flip, or after 40 days. Wide 18% trail.",
         entry=_crypto_momentum_entry,
-        exit=_crypto_trend_exit,
+        exit=_crypto_regime_exit,
         trailing_stop_pct=0.18,
         max_holding_days=40,
         min_bars=140,
@@ -976,12 +1067,137 @@ _CRYPTO_NATIVE: list[StrategyDef] = [
         id="crypto-supertrend-regime",
         name="Crypto Supertrend (Regime-Gated)",
         category="Trend",
-        description="Crypto: enter on a Supertrend bullish flip confirmed by a risk-on regime (above a "
-                    "rising 100-DMA); exit on the bearish flip. Wide 20% trailing stop.",
+        description="Crypto: enter on a Supertrend bullish flip confirmed by the coin AND market (BTC) "
+                    "being risk-on; exit on the bearish flip OR a BTC risk-off flip. Wide 20% trailing stop.",
         entry=_crypto_supertrend_entry,
-        exit=_supertrend_flip_exit,
+        exit=_crypto_supertrend_regime_exit,
         trailing_stop_pct=0.20,
         min_bars=140,
+    ),
+    StrategyDef(
+        id="crypto-regime-trend",
+        name="Crypto Regime Trend (BTC-Gated)",
+        category="Trend",
+        description="Crypto: buy a 100-day high breakout ONLY while BTC is risk-on (above a rising "
+                    "200-DMA), and get straight to cash the moment BTC flips risk-off. A pure "
+                    "'trend-follow the bull, sit out the winter' book — built to cut the ~−90% crypto "
+                    "drawdown rather than chase the biggest raw CAGR. Wide 20% trailing stop.",
+        entry=_crypto_regime_trend_entry,
+        exit=_crypto_regime_exit,
+        trailing_stop_pct=0.20,
+        min_bars=140,
+    ),
+]
+
+
+# ── Crypto SHORT strategies (bearish mirrors of the crypto-native longs) ──────────
+# The daily board is long-only for every equity/metal market, but crypto trades both ways: it trends
+# down as cleanly as it trends up. These are the exact mirror of the three crypto-native longs above —
+# a risk-OFF regime filter (price below a *falling* long MA), a bearish entry, and a structural
+# reclaim exit — with the same wide trailing stops. direction="short", so the engine flips every
+# comparison (stop above entry, target below) and inverts the P&L. Only produced for CRYPTO, and only
+# when settings.crypto_shorts_enabled is on.
+
+
+def _crypto_regime_off(df: pd.DataFrame, n: int = 100) -> pd.Series:
+    """Per-coin risk-OFF proxy: price below a *falling* long MA — the mirror of `_crypto_regime_ok`.
+    Stands in for a market-wide (BTC) bear filter, unavailable inside a single-coin entry signal."""
+    c = df["Close"]
+    ma = ind.sma(c, n)
+    return (c < ma) & (ma < ma.shift(10))
+
+
+def _crypto_breakdown_entry(df: pd.DataFrame) -> pd.Series:
+    """Donchian 20-day low breakdown, taken only while the coin AND the market (BTC) are risk-off —
+    shorting crypto only pays in a market-wide downtrend, never into a bull market."""
+    c = df["Close"]
+    return _fill((c < ind.rolling_low(c, 20)) & _crypto_regime_off(df, 100) & _mkt_risk_off(df))
+
+
+def _crypto_trend_reclaim_exit(df: pd.DataFrame) -> pd.Series:
+    """Structural cover: close crosses back above the 50-DMA (downtrend broken)."""
+    c = df["Close"]
+    return _fill(_crosses_above(c, ind.sma(c, 50)))
+
+
+def _crypto_regime_cover_exit(df: pd.DataFrame) -> pd.Series:
+    """Short cover: the structural 50-DMA reclaim OR the market flipping risk-on (get flat when BTC
+    turns up). No-op without the injected column, so it reduces to the plain 50-DMA reclaim."""
+    base = _crypto_trend_reclaim_exit(df)
+    if "MKT_RISK_ON" in df.columns:
+        base = base | df["MKT_RISK_ON"].astype(bool)
+    return _fill(base)
+
+
+def _crypto_momentum_down_entry(df: pd.DataFrame) -> pd.Series:
+    """Strong 30-day downside momentum (ROC crosses below −20%) with the coin AND market (BTC) risk-off."""
+    c = df["Close"]
+    return _fill(_crosses_below(ind.roc(c, 30), pd.Series(-20.0, index=df.index))
+                 & _crypto_regime_off(df, 100) & _mkt_risk_off(df))
+
+
+def _crypto_supertrend_down_entry(df: pd.DataFrame) -> pd.Series:
+    """Supertrend bearish flip confirmed by the coin AND market (BTC) being risk-off."""
+    up = ind.supertrend(df["High"], df["Low"], df["Close"], 10, 3.0)["uptrend"]
+    flip = ~up & up.shift(1).fillna(False).astype(bool)
+    return _fill(flip & _crypto_regime_off(df, 100) & _mkt_risk_off(df))
+
+
+def _crypto_supertrend_bull_exit(df: pd.DataFrame) -> pd.Series:
+    """Cover a short on the Supertrend bullish flip (down → up)."""
+    up = ind.supertrend(df["High"], df["Low"], df["Close"], 10, 3.0)["uptrend"]
+    return _fill(up & ~up.shift(1).fillna(False).astype(bool))
+
+
+def _crypto_supertrend_regime_cover_exit(df: pd.DataFrame) -> pd.Series:
+    """Short cover for the Supertrend strategy: the bullish flip OR the market flipping risk-on (no-op
+    without the injected column, so it reduces to the plain bullish-flip cover)."""
+    base = _crypto_supertrend_bull_exit(df)
+    if "MKT_RISK_ON" in df.columns:
+        base = base | df["MKT_RISK_ON"].astype(bool)
+    return _fill(base)
+
+
+_CRYPTO_SHORT: list[StrategyDef] = [
+    StrategyDef(
+        id="crypto-breakdown-regime",
+        name="Crypto Breakdown Short (Regime-Gated)",
+        category="Breakout",
+        description="Crypto SHORT: sell a 20-day low breakdown only while the coin AND the market (BTC) "
+                    "are risk-off; cover on a 50-DMA reclaim, a BTC risk-on flip, or a 15% trailing stop "
+                    "off the trough. The market-off gate stops it shorting into a bull market.",
+        entry=_crypto_breakdown_entry,
+        exit=_crypto_regime_cover_exit,
+        trailing_stop_pct=0.15,
+        max_holding_days=45,
+        min_bars=140,
+        direction="short",
+    ),
+    StrategyDef(
+        id="crypto-momentum-down-regime",
+        name="Crypto Momentum Short (Regime-Gated)",
+        category="Momentum",
+        description="Crypto SHORT: sell when 30-day momentum crosses below −20% with the coin AND market "
+                    "(BTC) risk-off; cover on a 50-DMA reclaim, a BTC risk-on flip, or after 40 days. "
+                    "Wide 18% trail off the trough.",
+        entry=_crypto_momentum_down_entry,
+        exit=_crypto_regime_cover_exit,
+        trailing_stop_pct=0.18,
+        max_holding_days=40,
+        min_bars=140,
+        direction="short",
+    ),
+    StrategyDef(
+        id="crypto-supertrend-down-regime",
+        name="Crypto Supertrend Short (Regime-Gated)",
+        category="Trend",
+        description="Crypto SHORT: enter on a Supertrend bearish flip confirmed by the coin AND market "
+                    "(BTC) being risk-off; cover on the bullish flip or a BTC risk-on flip. Wide 20% stop.",
+        entry=_crypto_supertrend_down_entry,
+        exit=_crypto_supertrend_regime_cover_exit,
+        trailing_stop_pct=0.20,
+        min_bars=140,
+        direction="short",
     ),
 ]
 
@@ -1006,6 +1222,11 @@ _CRYPTO_REUSE_IDS = [
 
 CRYPTO_STRATEGIES: list[StrategyDef] = [_BY_ID[i] for i in _CRYPTO_REUSE_IDS] + _CRYPTO_NATIVE
 
+# Crypto SHORT strategies — surfaced only when settings.crypto_shorts_enabled (default on). Kept in a
+# separate list so `strategies_for_market` can gate them, but always folded into ALL_STRATEGIES below
+# so a persisted short signal resolves back to its def even if the flag is later turned off.
+CRYPTO_SHORT_STRATEGIES: list[StrategyDef] = _CRYPTO_SHORT
+
 
 STRATEGIES_BY_MARKET: dict[str, list[StrategyDef]] = {
     "CRYPTO": CRYPTO_STRATEGIES,
@@ -1016,12 +1237,21 @@ def strategies_for_market(market: str) -> list[StrategyDef]:
     """The backtest strategy set for a market. Most markets run the full equity+shared library
     (`STRATEGIES`); CRYPTO runs a curated trend/momentum/breakout set plus crypto-native
     strategies (`CRYPTO_STRATEGIES`), because the daily mean-reversion strategies catch falling
-    knives in crypto bear markets. Definitions are shared objects — safe to read, never mutate."""
-    return STRATEGIES_BY_MARKET.get((market or "IN").upper(), STRATEGIES)
+    knives in crypto bear markets. Crypto additionally runs a small bearish-mirror SHORT set
+    (`CRYPTO_SHORT_STRATEGIES`) when settings.crypto_shorts_enabled is on, so the board trades both
+    ways. Definitions are shared objects — safe to read, never mutate."""
+    mk = (market or "IN").upper()
+    if mk == "CRYPTO":
+        from pipeline_core.config import settings          # lazy — avoid an import cycle
+        shorts = CRYPTO_SHORT_STRATEGIES if settings.crypto_shorts_enabled else []
+        return CRYPTO_STRATEGIES + shorts
+    return STRATEGIES_BY_MARKET.get(mk, STRATEGIES)
 
 
 # Union of every market's strategies, de-duplicated by id — the global lookup used to resolve a
-# persisted signal's id back to its StrategyDef regardless of which market produced it.
+# persisted signal's id back to its StrategyDef regardless of which market produced it. Crypto shorts
+# are always included here (independent of the flag) so their persisted signals stay resolvable.
 ALL_STRATEGIES: list[StrategyDef] = list(
-    {s.id: s for lst in [STRATEGIES, *STRATEGIES_BY_MARKET.values()] for s in lst}.values()
+    {s.id: s for lst in [STRATEGIES, *STRATEGIES_BY_MARKET.values(), CRYPTO_SHORT_STRATEGIES]
+     for s in lst}.values()
 )

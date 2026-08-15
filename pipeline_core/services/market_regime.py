@@ -95,6 +95,54 @@ def _trend(close) -> tuple[Optional[bool], str]:
     return None, "insufficient history"
 
 
+# ── Backtest-time regime series (historical risk-on/off for the crypto strategy filter) ──────────
+# The live gauge above returns a single point-in-time tilt. The backtest instead needs the FULL daily
+# history of the benchmark's regime so a per-coin entry/exit signal can be gated on the market-wide tide
+# — crypto's dominant risk factor is BTC, and a per-coin filter lets you buy an alt right before the whole
+# market rolls over. Reuses the same long-MA trend concept as `_trend`. Anti-lookahead: the regime at each
+# date uses only benchmark data up to that date, then is shifted one bar (yesterday's regime gates today's
+# entry, which itself executes next open).
+
+
+def regime_series(benchmark_close):
+    """Daily risk-on (True) / risk-off (False) from the benchmark's long-MA trend: close above a
+    *rising* long moving average. 200-DMA where history allows, 100/50 fallback for a short series
+    (mirrors `_trend`). Returns a boolean Series (tz-naive, sorted) shifted one bar so it never uses
+    same-day information; pre-history defaults to risk-on. None on empty input."""
+    if benchmark_close is None or len(benchmark_close) == 0:
+        return None
+    close = benchmark_close.dropna().astype(float)
+    if getattr(close.index, "tz", None) is not None:
+        close = close.tz_localize(None)
+    close = close.sort_index()
+    n = len(close)
+    length = 200 if n >= 200 else 100 if n >= 100 else 50 if n >= 50 else max(2, n // 2)
+    ma = ind.sma(close, length)
+    risk_on = (close > ma) & (ma > ma.shift(20))
+    # Shift one bar for strict anti-lookahead; pre-history (NaN MA) defaults to risk-on (never blocks).
+    return risk_on.shift(1).fillna(True).astype(bool)
+
+
+def enrich_frames_with_market(df_by_ticker: dict, benchmark_close) -> None:
+    """Inject a boolean ``MKT_RISK_ON`` column (the benchmark's daily regime from `regime_series`) onto
+    every frame, so market-gated strategies can read the market-wide tide inside a single-coin entry/exit
+    signal. Forward-filled onto each frame's dates (risk-on before the series starts). Mutates in place;
+    never raises — a failure just leaves frames without the column and strategies fall back to their
+    per-coin proxy. Mirrors ``smart_money.enrich_frames``."""
+    try:
+        series = regime_series(benchmark_close)
+        if series is None or series.empty:
+            return
+        for df in df_by_ticker.values():
+            if df is None or getattr(df, "empty", True):
+                continue
+            idx = df.index
+            key = idx.tz_localize(None) if getattr(idx, "tz", None) is not None else idx
+            df["MKT_RISK_ON"] = series.reindex(key, method="ffill").fillna(True).to_numpy().astype(bool)
+    except Exception as e:
+        logger.warning(f"market-regime frame enrichment skipped: {e}")
+
+
 def _percentile(close, value: float) -> float:
     """Fraction of the trailing series ≤ `value` (0-1). Used to contextualize the vol reading."""
     s = close.dropna()

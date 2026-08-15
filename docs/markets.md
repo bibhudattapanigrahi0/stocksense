@@ -47,6 +47,17 @@ those tabs against that market's own last run (run a backtest per market to
 populate it; a pre-existing `latest.json` is honored as the IN run). The Idea
 Tracker tags each idea with its market and prices/scoreboards it per market.
 
+**Long *and* short — CRYPTO only.** Crypto trends down as cleanly as it trends up, so its Trade
+Ideas board trades both ways: alongside the long ideas it runs a small **bearish-mirror SHORT set**
+(`CRYPTO_SHORT_STRATEGIES` — a risk-off Donchian-low breakdown, downside-momentum, and Supertrend
+bearish-flip, mirroring the crypto-native longs) that is backtested short-aware (the engine flips the
+stop/target/P&L for `direction="short"`). Each board candidate carries a `side`; a short's **stop sits
+above** entry and its **target below**, its realized/unrealized P&L and tracker outcome invert, and
+longs vs shorts are ranked, gated, de-duped and sized as **independent books** (a risk-off tide is a
+short's tailwind). Every other market (IN/US/METALS) stays long-only, and even on crypto the curated
+**Today's Basket** / best-odds shortlists remain long-only. Toggle with
+`settings.crypto_shorts_enabled` (default on). See the ⚡📈🏔️ columns' **↓ Shorts** subgroup in the UI.
+
 ---
 
 ## Data sources per market
@@ -77,6 +88,29 @@ Tracker tags each idea with its market and prices/scoreboards it per market.
     with retries + backoff and **per-provider health** at `GET /api/v1/health/providers`.
     The DataFrame shape matches yfinance, so indicators / bots / the backtest reuse
     unchanged. Intraday bars (`5m–4h`) come from the same chain (`10m` resampled from `5m`).
+
+---
+
+## Market conditions header — direction + Fear & Greed
+
+The daily **Trade Ideas** board opens with a **Market Conditions** card pairing the tide it trades
+with. Both readings are cached ~1h and degrade to a neutral value, so an offline run leaves the board
+unchanged, and both ride along on the `/api/v1/backtest/ideas` payload (`regime` + `fear_greed`) and
+the `get_market_conditions` MCP tool.
+
+- **Direction** — the risk-on/off regime
+  ([`market_regime`](../pipeline_core/services/market_regime.py)): the benchmark's 200-DMA trend + a
+  vol/macro factor. This one **acts** on the board — regime-aligned longs rank first and risk-off
+  trims position size.
+- **Fear & Greed** — a 0–100 market-mood gauge
+  ([`market_sentiment.fear_greed`](../pipeline_core/services/market_sentiment.py)), **display-only**.
+  Because no single free source covers every market, the source is per-market:
+  - **US** — the real **CNN Fear & Greed Index** (keyless, *unofficial* dataviz endpoint; falls back
+    to the derived blend below if blocked or if `fear_greed_cnn_enabled` is off).
+  - **CRYPTO** — the free **alternative.me** Fear & Greed feed.
+  - **IN / other** — a **derived "Market Mood"** (labelled *derived*, not an official index — India
+    has no free canonical one): the benchmark's momentum vs its ~125-DMA blended with an inverted
+    volatility-index percentile (`fng_w_momentum` / `fng_w_volatility`).
 
 ---
 

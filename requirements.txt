@@ -15,6 +15,9 @@ numpy
 feedparser
 requests
 
+# Disclosure PDFs (US congressional PTR parsing — services/us_congress.py; source no-ops without it)
+pypdf
+
 # LLM providers (optional — pipeline runs rules-only without them)
 openai
 anthropic

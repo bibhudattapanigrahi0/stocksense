@@ -213,7 +213,7 @@ def scan_fresh_buys(strategy: StrategyDef, df_by_ticker: dict[str, pd.DataFrame]
 async def run_full_backtest(
     index: Optional[str] = None,
     years: int = 10,
-    cost_roundtrip_bps: float = 25.0,
+    cost_roundtrip_bps: Optional[float] = None,
     strategy_ids: Optional[list[str]] = None,
     market: str = "IN",
 ) -> dict:
@@ -222,14 +222,22 @@ async def run_full_backtest(
     backtest every strategy, scan current signals, persist results.
     The universe and benchmark are market-aware (S&P 500/^GSPC for US,
     metals/gold, crypto/BTC); strategies are pure-price so they run unchanged.
+
+    cost_roundtrip_bps: None (default) ⇒ use the market's realistic cost (config.market_cost_bps —
+    crypto ~35, US ~10, …); pass a number to override. Crypto shorts additionally pay a per-day
+    funding/borrow drag (config.crypto_funding_bps_per_day), modelled in the engine.
     """
     if job_state["running"]:
         raise RuntimeError("A backtest job is already running")
 
+    from pipeline_core.config import market_cost_bps
     from pipeline_core.markets import get_market
 
     m = get_market(market)
     index = index or m.default_universe
+    # Realistic per-market cost unless the caller overrode it; crypto shorts also pay funding.
+    cost_bps = market_cost_bps(m.key) if cost_roundtrip_bps is None else cost_roundtrip_bps
+    funding_bps = settings.crypto_funding_bps_per_day if m.key == "CRYPTO" else 0.0
 
     job_state.update(running=True, market=m.key, started_at=datetime.now(timezone.utc).isoformat(),
                      finished_at=None, error=None)
@@ -256,6 +264,13 @@ async def run_full_backtest(
         # No-op / inert on markets without a source. See services/smart_money.enrich_frames.
         smart_money.enrich_frames(m.key, df_by_ticker)
 
+        # Crypto: inject the market-wide BTC regime (the benchmark) onto every coin frame so the
+        # market-gated strategies can sit out crypto winters — crypto's dominant risk factor is BTC, and
+        # gating each coin on its own MA (the old per-coin proxy) lets the book crash with the market. The
+        # column is read by strategies._mkt_risk_on/_off; absent ⇒ they fall back to the per-coin proxy.
+        if m.key == "CRYPTO" and benchmark_df is not None and not benchmark_df.empty:
+            market_regime.enrich_frames_with_market(df_by_ticker, benchmark_df["Close"])
+
         # Curated strategies (market-scoped — crypto runs its own trend/momentum set) + any
         # user-promoted discovered ones (they run like built-ins).
         available = list(strategies_for_market(m.key)) + promoted_strategies(m.key)
@@ -267,7 +282,8 @@ async def run_full_backtest(
             _set_job(f"Backtesting {strategy.name}", pct, f"{idx + 1}/{len(strategies)}")
 
             bt = await asyncio.to_thread(
-                backtest_strategy, strategy, df_by_ticker, benchmark_df, years, cost_roundtrip_bps
+                backtest_strategy, strategy, df_by_ticker, benchmark_df, years, cost_bps,
+                None, None, funding_bps
             )
             results.append(bt)
 
@@ -281,8 +297,9 @@ async def run_full_backtest(
             )
 
         _set_job("Persisting results", 98.0)
-        payload = _serialize(results, signals, index, years, load_stats, cost_roundtrip_bps,
+        payload = _serialize(results, signals, index, years, load_stats, cost_bps,
                              time.time() - t0, market=m.key, benchmark_label=m.benchmark_label)
+        payload["funding_bps_per_day"] = funding_bps    # disclosed so the board can note the short drag
         _persist(payload, m.key)
 
         # Auto-track the freshly generated ideas so their win/loss can be followed over time.
@@ -817,11 +834,12 @@ def strategy_horizon(sdef: StrategyDef) -> str:
     return "long"
 
 
-def _idea_stop(horizon: str, stop_pcts: list, entry, market: str = "IN") -> tuple:
+def _idea_stop(horizon: str, stop_pcts: list, entry, market: str = "IN", side: str = "long") -> tuple:
     """Every trade idea gets a stop. Equities prefer the *tightest* stop the flagging strategies
     define (hard or trailing). CRYPTO instead uses the *median* strategy stop floored at a
     crypto-volatility minimum (`CRYPTO_HORIZON_STOP`) — the equity-calibrated tight stops get shaken
-    out by ordinary crypto noise, so taking the tightest one is exactly wrong there."""
+    out by ordinary crypto noise, so taking the tightest one is exactly wrong there. A SHORT's stop
+    sits ABOVE entry (price rising against the position)."""
     if str(market).upper() == "CRYPTO":
         floor = CRYPTO_HORIZON_STOP[horizon]
         stop_pct = max(statistics.median(stop_pcts), floor) if stop_pcts else floor
@@ -830,15 +848,17 @@ def _idea_stop(horizon: str, stop_pcts: list, entry, market: str = "IN") -> tupl
         stop_pct, source = min(stop_pcts), "strategy"
     else:
         stop_pct, source = HORIZON_DEFAULT_STOP[horizon], "horizon-default"
-    stop_price = round_price(entry * (1 - stop_pct)) if entry else None
+    sign = 1 if side == "short" else -1                       # short stop is above entry
+    stop_price = round_price(entry * (1 + sign * stop_pct)) if entry else None
     return round(stop_pct, 4), stop_price, source
 
 
-def _idea_target(horizon: str, target_pcts: list, entry, market: str = "IN") -> tuple:
+def _idea_target(horizon: str, target_pcts: list, entry, market: str = "IN", side: str = "long") -> tuple:
     """Upside for a trade idea. Prefer the average fixed profit target across the flagging strategies
     that define one; otherwise fall back to a horizon default. For CRYPTO the target is floored at a
     wider crypto minimum (`CRYPTO_HORIZON_TARGET`) so reward:risk stays sensible against the wider
-    crypto stop. Returns (target_pct, target_price, source)."""
+    crypto stop. A SHORT's target sits BELOW entry (price falling in the position's favour).
+    Returns (target_pct, target_price, source)."""
     is_crypto = str(market).upper() == "CRYPTO"
     if target_pcts:
         target_pct, source = sum(target_pcts) / len(target_pcts), "strategy"
@@ -847,7 +867,8 @@ def _idea_target(horizon: str, target_pcts: list, entry, market: str = "IN") -> 
         source = "crypto-default" if is_crypto else "horizon-default"
     if is_crypto and target_pct < CRYPTO_HORIZON_TARGET[horizon]:
         target_pct, source = CRYPTO_HORIZON_TARGET[horizon], "crypto-floor"
-    target_price = round_price(entry * (1 + target_pct)) if entry else None
+    sign = -1 if side == "short" else 1                        # short target is below entry
+    target_price = round_price(entry * (1 + sign * target_pct)) if entry else None
     return round(target_pct, 4), target_price, source
 
 
@@ -872,6 +893,37 @@ def _strategy_risk_ok(max_drawdown_pct, sharpe, market: str) -> bool:
     if sharpe is not None and sharpe < settings.crypto_idea_sharpe_floor:
         return False
     return True
+
+
+def _crypto_idea_gate(cands: list, tilt: float) -> list:
+    """The crypto board gate, applied to one horizon's candidate pool.
+
+    LONGS survive only if a non-catastrophic strategy backs them (``eligible_conviction`` ≥ 1) or the
+    idea is carried (an open tracked position); the long side is never emptied — if every long is gated,
+    they're all kept and simply rank last.
+
+    SHORTS have no strategy that clears the backtest risk gate today (crypto shorts lose over a 10y
+    sample), so a *proven* short is rare. But in a genuinely BEARISH tide a short still has some
+    potential, so the best few unproven shorts are surfaced as **speculative** watchlist ideas —
+    ``c["speculative"]=True``, ranked by raw bearish agreement (conviction → least-bad Sharpe → least-bad
+    drawdown), capped at ``crypto_shorts_max_speculative`` — only when ``tilt`` ≤
+    ``crypto_shorts_regime_tilt``. On a risk-on day (or with the flag off) unproven shorts are dropped."""
+    def _eligible(c):
+        return c.get("carried") or c.get("eligible_conviction", 0) >= 1
+
+    longs = [c for c in cands if c.get("side", "long") != "short"]
+    shorts = [c for c in cands if c.get("side") == "short"]
+    kept_longs = [c for c in longs if _eligible(c)] or longs
+    kept_shorts = [c for c in shorts if _eligible(c)]                 # proven shorts (cleared the gate)
+    unproven = [c for c in shorts if not _eligible(c)]
+    if unproven and settings.crypto_shorts_regime_surface and tilt <= settings.crypto_shorts_regime_tilt:
+        unproven.sort(key=lambda c: (c.get("conviction", 0), c.get("avg_sharpe") or -9,
+                      c.get("avg_max_drawdown") if c.get("avg_max_drawdown") is not None else -999),
+                      reverse=True)
+        for c in unproven[:settings.crypto_shorts_max_speculative]:
+            c["speculative"] = True
+            kept_shorts.append(c)
+    return kept_longs + kept_shorts
 
 
 def _days_since(date_str: Optional[str]) -> Optional[int]:
@@ -899,7 +951,7 @@ def _partition_tracked(market: str) -> tuple[dict, dict]:
     for t in _load_tracked():
         if (t.get("market") or "IN") != mk:
             continue
-        key = (t.get("ticker"), t.get("horizon"))
+        key = (t.get("ticker"), t.get("horizon"), t.get("side", "long"))
         if t.get("closed"):
             ex = t.get("exit_date") or "9999-12-31"
             closed_exit[key] = max(closed_exit.get(key, ""), ex)
@@ -915,6 +967,7 @@ def _carried_candidate(t: dict) -> dict:
     sp, tp = t.get("stop_pct"), t.get("target_pct")
     return {
         "ticker": t["ticker"],
+        "side": t.get("side", "long"),
         "price": t.get("entry_price"),
         "buy_low": t.get("buy_low"),
         "buy_high": t.get("buy_high"),
@@ -954,12 +1007,67 @@ def _size_bucket(shown: list, tilt: float) -> dict:
     return bucket_sizing
 
 
+def _rank_pool(pool: list, max_per_bucket: int,
+               clusters: Optional[dict], pillar_ctx: Optional[dict]) -> tuple:
+    """Rank ONE direction's candidate pool by the composite score → quality gate → correlation de-dup
+    → cap → optional pillar tiering. Returns (shown, quality_cut, dedup_info). Mutates candidate
+    fields (rank_multiplier/rank_score/pillars/tier) but no bucket. The regime tilt is already baked
+    into each idea's `_base_score` (side-appropriate sign) and sizing is applied by the caller, so no
+    tilt is needed here. A SHORT's directional soft factors are inverted (a bullish tilt is a headwind
+    for it); for long candidates the inversion is a no-op, so behaviour is unchanged."""
+    for c in pool:
+        factors = {name: c.get(f"{name}_factor") for name in idea_ranking.FACTOR_NAMES}
+        if c.get("side") == "short":
+            # Directional factors flip for a short: accumulation / bullish news / a leading sector /
+            # high quality all argue AGAINST it. Earnings is event-risk (non-directional) → kept.
+            for name in ("news", "sector", "quality", "smart_money"):
+                if factors.get(name) is not None:
+                    factors[name] = -factors[name]
+        mult = idea_ranking.composite_multiplier(factors)
+        c["rank_multiplier"] = round(mult, 4)
+        c["rank_score"] = round(c.get("_base_score", c.get("conviction", 0)) * mult, 6)
+    pool.sort(key=lambda c: (c["rank_score"], c.get("avg_win_rate") or 0, c.get("avg_sharpe") or 0),
+              reverse=True)
+    floor = settings.rank_min_multiplier
+    survivors = [c for c in pool if c["rank_multiplier"] >= floor]
+    # Correlation de-dup on the rank-sorted survivors (best-ranked idea per correlated cluster kept),
+    # BEFORE the cap so independent names are promoted over correlated ones. Empty clusters → no-op.
+    deduped, dd = dedup.dedup_book(survivors, clusters or {})
+    shown = deduped[:max_per_bucket]
+    # Multi-pillar confluence tiering (opt-in): tag each shown idea with its confirming families and
+    # split actionable vs watch, then order actionable-first (stable → rank order kept within tier).
+    if pillar_ctx is not None:
+        avail = pillar_ctx.get("available", 0)
+        mina = pillar_ctx.get("min_actionable")
+        gate_shorts = not settings.crypto_shorts_actionable
+        for c in shown:
+            summ = idea_ranking.pillar_summary(c, avail, side=c.get("side", "long"))
+            c["pillars"] = summ["pillars"]
+            c["pillar_count"] = summ["count"]
+            c["pillar_available"] = summ["available"]
+            c["tier"] = idea_ranking.pillar_tier(summ["count"], avail, mina)
+            # Crypto shorts stay on the WATCHLIST (visible, never "actionable") when either the cautious
+            # flag is set OR the short is SPECULATIVE (surfaced by the bearish-regime path with no backtest
+            # edge) — a proven short that cleared the risk gate can still go actionable.
+            if (gate_shorts or c.get("speculative")) and c.get("side") == "short":
+                c["tier"] = "watch"
+                c["short_gated"] = True
+        shown.sort(key=lambda c: 0 if c.get("tier") == "actionable" else 1)
+    for c in pool:
+        c.pop("_base_score", None)
+    return shown, len(pool) - len(survivors), dd
+
+
 def _recompose_bucket(bucket: dict, tilt: float, max_per_bucket: int,
                       clusters: Optional[dict] = None, pillar_ctx: Optional[dict] = None) -> None:
     """Re-rank a bucket's candidate POOL (shown + reserve) by the composite score — each idea's base
     conviction×regime score scaled by whatever soft factors (earnings/news/sector/quality) live
     enrichment has attached — then apply the QUALITY GATE, collapse CORRELATED duplicates, and keep
     the top `max_per_bucket`.
+
+    Longs and shorts are ranked, gated, de-duped, capped and sized as INDEPENDENT books (a long and a
+    correlated short are opposite bets, not duplicates; each side gets its own top-N). Non-crypto
+    markets only ever have longs → the single-side path below is the exact prior behaviour.
 
     `pillar_ctx` ({available, min_actionable}) turns on MULTI-PILLAR TIERING: each shown idea is tagged
     with the independent families that confirm it (idea_ranking.idea_pillars) and split into an
@@ -977,39 +1085,44 @@ def _recompose_bucket(bucket: dict, tilt: float, max_per_bucket: int,
     With no factors attached every multiplier is 1.0 and with no clusters nothing is collapsed, so the
     order is exactly the base one (regression-safe)."""
     pool = bucket.get("candidates", []) + bucket.pop("_reserve", [])
+    by_side: dict[str, list] = {}
     for c in pool:
-        factors = {name: c.get(f"{name}_factor") for name in idea_ranking.FACTOR_NAMES}
-        mult = idea_ranking.composite_multiplier(factors)
-        c["rank_multiplier"] = round(mult, 4)
-        c["rank_score"] = round(c.get("_base_score", c.get("conviction", 0)) * mult, 6)
-    pool.sort(key=lambda c: (c["rank_score"], c.get("avg_win_rate") or 0, c.get("avg_sharpe") or 0),
-              reverse=True)
-    floor = settings.rank_min_multiplier
-    survivors = [c for c in pool if c["rank_multiplier"] >= floor]
-    # Correlation de-dup on the rank-sorted survivors (best-ranked idea per correlated cluster kept),
-    # BEFORE the cap so independent names are promoted over correlated ones. Empty clusters → no-op.
-    deduped, dd = dedup.dedup_book(survivors, clusters or {})
-    shown = deduped[:max_per_bucket]
-    # Multi-pillar confluence tiering (opt-in): tag each shown idea with its confirming families and
-    # split actionable vs watch, then order actionable-first (stable → rank order kept within tier).
+        by_side.setdefault(c.get("side", "long"), []).append(c)
+
+    if "short" not in by_side:
+        # Long-only (every non-crypto market, and crypto with shorts off) — behaviour unchanged.
+        shown, cut, dd = _rank_pool(pool, max_per_bucket, clusters, pillar_ctx)
+        bucket["candidates"] = shown
+        bucket["quality_cut"] = cut                       # conflicted ideas the gate removed
+        bucket["dedup"] = dd                              # {kept, dropped, collapsed_clusters}
+        if pillar_ctx is not None:
+            bucket["actionable_count"] = sum(1 for c in shown if c.get("tier") == "actionable")
+            bucket["watch_count"] = sum(1 for c in shown if c.get("tier") == "watch")
+        bucket["sizing"] = _size_bucket(shown, tilt)
+        return
+
+    # Mixed long+short (crypto): rank each side independently, then concatenate (longs first).
+    combined, cut_total = [], 0
+    dd_total = {"kept": 0, "dropped": 0, "collapsed_clusters": 0}
+    for _side in ("long", "short"):
+        if _side not in by_side:
+            continue
+        shown, cut, dd = _rank_pool(by_side[_side], max_per_bucket, clusters, pillar_ctx)
+        combined += shown
+        cut_total += cut
+        dd_total["kept"] += dd.get("kept", 0)
+        dd_total["dropped"] += dd.get("dropped", 0)
+        dd_total["collapsed_clusters"] += dd.get("collapsed_clusters", 0)
     if pillar_ctx is not None:
-        avail = pillar_ctx.get("available", 0)
-        mina = pillar_ctx.get("min_actionable")
-        for c in shown:
-            summ = idea_ranking.pillar_summary(c, avail)
-            c["pillars"] = summ["pillars"]
-            c["pillar_count"] = summ["count"]
-            c["pillar_available"] = summ["available"]
-            c["tier"] = idea_ranking.pillar_tier(summ["count"], avail, mina)
-        shown.sort(key=lambda c: 0 if c.get("tier") == "actionable" else 1)
-        bucket["actionable_count"] = sum(1 for c in shown if c.get("tier") == "actionable")
-        bucket["watch_count"] = sum(1 for c in shown if c.get("tier") == "watch")
-    for c in pool:
-        c.pop("_base_score", None)
-    bucket["candidates"] = shown
-    bucket["quality_cut"] = len(pool) - len(survivors)   # conflicted ideas the gate removed
-    bucket["dedup"] = dd                                  # {kept, dropped, collapsed_clusters}
-    bucket["sizing"] = _size_bucket(shown, tilt)
+        bucket["actionable_count"] = sum(1 for c in combined if c.get("tier") == "actionable")
+        bucket["watch_count"] = sum(1 for c in combined if c.get("tier") == "watch")
+    long_shown = [c for c in combined if c.get("side", "long") != "short"]
+    short_shown = [c for c in combined if c.get("side") == "short"]
+    bucket["candidates"] = combined
+    bucket["quality_cut"] = cut_total
+    bucket["dedup"] = dd_total
+    bucket["sizing"] = _size_bucket(long_shown, tilt)
+    bucket["short_sizing"] = _size_bucket(short_shown, -tilt) if short_shown else None
 
 
 def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict]:
@@ -1039,14 +1152,21 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
     # UNLESS a fresh signal fires after that close (a re-entry, which resurfaces). Still-open
     # tracked ideas are carried over so a valid setup isn't flushed when it isn't re-signaled.
     closed_exit, open_tracked = _partition_tracked(idea_market)
-    open_keys = {(t["ticker"], h) for h, lst in open_tracked.items() for t in lst}
+    open_keys = {(t["ticker"], h, t.get("side", "long")) for h, lst in open_tracked.items() for t in lst}
     horizons = ["short", "medium", "long"]
-    pools: dict[str, dict[str, dict]] = {h: {} for h in horizons}
+    # Pools are keyed by (side, ticker): the same coin can be both a long idea (from a long strategy)
+    # and a short idea (from a short strategy) in the same horizon, tracked and shown independently.
+    # Non-crypto markets only ever produce long strategies → every key is ("long", ticker), unchanged.
+    allow_shorts = idea_market == "CRYPTO" and settings.crypto_shorts_enabled
+    pools: dict[str, dict[tuple, dict]] = {h: {} for h in horizons}
     strat_by_horizon: dict[str, list] = {h: [] for h in horizons}
 
     for s in latest["strategies"]:
         sdef = _STRATEGY_BY_ID.get(s["id"])
         if sdef is None:
+            continue
+        side = getattr(sdef, "direction", "long")
+        if side == "short" and not allow_shorts:      # honour the flag / market at surface time
             continue
         h = strategy_horizon(sdef)
         m = s.get("metrics", {}) or {}
@@ -1060,8 +1180,8 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
         })
         for b in s["signals"]["buy"]:
             ticker = b["ticker"]
-            agg = pools[h].setdefault(ticker, {
-                "ticker": ticker, "price": b.get("price"),
+            agg = pools[h].setdefault((side, ticker), {
+                "ticker": ticker, "side": side, "price": b.get("price"),
                 "strategies": [], "signal_dates": set(),
                 "_win_rates": [], "_sharpes": [], "_drawdowns": [], "_stop_pcts": [],
                 "_target_pcts": [], "_n_eligible": 0, "_dips": [], "_deep_dips": [],
@@ -1100,23 +1220,32 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
     reg = market_regime.market_regime(idea_market) if settings.regime_gate_enabled else None
     tilt = reg["tilt"] if reg else 0.0
 
+    # Fear & Greed mood — the display-only companion to the regime tide (per-market source: CNN for
+    # US, alternative.me for crypto, a derived blend elsewhere). Rides along on the payload next to
+    # `regime`; degrades to a neutral 50 so it never blocks the board.
+    fng = market_sentiment.fear_greed(idea_market) if settings.fear_greed_enabled else None
+
     buckets = {}
     for h in horizons:
         cands = []
-        fresh_tickers = set()
+        fresh_keys = set()                          # (side, ticker) freshly signalled this scan
         for agg in pools[h].values():
-            key = (agg["ticker"], h)
+            key = (agg["ticker"], h, agg["side"])
             latest_sig = max(agg["signal_dates"]) if agg["signal_dates"] else None
             exit_d = closed_exit.get(key)
             # Drop a closed idea only if it hasn't fired a fresh signal after its close and isn't
             # currently open — i.e. a stale past trade. A newer signal is a re-entry → keep it.
             if exit_d and key not in open_keys and not (latest_sig and latest_sig > exit_d):
                 continue
-            fresh_tickers.add(agg["ticker"])
+            fresh_keys.add((agg["side"], agg["ticker"]))
             wins = agg["_win_rates"]
             sharpes = agg["_sharpes"]
             drawdowns = agg["_drawdowns"]
-            avg_wr = round(sum(wins) / len(wins), 1) if wins else None
+            # Survivorship honesty: the backtest universe is today's index members applied over history,
+            # so advertised win-rates are inflated. Subtract a documented haircut (uniform → ordering
+            # unchanged; only the shown/​sized win-prob drops) until a point-in-time universe lands.
+            avg_wr = (max(0.0, round(sum(wins) / len(wins) - settings.survivorship_haircut_pp, 1))
+                      if wins else None)
             avg_sh = round(sum(sharpes) / len(sharpes), 2) if sharpes else None
             avg_dd = round(sum(drawdowns) / len(drawdowns), 1) if drawdowns else None
             # "Normal drawdown" band: mean over the backing strategies of their winners' typical/deep dip
@@ -1125,13 +1254,15 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
             band_on = settings.drawdown_band_enabled
             typical_dd = round(sum(dips) / len(dips), 1) if (dips and band_on) else None
             deep_dd = round(sum(deep_dips) / len(deep_dips), 1) if (deep_dips and band_on) else None
-            stop_pct, stop_price, stop_source = _idea_stop(h, agg["_stop_pcts"], agg["price"], idea_market)
-            target_pct, target_price, target_source = _idea_target(h, agg["_target_pcts"], agg["price"], idea_market)
+            side = agg["side"]
+            stop_pct, stop_price, stop_source = _idea_stop(h, agg["_stop_pcts"], agg["price"], idea_market, side)
+            target_pct, target_price, target_source = _idea_target(h, agg["_target_pcts"], agg["price"], idea_market, side)
             buy_low, buy_high = _idea_buy_range(h, agg["price"])
             rr = round(target_pct / stop_pct, 2) if stop_pct else None
             age_days = _days_since(latest_sig)
             cands.append({
                 "ticker": agg["ticker"],
+                "side": side,
                 "price": agg["price"],
                 "buy_low": buy_low,
                 "buy_high": buy_high,
@@ -1164,15 +1295,12 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
         # with a non-positive entry price — legacy broken records that render as $0.00 cards and can
         # never close (they're purged separately); dropping them here keeps the board clean meanwhile.
         for t in open_tracked.get(h, []):
-            if t["ticker"] not in fresh_tickers and (t.get("entry_price") or 0) > 0:
+            if (t.get("side", "long"), t["ticker"]) not in fresh_keys and (t.get("entry_price") or 0) > 0:
                 cands.append(_carried_candidate(t))
-        # Crypto risk gate: a fresh idea only survives if a non-catastrophic strategy backs it
-        # (eligible_conviction ≥ 1). Carried open positions are kept regardless. Never empties a
-        # bucket — if every fresh idea is gated, they're all kept (and ranked last by the key below).
+        # Crypto board gate (long risk gate + bearish-regime speculative-short surfacing). See
+        # _crypto_idea_gate. Non-crypto markets skip it entirely (long-only, ungated).
         if idea_market == "CRYPTO":
-            kept = [c for c in cands if c.get("carried") or c.get("eligible_conviction", 0) >= 1]
-            if kept:
-                cands = kept
+            cands = _crypto_idea_gate(cands, tilt)
 
         # Rank by conviction, then win rate (a not-closed idea with a higher win rate outranks a
         # fresh lower-win-rate one and stays within the cap), then Sharpe. The market regime softly
@@ -1181,47 +1309,70 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
         # can outrank a high-conviction counter-trend one. tilt=0 ⇒ factor 1 ⇒ ordering unchanged.
         # Crypto ranks on the risk-GATED conviction and leads ties with Sharpe (risk-adjusted quality)
         # then the least-bad drawdown, so a few solid strategies beat a pile of near-wipeout ones.
+        def _eff_tilt(c):
+            # A risk-off tide (tilt<0) is a HEADWIND for a long but a TAILWIND for a short, so shorts
+            # read the regime with the opposite sign. tilt=0 ⇒ 0 either way ⇒ ordering unchanged.
+            return -tilt if c.get("side") == "short" else tilt
+
         def _regime_rank_key(c):
+            t = _eff_tilt(c)
             cyc = market_regime.idea_cyclicality([s.get("category") for s in c.get("strategies", [])])
             if idea_market == "CRYPTO":
-                conv = c.get("eligible_conviction", c["conviction"])
-                return (conv * (1 + settings.regime_rank_weight * tilt * cyc),
+                # Speculative shorts carry eligible_conviction 0 (their strategies fail the risk gate);
+                # rank them by their RAW bearish agreement so the strongest setup leads the subgroup.
+                conv = c["conviction"] if c.get("speculative") else c.get("eligible_conviction", c["conviction"])
+                return (conv * (1 + settings.regime_rank_weight * t * cyc),
                         c["avg_sharpe"] or 0, c["avg_win_rate"] or 0,
                         c["avg_max_drawdown"] if c.get("avg_max_drawdown") is not None else -999)
-            return (c["conviction"] * (1 + settings.regime_rank_weight * tilt * cyc),
+            return (c["conviction"] * (1 + settings.regime_rank_weight * t * cyc),
                     c["avg_win_rate"] or 0, c["avg_sharpe"] or 0)
 
-        cands.sort(key=_regime_rank_key, reverse=True)
-        # Keep a re-rank POOL a few deep past the cap: live enrichment (earnings/news/…) can then
-        # promote a cleaner idea into the shown top-N. Each pooled idea carries its base score for
-        # that composite re-rank; the non-live board is simply the base top-N of the pool.
-        pool = cands[:max(max_per_bucket, max_per_bucket * max(1, settings.rank_pool_mult))]
-        for c in pool:
-            c["_base_score"] = _regime_rank_key(c)[0]      # conviction × regime multiplier
-        # Per-idea fields (regime fit / calibration / fusion) — set on the whole pool, so a reserve
-        # idea promoted during live re-rank still carries them. All order-independent.
-        if tilt:                                   # tag how each idea sits vs the tide (skipped when neutral)
-            for c in pool:
-                cyc = market_regime.idea_cyclicality([s.get("category") for s in c.get("strategies", [])])
-                pull = tilt * cyc                  # >0 = the tide favours this idea, <0 = against it
-                c["regime_fit"] = ("tailwind" if pull > 0.05 else
-                                   "headwind" if pull < -0.05 else "neutral")
-        if cal_curve:
-            for c in pool:
-                if c.get("avg_win_rate") is not None:
-                    c["calibrated_win_pct"] = calibration.apply_calibration(cal_curve, c["avg_win_rate"])
-        if fusion_bundle.get("active"):
-            for c in pool:
-                mp = fusion.model_win_pct(fusion_bundle, c)
-                if mp is not None:
-                    c["model_win_pct"] = mp
-        shown = pool[:max_per_bucket]
+        # Rank, pool and cap each DIRECTION independently, so a horizon surfaces up to max_per_bucket
+        # longs AND up to max_per_bucket shorts. Longs lead the combined list (the UI renders the two
+        # as separate subgroups). Non-crypto markets have only longs → identical to the prior board.
+        pool_size = max(max_per_bucket, max_per_bucket * max(1, settings.rank_pool_mult))
+        shown, reserve = [], []
+        for _side in ("long", "short"):
+            side_cands = [c for c in cands if c.get("side", "long") == _side]
+            if not side_cands:
+                continue
+            side_cands.sort(key=_regime_rank_key, reverse=True)
+            # Keep a re-rank POOL a few deep past the cap: live enrichment (earnings/news/…) can then
+            # promote a cleaner idea into the shown top-N. Each pooled idea carries its base score for
+            # that composite re-rank; the non-live board is simply the base top-N of the pool.
+            side_pool = side_cands[:pool_size]
+            for c in side_pool:
+                c["_base_score"] = _regime_rank_key(c)[0]      # conviction × regime multiplier
+            # Per-idea fields (regime fit / calibration / fusion) — set on the whole pool, so a reserve
+            # idea promoted during live re-rank still carries them. All order-independent.
+            if tilt:                               # tag how each idea sits vs the tide (skipped when neutral)
+                for c in side_pool:
+                    cyc = market_regime.idea_cyclicality([s.get("category") for s in c.get("strategies", [])])
+                    pull = _eff_tilt(c) * cyc      # >0 = the tide favours this idea, <0 = against it
+                    c["regime_fit"] = ("tailwind" if pull > 0.05 else
+                                       "headwind" if pull < -0.05 else "neutral")
+            if cal_curve:
+                for c in side_pool:
+                    if c.get("avg_win_rate") is not None:
+                        c["calibrated_win_pct"] = calibration.apply_calibration(cal_curve, c["avg_win_rate"])
+            if fusion_bundle.get("active"):
+                for c in side_pool:
+                    mp = fusion.model_win_pct(fusion_bundle, c)
+                    if mp is not None:
+                        c["model_win_pct"] = mp
+            shown += side_pool[:max_per_bucket]
+            reserve += side_pool[max_per_bucket:]
+        # Size each direction as its own ¼-Kelly book with the side-appropriate regime tilt sign
+        # (a risk-off haircut trims longs, not shorts). The UI reads per-idea alloc/risk off each.
+        long_shown = [c for c in shown if c.get("side", "long") != "short"]
+        short_shown = [c for c in shown if c.get("side") == "short"]
         buckets[h] = {
             "horizon": h,
             **HORIZON_META[h],
             "candidates": shown,
-            "_reserve": pool[max_per_bucket:],     # consumed by enrich_ideas_live's composite re-rank
-            "sizing": _size_bucket(shown, tilt),
+            "_reserve": reserve,                   # consumed by enrich_ideas_live's composite re-rank
+            "sizing": _size_bucket(long_shown, tilt),
+            "short_sizing": _size_bucket(short_shown, -tilt) if short_shown else None,
             "total_candidates": len(cands),
             "strategies": strat_by_horizon[h],
             "strategy_count": len(strat_by_horizon[h]),
@@ -1246,20 +1397,33 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
                if c.get("avg_max_drawdown") is not None]
         avg_txt = (f"Backing strategies average {round(sum(dds) / len(dds), 1)}% max drawdown. "
                    if dds else "")
+        funding = latest.get("funding_bps_per_day")
+        fund_txt = (f" Shorts also pay ~{funding:g} bps/day funding while held."
+                    if funding else "")
         risk_note = (f"{avg_txt}Crypto ideas come from equity strategies with deep backtested "
                      f"drawdowns — those worse than {settings.crypto_idea_dd_floor:g}% are filtered, "
                      "the rest ranked by risk-adjusted quality, with wider crypto stops. Size small; "
-                     "decision-support, not advice.")
+                     f"decision-support, not advice.{fund_txt}")
+    # Board-level honesty disclosure (all markets): the realistic cost the backtest was priced at + the
+    # survivorship haircut applied to advertised win-rates. Lets the UI show "priced with X bps · win
+    # rates haircut Ypp for survivorship" so the numbers don't over-promise.
+    cost_disclosure = {
+        "cost_bps": latest.get("cost_roundtrip_bps"),
+        "funding_bps_per_day": latest.get("funding_bps_per_day") or 0.0,
+        "survivorship_haircut_pp": settings.survivorship_haircut_pp,
+    }
     return {
         "horizons": horizons,
         "buckets": buckets,
         "sizing_params": sizing.sizing_params(),
         "ranking": idea_ranking.rank_weights(),
-        "pillars": idea_ranking.pillar_disclosure(),
+        "pillars": idea_ranking.pillar_disclosure(idea_market),
         "calibration": cal_public,
         "fusion": fusion.public_view(fusion_bundle),
         "regime": reg,
+        "fear_greed": fng,
         "risk_note": risk_note,
+        "cost_disclosure": cost_disclosure,
         "max_per_bucket": max_per_bucket,
         "run_at": latest["run_at"],
         "market": latest.get("market", "IN"),
@@ -1277,10 +1441,16 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
 def _idea_zone(live: float, c: dict) -> str:
     stop, target = c.get("stop_price"), c.get("target_price")
     lo, hi = c.get("buy_low"), c.get("buy_high")
-    if stop is not None and live <= stop:
-        return "below_stop"
-    if target is not None and live >= target:
-        return "at_target"
+    if c.get("side") == "short":                      # short: stop above entry, target below
+        if stop is not None and live >= stop:
+            return "below_stop"                       # stopped out — price ran up through the stop
+        if target is not None and live <= target:
+            return "at_target"                        # short reached its (lower) target
+    else:
+        if stop is not None and live <= stop:
+            return "below_stop"
+        if target is not None and live >= target:
+            return "at_target"
     if lo is not None and live < lo:
         return "below_zone"
     if hi is not None and live > hi:
@@ -1322,7 +1492,11 @@ async def enrich_ideas_live(ideas: Optional[dict], market: str = "IN") -> Option
         + (1 if want_news else 0)            # news sentiment
         + (1 if want_sector else 0)          # sector rotation
     )
-    pillar_ctx = ({"available": available_families, "min_actionable": settings.pillar_min_actionable}
+    # Crypto uses a lower actionable bar (only ~3 families exist there, so the equity bar of 3 files
+    # every idea under watch); every other market uses the standard bar. Still clamped to availability.
+    min_actionable = (settings.pillar_min_actionable_crypto if mk == "CRYPTO"
+                      else settings.pillar_min_actionable)
+    pillar_ctx = ({"available": available_families, "min_actionable": min_actionable}
                   if settings.pillar_tiering_enabled else None)
 
     # The re-rank POOL = each bucket's shown candidates + its reserve (a reserve idea can be promoted
@@ -1376,6 +1550,12 @@ async def enrich_ideas_live(ideas: Optional[dict], market: str = "IN") -> Option
             # Smart-money rank tilt: accumulation lifts the idea, distribution trims it (scaled by the
             # signal's conviction). Same normalized signal the badge/coattail already use — no new fetch.
             c["smart_money_factor"] = idea_ranking.smart_money_factor(c["smart_money"])
+            # Sell-side visibility: surface DISTRIBUTION (the pros trimming / whales net-short) as a flag —
+            # an AVOID warning on a long, a CONFIRMATION on a crypto short. The rank impact is already
+            # applied above (+ the short-side inversion in _rank_pool); this only makes it visible.
+            if settings.smart_money_distribution_enabled:
+                c["smart_money_distributing"] = idea_ranking.distribution_flag(
+                    c["smart_money"], c.get("side", "long"))
             # Earnings event risk: days to the next report + a soft rank penalty that ramps up inside
             # the window (idea_ranking.earnings_factor). None outside the window / non-equity markets.
             dte = days_earn.get(c["ticker"])
@@ -1409,11 +1589,12 @@ async def enrich_ideas_live(ideas: Optional[dict], market: str = "IN") -> Option
             c["live_change_pct"] = round((live - entry) / entry * 100, 2) if entry else None
             c["zone"] = _idea_zone(live, c)
             sp, tp = c.get("stop_pct"), c.get("target_pct")
+            s_sign = 1 if c.get("side") == "short" else -1    # short stop is above, target below
             c["live_levels"] = {                              # same fractions, re-anchored to live
                 "buy_low": round_price(live * (1 - band)),
                 "buy_high": round_price(live * (1 + band)),
-                "stop_price": round_price(live * (1 - sp)) if sp else None,
-                "target_price": round_price(live * (1 + tp)) if tp else None,
+                "stop_price": round_price(live * (1 + s_sign * sp)) if sp else None,
+                "target_price": round_price(live * (1 - s_sign * tp)) if tp else None,
                 "risk_reward": round(tp / sp, 2) if sp and tp else c.get("risk_reward"),
             }
         # Composite re-rank the enriched pool (base conviction×regime × the soft factors), collapse
@@ -1435,6 +1616,16 @@ async def enrich_ideas_live(ideas: Optional[dict], market: str = "IN") -> Option
         # (services/smart_money). Read-only ride-along; "what to buy that the pros are buying too".
         if settings.coattail_basket_enabled:
             ideas["coattail_basket"] = basket.build_basket(ideas, clusters, coattail_mode=True)
+        # The sell-side mirror — the COATTAIL SHORT sleeve: SHORT ideas the smart money is DISTRIBUTING
+        # (crypto whales net-short). Read-only ride-along; "the short book the pros are positioned for".
+        # Empty on long-only markets / risk-on tides (no shorts to curate) — honest by construction.
+        if settings.coattail_short_basket_enabled:
+            ideas["coattail_short_basket"] = basket.build_basket(ideas, clusters, distribute_mode=True)
+
+    # The BEST-ODDS board — the same board's fresh setups ranked purely by win probability (top N).
+    # Read-only ride-along; "which trades are most likely to win". Independent of basket_enabled.
+    if settings.best_odds_enabled:
+        ideas["best_odds"] = basket.build_best_odds(ideas, clusters)
 
     ideas["live_priced_at"] = datetime.now(timezone.utc).isoformat()
     return ideas
@@ -1482,17 +1673,29 @@ async def snapshot_current_ideas(max_per_bucket: int = 10, market: str = "IN") -
     now = datetime.now(timezone.utc).isoformat()
     as_of = ideas.get("as_of")
     # Currently-open cycles (skip) and the latest close per name (a later signal re-enters).
-    open_keys = {(t["ticker"], t["horizon"], (t.get("market") or "IN"))
+    # Keys include `side` so a long and a short of the same coin+horizon are tracked independently.
+    open_keys = {(t["ticker"], t["horizon"], (t.get("market") or "IN"), t.get("side", "long"))
                  for t in tracked if not t.get("closed")}
     last_exit: dict = {}
     for t in tracked:
         if t.get("closed"):
-            k = (t["ticker"], t["horizon"], (t.get("market") or "IN"))
+            k = (t["ticker"], t["horizon"], (t.get("market") or "IN"), t.get("side", "long"))
             last_exit[k] = max(last_exit.get(k, ""), t.get("exit_date") or "9999-12-31")
+    # Entry rank as a within-cohort percentile (1.0 = best in its horizon+side, 0.0 = worst), captured
+    # so idea_ranking.rank_efficiency can later measure whether rank predicted realized return. Candidates
+    # are already ordered best-first per (horizon, side) by _rank_pool, so position = rank.
+    rank_pct_by: dict = {}
+    for h in ideas["horizons"]:
+        cands = ideas["buckets"][h].get("candidates", [])
+        for _side in ("long", "short"):
+            grp = [c for c in cands if c.get("side", "long") == _side]
+            n_grp = len(grp)
+            for i, c in enumerate(grp):
+                rank_pct_by[(c["ticker"], h, _side)] = round(1.0 - (i / (n_grp - 1) if n_grp > 1 else 0.0), 4)
     added = 0
     for h in ideas["horizons"]:
         for c in ideas["buckets"][h]["candidates"]:
-            key = (c["ticker"], h, idea_market)
+            key = (c["ticker"], h, idea_market, c.get("side", "long"))
             sig = c["latest_signal_date"] or as_of
             if key in open_keys:
                 continue                               # already open — same live idea
@@ -1506,6 +1709,7 @@ async def snapshot_current_ideas(max_per_bucket: int = 10, market: str = "IN") -
                 "ticker": c["ticker"],
                 "market": idea_market,
                 "horizon": h,
+                "side": c.get("side", "long"),         # "long" | "short" — drives P&L / stop-target sign
                 "entry_price": entry_px,
                 "buy_low": c.get("buy_low"),
                 "buy_high": c.get("buy_high"),
@@ -1515,6 +1719,9 @@ async def snapshot_current_ideas(max_per_bucket: int = 10, market: str = "IN") -
                 "target_price": c.get("target_price"),
                 "conviction": c["conviction"],
                 "avg_win_rate": c["avg_win_rate"],
+                # Entry rank (composite score + within-cohort percentile) → the rank-efficiency north-star.
+                "rank_score": c.get("rank_score"),
+                "entry_rank_pct": rank_pct_by.get((c["ticker"], h, c.get("side", "long"))),
                 # "Normal drawdown" band captured at entry so a held idea can be checked within/beyond it.
                 "typical_drawdown_pct": c.get("typical_drawdown_pct"),
                 "deep_drawdown_pct": c.get("deep_drawdown_pct"),
@@ -1872,9 +2079,11 @@ HORIZON_MAX_BARS = {"short": 15, "medium": 40, "long": 120}
 
 
 def _closed_outcome(idea: dict, reason: str, exit_price: float, exit_date: str, bars_held: int) -> dict:
-    """The lifecycle fields written onto a tracked idea when it closes."""
+    """The lifecycle fields written onto a tracked idea when it closes. A SHORT realizes the inverse
+    price move (it profits when the exit is below entry)."""
     entry = idea.get("entry_price")
-    realized = round((exit_price - entry) / entry * 100, 2) if entry else None
+    sign = -1 if idea.get("side") == "short" else 1
+    realized = round(sign * (exit_price - entry) / entry * 100, 2) if entry else None
     return {
         "closed": True,
         "exit_reason": reason,                 # "stop" | "target" | "time"
@@ -1899,7 +2108,8 @@ def _effective_target(idea: dict) -> Optional[float]:
     pct = idea.get("target_pct")
     if pct is None:
         pct = HORIZON_DEFAULT_TARGET.get(idea.get("horizon", "medium"), 0.18)
-    return round_price(entry * (1 + pct))
+    sign = -1 if idea.get("side") == "short" else 1          # short target is below entry
+    return round_price(entry * (1 + sign * pct))
 
 
 def _evaluate_idea_path(idea: dict, df) -> Optional[dict]:
@@ -1923,14 +2133,21 @@ def _evaluate_idea_path(idea: dict, df) -> Optional[dict]:
         sub = d
     bars = sub.iloc[1:]                         # skip the entry (signal-day) bar
     max_bars = HORIZON_MAX_BARS.get(horizon)
+    is_short = idea.get("side") == "short"      # short: stop above entry, target below
 
     for i, (ts, row) in enumerate(bars.iterrows(), start=1):
         low, high, close = float(row["Low"]), float(row["High"]), float(row["Close"])
         exit_date = str(ts.date())
-        if stop is not None and low <= stop:            # stop first when both touch a bar
-            return _closed_outcome(idea, "stop", stop, exit_date, i)
-        if target is not None and high >= target:
-            return _closed_outcome(idea, "target", target, exit_date, i)
+        if is_short:
+            if stop is not None and high >= stop:       # stop first when both touch a bar
+                return _closed_outcome(idea, "stop", stop, exit_date, i)
+            if target is not None and low <= target:
+                return _closed_outcome(idea, "target", target, exit_date, i)
+        else:
+            if stop is not None and low <= stop:        # stop first when both touch a bar
+                return _closed_outcome(idea, "stop", stop, exit_date, i)
+            if target is not None and high >= target:
+                return _closed_outcome(idea, "target", target, exit_date, i)
         if max_bars is not None and i >= max_bars:
             return _closed_outcome(idea, "time", close, exit_date, i)
     return None                                # still open
@@ -2037,7 +2254,8 @@ async def tracked_ideas_status(market: Optional[str] = None) -> dict:
     if not subset:
         return {"ideas": [], "open": [], "closed": [], "count": 0, "priced_at": None,
                 "scoreboard": _open_scoreboard([]), "closed_scoreboard": _realized_scoreboard([]),
-                "attribution": idea_ranking.factor_attribution([]), "equity_curve": []}
+                "attribution": idea_ranking.factor_attribution([]),
+                "rank_efficiency": idea_ranking.rank_efficiency([]), "equity_curve": []}
 
     open_before = [t for t in subset if not t.get("closed")]
 
@@ -2066,6 +2284,17 @@ async def tracked_ideas_status(market: Optional[str] = None) -> dict:
             return key, await asyncio.to_thread(_current_price, tk, mkt)
 
     quotes = dict(await asyncio.gather(*(fetch_quote(k) for k in need))) if need else {}
+
+    # Sell-side EXIT signal: has the smart money turned AGAINST an open position since entry — the pros now
+    # distributing a long you hold (or accumulating a short you hold)? Read-only nudge; never auto-closes.
+    sm_signals: dict = {}
+    if settings.smart_money_distribution_enabled and need:
+        async def fetch_sm(key):
+            tk, mkt = key
+            async with sem:
+                return key, await asyncio.to_thread(smart_money.get_signal, mkt, tk)
+        sm_signals = dict(await asyncio.gather(*(fetch_sm(k) for k in need)))
+
     now = datetime.now(timezone.utc).isoformat()
 
     closed_display, open_display, changed = [], [], False
@@ -2088,8 +2317,9 @@ async def tracked_ideas_status(market: Optional[str] = None) -> dict:
             entry = t.get("entry_price")
             ret, status = None, "unknown"
             if cur is not None and entry:
-                ret = round((cur - entry) / entry * 100, 2)
-                status = "winning" if cur > entry else "losing" if cur < entry else "flat"
+                sign = -1 if t.get("side") == "short" else 1     # a short gains when price falls
+                ret = round(sign * (cur - entry) / entry * 100, 2)
+                status = "winning" if ret > 0 else "losing" if ret < 0 else "flat"
             # "Normal drawdown" check: how the live drawdown sits vs the winners' typical/deep dip band
             # captured at entry — reassurance while within it, a warning past it. None when not down / no band.
             typ, deep = t.get("typical_drawdown_pct"), t.get("deep_drawdown_pct")
@@ -2099,8 +2329,11 @@ async def tracked_ideas_status(market: Optional[str] = None) -> dict:
                 dd_status = ("within" if dd_pct <= typ
                              else "stretching" if (deep is None or dd_pct <= deep)
                              else "beyond")
+            exit_flag = (idea_ranking.smart_money_exit_flag(sm_signals.get(key), t.get("side", "long"))
+                         if settings.smart_money_distribution_enabled else None)
             open_display.append({**t, "current_price": cur, "return_pct": ret, "status": status,
-                                 "dd_status": dd_status, "dd_pct": dd_pct})
+                                 "dd_status": dd_status, "dd_pct": dd_pct,
+                                 "smart_money_exit": exit_flag})
 
     if changed:
         _save_tracked(all_tracked)                      # closures mutated in place
@@ -2115,6 +2348,7 @@ async def tracked_ideas_status(market: Optional[str] = None) -> dict:
         "scoreboard": _open_scoreboard(open_display),
         "closed_scoreboard": _realized_scoreboard(closed_display),
         "attribution": idea_ranking.factor_attribution(closed_display),   # realized lift per factor
+        "rank_efficiency": idea_ranking.rank_efficiency(closed_display),   # does rank predict return? (north-star)
         "equity_curve": _idea_equity_curve(closed_display),
         "priced_at": now,
     }

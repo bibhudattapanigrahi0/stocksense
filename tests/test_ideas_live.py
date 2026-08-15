@@ -33,6 +33,15 @@ def test_enrich_handles_missing_quote(monkeypatch):
     assert c["live_price"] is None and c["zone"] is None and c["live_levels"] is None
 
 
+def test_enrich_attaches_best_odds(monkeypatch):
+    # The Best-Odds board rides along on the enriched payload (next to `basket`).
+    monkeypatch.setattr(runner, "get_quote", lambda tk, market="IN": 101.0)
+    out = asyncio.run(runner.enrich_ideas_live(_ideas(), "IN"))
+    bo = out["best_odds"]
+    assert bo["enabled"] is True and len(bo["items"]) == 1
+    assert bo["items"][0]["ticker"] == "A" and bo["items"][0]["rank"] == 1
+
+
 def test_zone_classification():
     c = {"buy_low": 98.0, "buy_high": 103.0, "stop_price": 94.0, "target_price": 118.0}
     assert runner._idea_zone(90.0, c) == "below_stop"

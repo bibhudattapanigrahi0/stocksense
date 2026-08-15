@@ -100,6 +100,53 @@ def smart_money_factor(sig: Optional[dict]) -> Optional[float]:
     return round(_clamp(sign * max(mag, 0.15)), 4)              # floor so a confirmed signal always counts
 
 
+# Family → the short chip shown when the smart money is DISTRIBUTING (selling / net-short) a name.
+_DISTRIBUTE_LABEL = {
+    "ownership": "🏦 13F distributing", "congress": "🏛 Congress selling",
+    "cot": "🏦 COT net-short", "flow": "🐋 whales net-short", "bulk_deal": "🇮🇳 bulk sellers",
+    "ace": "🇮🇳 ace exiting",
+}
+
+
+def distribution_flag(sig: Optional[dict], side: str = "long") -> Optional[dict]:
+    """A small, visible sell-side flag when the smart money is DISTRIBUTING this name — else None. On a
+    LONG it reads as an AVOID warning ("the pros are trimming"); on a crypto SHORT it reads as a
+    CONFIRMATION ("their selling is a tailwind"). Pure — reads only the normalized smart_money signal.
+
+    The RANK impact is already applied elsewhere (smart_money_factor is negative for distribution, and
+    _rank_pool inverts it for a short); this only SURFACES what is otherwise a silent multiplier."""
+    if not sig or not sig.get("available") or sig.get("direction") != "distribute":
+        return None
+    fam = sig.get("family")
+    return {
+        "label": _DISTRIBUTE_LABEL.get(fam, "🚩 smart money distributing"),
+        "detail": sig.get("detail"),
+        "family": fam,
+        "stance": "confirm" if side == "short" else "avoid",
+        "actors": sig.get("actors") or [],
+        "n_actors": sig.get("n_actors"),
+    }
+
+
+def smart_money_exit_flag(sig: Optional[dict], side: str = "long") -> Optional[dict]:
+    """A held-position EXIT nudge when the smart money has turned AGAINST an open trade — the pros now
+    DISTRIBUTING a long you hold (or ACCUMULATING a short you hold). None otherwise. Read-only — this
+    never auto-closes a position; it's a "consider trimming/covering" signal for the tracker. Pure."""
+    if not sig or not sig.get("available"):
+        return None
+    direction = sig.get("direction")
+    against = "accumulate" if side == "short" else "distribute"
+    if direction != against:
+        return None
+    fam = sig.get("family")
+    if side == "short":
+        label, msg = "🚩 smart money accumulating", "Smart money is now accumulating this — consider covering the short."
+    else:
+        label, msg = _DISTRIBUTE_LABEL.get(fam, "🚩 smart money exiting"), "Smart money is now distributing this — consider trimming."
+    return {"label": label, "detail": sig.get("detail"), "family": fam,
+            "message": msg, "actors": sig.get("actors") or [], "n_actors": sig.get("n_actors")}
+
+
 def quality_score(info: Optional[dict]) -> Optional[float]:
     """A simple 0–100 fundamental-quality read (50 neutral) from a `get_stock_info` dict: rewards
     high ROE, low leverage, and healthy profit margins. Each present metric contributes a ±1 sub-
@@ -184,28 +231,39 @@ def _smart_money_supportive(sig: Optional[dict]) -> Optional[bool]:
     return float(qoq) > 0 if qoq is not None else None
 
 
-def idea_pillars(c: dict) -> dict:
+def idea_pillars(c: dict, side: str = "long") -> dict:
     """Which independent families support this idea: True (supports), False (measured, doesn't), or None
-    (not available this market). Pure function of numbers the candidate already carries post-enrichment."""
+    (not available this market). Pure function of numbers the candidate already carries post-enrichment.
+
+    For a SHORT (`side="short"`) the DIRECTIONAL families flip — high quality, bullish news, a leading
+    sector and smart-money accumulation all argue AGAINST a short, so a supportive reading becomes
+    non-supportive. `regime_fit` is already computed from the short's perspective by the caller, so
+    the regime pillar is read as-is; `technical` (a strategy fired) supports either direction."""
     qs = c.get("quality_score")
     ns = c.get("news_score")
     rs = c.get("sector_rs")
     rf = c.get("regime_fit")
+    short = side == "short"
+
+    def _dir(supportive: Optional[bool]) -> Optional[bool]:
+        return (not supportive) if (short and supportive is not None) else supportive
+
     return {
         "technical": (c.get("eligible_conviction", c.get("conviction", 0)) or 0) >= 1,
-        "quality": (qs >= QUALITY_PILLAR_MIN) if qs is not None else None,
-        "smart_money": _smart_money_supportive(c.get("smart_money") or c.get("inst_ownership")),
+        "quality": _dir((qs >= QUALITY_PILLAR_MIN) if qs is not None else None),
+        "smart_money": _dir(_smart_money_supportive(c.get("smart_money") or c.get("inst_ownership"))),
         "regime": (rf == "tailwind") if rf is not None else None,
-        "sentiment": (ns >= NEWS_PILLAR_MIN) if ns is not None else None,
-        "sector": (rs > 0) if rs is not None else None,
+        "sentiment": _dir((ns >= NEWS_PILLAR_MIN) if ns is not None else None),
+        "sector": _dir((rs > 0) if rs is not None else None),
     }
 
 
-def pillar_summary(c: dict, available: Optional[int] = None) -> dict:
+def pillar_summary(c: dict, available: Optional[int] = None, side: str = "long") -> dict:
     """`idea_pillars` plus the count of supporting families and how many were available to confirm.
     `available` (families switched on for this market, from the caller) defaults to the number of
-    non-None readings on this idea when not supplied (standalone/testing use)."""
-    p = idea_pillars(c)
+    non-None readings on this idea when not supplied (standalone/testing use). `side` flips the
+    directional pillars for shorts (see `idea_pillars`)."""
+    p = idea_pillars(c, side)
     supporting = [k for k, v in p.items() if v is True]
     avail = available if available is not None else sum(1 for v in p.values() if v is not None)
     return {"pillars": p, "supporting": supporting, "count": len(supporting), "available": avail}
@@ -221,12 +279,15 @@ def pillar_tier(count: int, available: int, min_actionable: Optional[int] = None
     return "actionable" if count >= thr else "watch"
 
 
-def pillar_disclosure() -> dict:
+def pillar_disclosure(market: Optional[str] = None) -> dict:
     """The confluence config, surfaced in the ideas payload so the UI can explain the Actionable/Watchlist
-    split (mirrors `rank_weights` for the composite banner)."""
+    split (mirrors `rank_weights` for the composite banner). Crypto uses a lower actionable bar (it has
+    only ~3 possible families), so the disclosed bar is market-specific to match what tiering applies."""
+    min_actionable = (settings.pillar_min_actionable_crypto
+                      if (market or "").upper() == "CRYPTO" else settings.pillar_min_actionable)
     return {
         "enabled": settings.pillar_tiering_enabled,
-        "min_actionable": settings.pillar_min_actionable,
+        "min_actionable": min_actionable,
         "names": list(PILLAR_NAMES),
         "quality_min": QUALITY_PILLAR_MIN, "news_min": NEWS_PILLAR_MIN,
     }
@@ -304,3 +365,69 @@ def factor_attribution(closed: list, *, min_samples: Optional[int] = None,
                          "status": "ok" if r_lift is not None else "insufficient"}
 
     return {"sample": len(withf), "baseline": baseline, "factors": factors, "min_samples": thr}
+
+
+# ── Rank efficiency (the north-star: does the ranking predict realized return?) ──
+# Conviction / factors / calibration all try to ORDER the board well. This measures whether that
+# ordering actually works: the Spearman rank-IC between an idea's entry rank and its realized return,
+# plus the mean realized return of the best-ranked quintile vs the worst. Every other ranking change
+# (weights, meta-labeling, gates) should be adopted only if it moves these numbers — measure, then tune.
+
+def _avg_ranks(vals: list) -> list:
+    """1-based ranks with ties averaged (the rank transform behind Spearman)."""
+    order = sorted(range(len(vals)), key=lambda i: vals[i])
+    ranks = [0.0] * len(vals)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and vals[order[j + 1]] == vals[order[i]]:
+            j += 1
+        avg = (i + j) / 2.0 + 1.0                 # mean 1-based position of the tie group
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg
+        i = j + 1
+    return ranks
+
+
+def _pearson(xs: list, ys: list) -> float:
+    n = len(xs)
+    if n == 0:
+        return 0.0
+    mx, my = sum(xs) / n, sum(ys) / n
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    dx = math.sqrt(sum((x - mx) ** 2 for x in xs))
+    dy = math.sqrt(sum((y - my) ** 2 for y in ys))
+    return num / (dx * dy) if dx and dy else 0.0
+
+
+def _spearman(xs: list, ys: list) -> float:
+    """Spearman ρ = Pearson on the (tie-averaged) ranks. No numpy/scipy dependency."""
+    return _pearson(_avg_ranks(xs), _avg_ranks(ys))
+
+
+def rank_efficiency(closed: list, *, min_samples: Optional[int] = None) -> dict:
+    """Does entry rank predict realized return? Over CLOSED tracked ideas, the Spearman IC between the
+    entry-time within-cohort rank (`entry_rank_pct`, 1=best) and `realized_return_pct`, plus the mean
+    realized return of the top vs bottom rank quintile and their spread. `active=False` (with n) until
+    enough closed ideas carry an `entry_rank_pct` (older records predate it and are simply skipped).
+
+    This is the board's report card: IC > 0 and a positive top−bottom spread mean the ranking earns its
+    keep. Pure — reads only the ledger."""
+    thr = settings.rank_ic_min_samples if min_samples is None else min_samples
+    rows = [(c.get("entry_rank_pct"), c.get("realized_return_pct")) for c in closed
+            if c.get("entry_rank_pct") is not None and c.get("realized_return_pct") is not None]
+    n = len(rows)
+    if n < thr:
+        return {"active": False, "n": n, "min_samples": thr}
+    xs = [r for r, _ in rows]
+    ys = [ret for _, ret in rows]
+    order = sorted(rows, key=lambda t: t[0])          # ascending rank pct (worst → best)
+    k = max(1, n // 5)
+    bottom = [ret for _, ret in order[:k]]
+    top = [ret for _, ret in order[-k:]]
+    top_mean, bot_mean = sum(top) / len(top), sum(bottom) / len(bottom)
+    return {"active": True, "n": n, "min_samples": thr,
+            "ic": round(_spearman(xs, ys), 3),
+            "top_quintile_return_pct": round(top_mean, 2),
+            "bottom_quintile_return_pct": round(bot_mean, 2),
+            "spread_pct": round(top_mean - bot_mean, 2)}

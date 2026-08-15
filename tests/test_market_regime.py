@@ -203,6 +203,13 @@ def test_regime_block_present_and_neutral_by_default(seeded):
     assert res["regime"] is not None and res["regime"]["state"] == "neutral"   # from the conftest stub
 
 
+def test_fear_greed_block_present_by_default(seeded):
+    # The Fear & Greed mood rides along on the payload next to `regime` (the Market Conditions header);
+    # the conftest stub makes it a neutral 50, so ordering/sizing are unaffected.
+    res = runner.horizon_ideas(market="US")
+    assert res["fear_greed"] is not None and res["fear_greed"]["value"] == 50
+
+
 def test_gate_disabled_is_noop(seeded):
     seeded.setattr(runner.settings, "regime_gate_enabled", False)
     res = runner.horizon_ideas(market="US")

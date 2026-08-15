@@ -134,14 +134,46 @@ def _ownership_signal(key: str, symbol: str) -> Optional[dict]:
         return None
 
 
+def _blend_us_signals(own: Optional[dict], cong: Optional[dict]) -> Optional[dict]:
+    """Blend the two US smart-money ACTOR FAMILIES — SEC-13F institutions and congressional filers — into
+    one normalized signal. Whichever expresses the higher-conviction directional read is the primary face
+    (badge / pillar / factor); the other rides along in `detail` + a `secondary` block, and a matching
+    direction sets `families_agree`. `None` + X → X (so a ticker no member traded is unchanged). Pure."""
+    if not cong:
+        return own
+    if not own:
+        return cong
+    rank = {"high": 3, "medium": 2, "low": 1, None: 0}
+    primary, secondary = ((cong, own)
+                          if rank.get(cong.get("conviction"), 0) > rank.get(own.get("conviction"), 0)
+                          else (own, cong))
+    merged = dict(primary)
+    pd_, sd_ = primary.get("direction"), secondary.get("direction")
+    agree = pd_ in ("accumulate", "distribute") and pd_ == sd_
+    merged["detail"] = ((primary.get("detail") or primary.get("label") or "")
+                        + f" · {secondary.get('label', 'other')} {'agrees' if agree else 'differs'}")
+    merged["secondary"] = {k: secondary.get(k)
+                           for k in ("family", "direction", "label", "detail", "n_actors", "actors")}
+    if agree:
+        merged["families_agree"] = True
+    return merged
+
+
 def get_signal(market: Optional[str], symbol: str) -> Optional[dict]:
     """The live smart-money overlay for one symbol, normalized across markets. Equity markets
-    start from the ownership/13F baseline; a market-native source (COT/flows/deals) augments
-    or overrides it when present. None when nothing is available. Never raises."""
+    start from the ownership/13F baseline (US also blends in congressional trades — a second actor
+    family); a market-native source (COT/flows/deals) augments or overrides it when present. None when
+    nothing is available. Never raises."""
     if not settings.smart_money_enabled:
         return None
     key = get_market(market).key
     sig = _ownership_signal(key, symbol)
+    if key == "US" and settings.sm_us_congress_enabled:
+        try:
+            from pipeline_core.services import us_congress
+            sig = _blend_us_signals(sig, us_congress.live_signal(symbol))
+        except Exception as e:
+            logger.warning("smart_money congress blend failed (%s): %s", symbol, e)
     mod = _native_module(key)
     if mod is not None and hasattr(mod, "live_signal"):
         try:
@@ -183,6 +215,9 @@ def enrich_frames(market: Optional[str], df_by_ticker: dict) -> None:
         if key == "US":
             from pipeline_core.services import edgar_13f
             edgar_13f.enrich_frames(df_by_ticker)
+            if settings.sm_us_congress_enabled:
+                from pipeline_core.services import us_congress
+                us_congress.enrich_frames(df_by_ticker)   # adds `congress_net` alongside the 13F columns
             return
         mod = _native_module(key)
         if mod is not None and hasattr(mod, "enrich_frames"):
@@ -212,7 +247,14 @@ def get_leaders(market: Optional[str], limit: int = 10) -> dict:
         elif key == "METALS":
             return _metals_leaders(limit)
         elif key == "US":
-            return _us_leaders(limit)
+            out = _us_leaders(limit)
+            if settings.sm_us_congress_enabled:      # attach the "who in Congress is buying now" board
+                try:
+                    from pipeline_core.services import us_congress
+                    out["congress"] = us_congress.leaders(limit)
+                except Exception as e:
+                    logger.warning("smart_money congress leaders failed: %s", e)
+            return out
     except Exception as e:
         logger.warning("smart_money leaders failed (%s): %s", key, e)
     base["note"] = "Per-symbol only for this market — query get_signal(symbol)."

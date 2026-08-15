@@ -356,7 +356,7 @@ async def list_backtest_strategies(market: str = "IN") -> dict:
 async def run_backtest(
     index: Optional[str] = None,
     years: int = 10,
-    cost_roundtrip_bps: float = 25.0,
+    cost_roundtrip_bps: Optional[float] = None,
     strategy_ids: Optional[list[str]] = None,
     market: str = "IN",
 ) -> dict:
@@ -369,7 +369,9 @@ async def run_backtest(
     market: "IN" | "US" | "METALS" | "CRYPTO" — selects the universe & benchmark.
     index: universe name (NIFTY 500, S&P 500, NASDAQ-100, Metals, Top 100…), or
     null for the market's default. years: 2–15 (default 10). cost_roundtrip_bps:
-    round-trip cost in basis points. strategy_ids: subset, or null for all.
+    round-trip cost in bps; null (default) uses the market's realistic cost
+    (crypto ~35, US ~10, IN ~25) and crypto shorts also pay a daily funding drag.
+    strategy_ids: subset, or null for all.
     """
     from pipeline_core.backtest import runner
 
@@ -492,10 +494,23 @@ async def get_trade_ideas(max_per_bucket: int = 10, market: str = "IN") -> dict:
     Empty until a backtest has run. **Use this to answer "what should I buy for a
     short / medium / long horizon right now?"** market ∈ {IN, US, METALS, CRYPTO}.
 
-    A top-level `regime` block reports the market's risk-on/off tide (benchmark 200-DMA + a
-    vol/macro factor — VIX, DXY, or crypto Fear & Greed). It trades WITH the tide: regime-aligned
-    longs rank first (each idea tagged `regime_fit` tailwind/headwind), and in risk-off the book is
-    sized down (`regime_size_factor`). A neutral/offline reading leaves the board unchanged.
+    Direction: every market is long-only EXCEPT **CRYPTO**, which trades both ways — its board also
+    surfaces backtested SHORT ideas (bearish-mirror strategies) alongside longs. Each candidate carries
+    `side` ("long" | "short"); a short's stop sits ABOVE entry, its target BELOW, and its P&L / tracker
+    outcome invert accordingly. Longs and shorts are ranked, gated and sized as independent books.
+    (Toggle via settings.crypto_shorts_enabled; the curated basket/best-odds stay long-only.)
+
+    Two top-level "market conditions" blocks read the tide the board trades with (see also
+    `get_market_conditions`): `regime` reports the risk-on/off direction (benchmark 200-DMA + a
+    vol/macro factor — VIX, DXY, or crypto Fear & Greed) and trades WITH it — regime-aligned longs
+    rank first (each idea tagged `regime_fit` tailwind/headwind), risk-off sizes the book down
+    (`regime_size_factor`); `fear_greed` reports the market's 0-100 mood (US ⇒ the real CNN index,
+    CRYPTO ⇒ alternative.me, IN/other ⇒ a derived blend) as a display companion. Both degrade to a
+    neutral reading that leaves the board unchanged.
+
+    The payload also carries two ready-made shortlists (each has its own tool): `best_odds` — the top
+    setups ranked purely by win probability (`get_best_odds`) — and `basket` — the balanced, sized,
+    diversified book to hold (`get_trade_basket`).
     """
     from pipeline_core.backtest import runner
 
@@ -504,6 +519,30 @@ async def get_trade_ideas(max_per_bucket: int = 10, market: str = "IN") -> dict:
         return {"horizons": ["short", "medium", "long"], "buckets": {}, "run_at": None,
                 "market": market, "note": f"No {market} backtest yet — call run_backtest."}
     return await runner.enrich_ideas_live(ideas, market)   # add live price / zone / recomputed levels
+
+
+@mcp.tool
+async def get_market_conditions(market: str = "IN") -> dict:
+    """
+    The market's **conditions header** — the risk-on/off direction and the Fear & Greed mood the
+    daily Trade Ideas board trades with, without computing the whole board. **Use this to answer
+    "which way is the market leaning right now?"** market ∈ {IN, US, METALS, CRYPTO}.
+
+    Returns `{market, regime, fear_greed}`:
+      • `regime` — `{state (risk-on/neutral/risk-off), score 0-100, tilt -1..+1, benchmark {trend},
+        volatility, factors}`: the benchmark's 200-DMA trend + a vol/macro factor.
+      • `fear_greed` — `{value 0-100, classification, source, label, stale}`: US ⇒ the real CNN
+        Fear & Greed Index, CRYPTO ⇒ alternative.me, IN/other ⇒ a derived "Market Mood" (benchmark
+        momentum + inverted vol-index percentile, labelled `derived`).
+
+    Both are cached ~1h and degrade to a neutral reading (`stale=true`) when a live feed is down.
+    """
+    from pipeline_core.config import settings
+    from pipeline_core.services import market_regime, market_sentiment
+
+    reg = market_regime.market_regime(market) if settings.regime_gate_enabled else None
+    fng = market_sentiment.fear_greed(market) if settings.fear_greed_enabled else None
+    return {"market": (market or "IN").upper(), "regime": reg, "fear_greed": fng}
 
 
 @mcp.tool
@@ -550,6 +589,36 @@ async def get_trade_basket(market: str = "IN", max_per_bucket: int = 10) -> dict
 
 
 @mcp.tool
+async def get_best_odds(market: str = "IN", top_n: int = 5) -> dict:
+    """
+    The **Best-Odds board** — the day's fresh setups ranked PURELY by **win probability**, top `top_n`
+    (default 5), de-duped to distinct names. **Use this to answer "which trades are most likely to
+    win right now?"** — the simple pick-one-and-go leaderboard, vs `get_trade_basket`'s balanced,
+    diversified, sized book.
+
+      • ranked by each idea's **best-available win rate** — learned-fusion → isotonic-calibrated →
+        advertised backtest rate (same number the basket/sizer use), highest first;
+      • de-duped so each row is a DISTINCT bet (one per ticker; one per correlation cluster);
+      • NO portfolio sizing / diversification / stickiness — pure hit-rate ranking.
+
+    Each item carries `rank`, `win_prob`, `win_prob_source` (`learned`/`calibrated`/`advertised` — the
+    first two are model-backed, the last is the raw in-sample backtest rate), `risk_reward`,
+    `expected_return_pct`, `horizon`, and the entry/stop/target plan. `summary.win_prob_sources` tallies
+    the source mix and `summary.backed_count` how many are model/calibrated-backed — **check this: a high
+    win rate from an `advertised` source is in-sample and optimistic.** market ∈ {IN, US, METALS, CRYPTO}.
+    """
+    from pipeline_core.backtest import basket, runner
+
+    ideas = runner.horizon_ideas(market=market)
+    if ideas is None:
+        return {"enabled": True, "items": [], "market": market,
+                "note": f"No {market} backtest yet — call run_backtest."}
+    ideas = await runner.enrich_ideas_live(ideas, market)
+    return (basket.build_best_odds(ideas, None, top_n=top_n) if top_n and top_n != settings.best_odds_size
+            else ideas.get("best_odds")) or {"enabled": True, "items": [], "market": market}
+
+
+@mcp.tool
 async def get_smart_money(market: str = "IN", symbol: str = "") -> dict:
     """
     The **smart-money / coattail** signal for one symbol — who the proven, informed money is and whether
@@ -579,10 +648,29 @@ async def get_smart_money_leaders(market: str = "CRYPTO", limit: int = 10) -> di
       • US     — the strongest 13F quarter-over-quarter accumulators in the tracked panel.
 
     India bulk deals are per-symbol — use get_smart_money(symbol=...) there. market ∈ {IN, US, METALS, CRYPTO}.
+    For US the payload also carries a `congress` block — the "who in Congress is buying now" board (build it
+    first with refresh_congress).
     """
     from pipeline_core.services import smart_money
 
     return await asyncio.to_thread(smart_money.get_leaders, market, limit)
+
+
+@mcp.tool
+async def refresh_congress(max_filings: int = 250) -> dict:
+    """
+    Build (or rebuild) the **US congressional-trades** panel from the keyless House Clerk Periodic
+    Transaction Report (PTR) disclosures — a second US smart-money actor family alongside SEC 13F. Bounded
+    to the most-recently-disclosed `max_filings` reports (each a PDF fetch; per-filing caching makes a
+    rebuild incremental). **Heavy on first run** — call once, then congressional buying/selling rides along
+    on the US ideas board, the coattail basket, the 🏦 badge, and get_smart_money_leaders (`congress` block).
+    Returns how many tickers were built + the current top buys. No-op if the pypdf dependency is missing.
+    """
+    from pipeline_core.services import us_congress
+
+    panel = await asyncio.to_thread(us_congress.build_panel, None, max_filings, True)
+    return {"built": bool(panel), "tickers": len(panel or {}),
+            "leaders": us_congress.leaders(10).get("leaders", [])}
 
 
 @mcp.tool
@@ -602,6 +690,26 @@ async def get_coattail_basket(market: str = "IN", max_per_bucket: int = 10) -> d
                 "note": f"No {market} backtest yet — call run_backtest."}
     ideas = await runner.enrich_ideas_live(ideas, market)
     return ideas.get("coattail_basket") or {"enabled": True, "items": [], "market": market}
+
+
+@mcp.tool
+async def get_coattail_short_basket(market: str = "IN", max_per_bucket: int = 10) -> dict:
+    """
+    The **coattail SHORT sleeve** — the sell-side mirror of the coattail basket: today's curated SHORT
+    ideas the SMART MONEY is DISTRIBUTING (crypto whales net-short, via Hyperliquid top-trader flow). Use
+    this for "what are the proven traders positioned SHORT on right now?" Same ¼-Kelly book sizing as the
+    daily basket but inverted for the sell side (a risk-off tide is a tailwind). Empty on long-only markets
+    (US/IN/METALS) and in risk-on tides — honest by construction. `summary.smart_money_backed` = how many
+    shorts qualified. market ∈ {IN, US, METALS, CRYPTO} (CRYPTO in practice).
+    """
+    from pipeline_core.backtest import runner
+
+    ideas = runner.horizon_ideas(max_per_bucket, market)
+    if ideas is None:
+        return {"enabled": True, "items": [], "market": market,
+                "note": f"No {market} backtest yet — call run_backtest."}
+    ideas = await runner.enrich_ideas_live(ideas, market)
+    return ideas.get("coattail_short_basket") or {"enabled": True, "items": [], "market": market}
 
 
 @mcp.tool

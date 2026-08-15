@@ -1,5 +1,24 @@
 # Today's Basket — the curated cross-horizon best-of
 
+> **UI note:** the *hero card* atop the Trade Ideas tab is now **🏆 Best Odds** — the day's fresh setups
+> ranked purely by win probability (see [`basket.build_best_odds`](../pipeline_core/backtest/basket.py),
+> REST `GET /api/v1/backtest/best-odds`, MCP `get_best_odds`) — a simpler "which trades are most likely
+> to win" answer. Today's Basket (below) remains the balanced/sized/holdable **book**: it still rides the
+> `/ideas` payload as `basket`, powers the Hold Basket + Coattail siblings and the deploy/backtest flows,
+> and is served by `get_trade_basket`.
+
+> **Sell-side sibling — the Coattail SHORT sleeve (🐋↓ Coattail Shorts).** The Coattail Basket keeps the
+> longs the smart money is *accumulating*; its mirror keeps the **shorts the smart money is *distributing***
+> (crypto whales net-short, via Hyperliquid top-trader flow). Built by
+> [`basket.build_basket(distribute_mode=True)`](../pipeline_core/backtest/basket.py) — pools the board's
+> SHORT candidates, keeps only names with `smart_money.direction == "distribute"`, and sizes them as one
+> ¼-Kelly book with the regime scaling **inverted** (a risk-off tide is a *tailwind* for shorts). Rides the
+> `/ideas` payload as `coattail_short_basket`; REST `GET /api/v1/backtest/coattail-short-basket`, MCP
+> `get_coattail_short_basket`. Empty on long-only markets (US/IN/METALS) and in risk-on tides — honest by
+> construction. Companion sell-side surfaces: a **distribution flag** on any idea (an ⚠ avoid pill on a
+> long, a confirming pill on a short) and a **held-position exit nudge** in the tracker when the smart
+> money turns against an open trade (both gated by `smart_money_distribution_enabled`).
+
 The daily **Trade Ideas** board ([`backtest/runner.horizon_ideas`](../pipeline_core/backtest/runner.py))
 surfaces up to **30 ideas** — 10 each for short / medium / long horizons, refreshed every day. That's
 the right depth for *exploration*, but a real user can't take 30 trades: faced with 30 rows that

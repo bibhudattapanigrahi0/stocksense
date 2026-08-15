@@ -7,8 +7,32 @@ The distinction matters, because one is backtestable and one is not.
 | --- | --- | --- | --- | --- |
 | **Accumulation footprint** | price/volume (OHLCV) | ✅ full | all | the `Accumulation` strategies (CMF / A-D line / MFI) |
 | **13F institutional holdings** | SEC EDGAR | ✅ quarterly, ~2013+ | **US** | live badge on ideas + `institutional-13f-accumulation` strategy |
+| **Congressional trades** | House Clerk PTR filings | ✅ disclosure-dated, ~45d lag | **US** | 2nd US actor family — badge/pillar + `congress-buy-follow` strategy + coattail leaders |
 | **Ownership snapshot** | yfinance | ❌ current only | US / IN | live badge fallback |
 | **FII / DII / promoter** | NSE | ⚠️ recent quarters | IN | screener filters (`nse_data.get_promoter_holding`) |
+
+## Congressional trades — the second US actor family
+
+The STOCK Act requires members of Congress to file a **Periodic Transaction Report (PTR)** within ~45
+days of a trade. Those filings are public and **keyless** at the House Clerk site, so
+[`services/us_congress.py`](../pipeline_core/services/us_congress.py) treats disclosed political-insider
+buying/selling as a second US smart-money actor family alongside 13F — captured through the SAME
+normalized signal, so it flows into the coattail basket / ranking pillar / 🏛 badge automatically.
+
+- **Two keyless feeds.** An annual **XML index** (`.../financial-pdfs/{YEAR}FD.ZIP`) lists every filing;
+  the per-filing **PTR PDF** (`.../ptr-pdfs/{YEAR}/{DocID}.pdf`) holds the transactions. Recent e-filed
+  reports are **text** PDFs parsed with `pypdf` (ticker · P/S · date · $ range); older **scanned** reports
+  extract no text and are **skipped gracefully** (no OCR). The community "House Stock Watcher" mirror the
+  ecosystem often points at is **dead** (bucket went private) — this uses the authoritative gov source.
+- **Anti-lookahead.** Every transaction is dated by its **public disclosure date** (notification / index
+  filing date), never the older transaction date — a backtest can't see a trade before it was disclosed.
+- **Bounded, cached panel.** A full year is ~500 PDFs, so the panel is capped to the most-recently-disclosed
+  `congress_max_filings` (250) reports and disk-cached per DocID (immutable) → a daily rebuild is
+  incremental. Built explicitly via **`refresh_congress`** (MCP) / `POST /api/v1/smart-money/congress/refresh`,
+  then read live. Inert (no-op) until built, or if `pypdf` isn't installed.
+- **Signal.** Per ticker, a trailing net **buy − sell** dollar flow → `direction` accumulate/distribute,
+  `n_actors` = distinct members, `actors` = their names. Config: `sm_us_congress_enabled` (default on),
+  `congress_lookback_years`, `congress_flow_window_days`, `congress_conviction_amount`.
 
 ## Why not just "institutional ownership %"?
 

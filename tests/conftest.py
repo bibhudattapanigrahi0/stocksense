@@ -14,7 +14,7 @@ def _hermetic_llm(monkeypatch):
     tests opt back in via their own monkeypatch, which runs after this fixture."""
     from pipeline_core.services import (
         cot, crypto_smartmoney, earnings, edgar_13f, in_smartmoney, llm_service, market_regime,
-        market_sentiment, sector, smart_money,
+        market_sentiment, sector, smart_money, us_congress,
     )
 
     monkeypatch.setattr(llm_service.settings, "llm_provider", "none")
@@ -30,7 +30,8 @@ def _hermetic_llm(monkeypatch):
         return {"score": 50.0, "consensus": "Neutral", "summary": "", "method": "stub"}
 
     monkeypatch.setattr(market_sentiment, "fear_greed",
-                        lambda: {"value": 50, "classification": "Neutral", "as_of": None, "stale": True})
+                        lambda market="CRYPTO": {"value": 50, "classification": "Neutral", "as_of": None,
+                                                 "stale": True, "source": "stub", "label": "Fear & Greed"})
     monkeypatch.setattr(market_sentiment, "coin_news", _neutral_news)
 
     async def _neutral_news_sent(ticker, name=None, market="IN"):
@@ -65,6 +66,11 @@ def _hermetic_llm(monkeypatch):
     # to "no data" so the IN signals/strategy stay inert offline. Tests opt back in with their own monkeypatch.
     monkeypatch.setattr(in_smartmoney, "_fetch_deals", lambda symbol: [])
     monkeypatch.setattr(in_smartmoney, "_fetch_shareholders", lambda symbol: [])
+
+    # US congressional trades (House Clerk PTR disclosures) is a live source with a PDF-parse step; default
+    # the panel to "not built" so the congress signal/strategy stay inert offline. Tests opt back in.
+    monkeypatch.setattr(us_congress, "get_panel", lambda: None)
+    monkeypatch.setattr(us_congress, "_fetch_index", lambda year: [])
 
     # Earnings dates are a live yfinance source (feeds the idea board's event-risk factor);
     # default to "no known earnings" so the ranking factor is neutral offline.

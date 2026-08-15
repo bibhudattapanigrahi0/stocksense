@@ -1692,8 +1692,9 @@ function basketItemRow(it, i) {
     const win = it.win_prob != null ? `${fmt(it.win_prob, 0)}% win` : "";
     const winSrc = it.win_prob_source && it.win_prob_source !== "advertised" ? ` ✓` : "";
     const exp = it.expected_return_pct != null ? `<span class="${it.expected_return_pct >= 0 ? "pos" : "neg"}" title="Expected return per trade = win%·target − loss%·stop (an estimate from measured edge).">exp ${it.expected_return_pct >= 0 ? "+" : ""}${fmt(it.expected_return_pct, 1)}%</span>` : "";
+    const isShort = it.side === "short";
     const paperBtn = it.price != null
-        ? `<button class="idea-paper-btn paper-btn" data-ticker="${esc(it.ticker)}" data-market="${esc(IDEAS_DATA.market || MARKET.key)}" data-side="long" data-price="${it.live_price != null ? it.live_price : it.price}" data-stop="${it.stop_price != null ? it.stop_price : ""}" data-target="${it.target_price != null ? it.target_price : ""}" data-alloc="${it.alloc_pct != null ? it.alloc_pct : ""}" data-source="basket" title="Paper-trade ${esc(it.ticker)} at ${it.alloc_pct != null ? it.alloc_pct + "% weight" : "market"}">📝</button>`
+        ? `<button class="idea-paper-btn paper-btn" data-ticker="${esc(it.ticker)}" data-market="${esc(IDEAS_DATA.market || MARKET.key)}" data-side="${isShort ? "short" : "long"}" data-price="${it.live_price != null ? it.live_price : it.price}" data-stop="${it.stop_price != null ? it.stop_price : ""}" data-target="${it.target_price != null ? it.target_price : ""}" data-alloc="${it.alloc_pct != null ? it.alloc_pct : ""}" data-source="basket" title="Paper-trade ${esc(it.ticker)} at ${it.alloc_pct != null ? it.alloc_pct + "% weight" : "market"}">📝</button>`
         : "";
     return `<div class="basket-item" data-ticker="${esc(it.ticker)}" title="Click to deep-dive ${esc(it.ticker)}">
         <div class="bi-rank">${i + 1}</div>
@@ -1701,8 +1702,8 @@ function basketItemRow(it, i) {
             <span class="bi-alloc-pct">${alloc}%</span><span class="bi-alloc-lbl">weight</span>
         </div>
         <div class="bi-main">
-            <div class="bi-top"><span class="bi-ticker">${esc(it.ticker)}</span>${hz}${tag}</div>
-            <div class="bi-plan mono small">Buy ${buy} · <span class="pos">Tgt ${tgt}</span> · <span class="neg">Stop ${stop}</span>${rr}</div>
+            <div class="bi-top"><span class="bi-ticker">${esc(it.ticker)}</span>${isShort ? `<span class="pill pill-sell" title="Short — profit if the price falls">SHORT</span>` : ""}${hz}${tag}</div>
+            <div class="bi-plan mono small">${isShort ? "Short" : "Buy"} ${buy} · <span class="pos">Tgt ${tgt}</span> · <span class="neg">Stop ${stop}</span>${rr}</div>
             <div class="bi-why muted small">${win}${winSrc}${win && exp ? " · " : ""}${exp}</div>
         </div>
         <div class="bi-actions">${paperBtn}</div>
@@ -1753,6 +1754,99 @@ function renderBasketCard(b) {
     </div>`;
 }
 
+// ── Best Odds: the day's fresh setups ranked PURELY by win probability (the new hero board) ──
+// "Which trades are most likely to win" — a simple ranked Top-N to pick from, vs Today's Basket's
+// diversified/sized/holdable book. Reuses the .basket-* card/row chrome (so click-to-analyze + the
+// per-row paper button wire up for free), but leads each row with the win% instead of a weight.
+const WIN_SRC_LABEL = { learned: "learned", calibrated: "calibrated", measured: "measured", advertised: "backtest" };
+
+function winColor(p) {
+    if (p == null) return "var(--text-mute)";
+    if (p >= 60) return "var(--pos)";
+    if (p >= 50) return "var(--text)";
+    return "var(--text-mute)";
+}
+
+function bestOddsRow(it) {
+    const wp = it.win_prob;
+    const backed = it.win_prob_source && it.win_prob_source !== "advertised";   // learned / calibrated
+    const srcTxt = it.win_prob_source ? (WIN_SRC_LABEL[it.win_prob_source] || it.win_prob_source) : "";
+    const check = backed
+        ? `<span class="bo-check" title="Model/calibrated win rate — learned from realized outcomes, not the raw in-sample backtest.">✓</span>` : "";
+    const hz = `<span class="pill horizon-chip" title="${esc(it.horizon_label || it.horizon || "")} idea">${HORIZON_ICON[it.horizon] || ""} ${esc((it.horizon_label || it.horizon || "").replace(/ term$/i, ""))}</span>`;
+    const conf = it.pillar_count != null
+        ? `<span class="pill pill-muted" title="${it.pillar_count} independent signal${it.pillar_count === 1 ? "" : "s"} confirm this idea (technical, quality, regime, sector, news, smart-money).">★ ${it.pillar_count}</span>` : "";
+    const buy = (it.buy_low != null && it.buy_high != null) ? `${priceFmt(it.buy_low)}–${priceFmt(it.buy_high)}`
+        : (it.price != null ? `~${priceFmt(it.price)}` : "—");
+    const tgt = it.target_price != null ? priceFmt(it.target_price) : "—";
+    const stop = it.stop_price != null ? priceFmt(it.stop_price) : "—";
+    const rr = it.risk_reward != null ? ` · <span title="Reward:risk">${fmt(it.risk_reward, 2)}:1</span>` : "";
+    const exp = it.expected_return_pct != null ? `<span class="${it.expected_return_pct >= 0 ? "pos" : "neg"}" title="Expected return per trade = win%·target − loss%·stop (an estimate).">exp ${it.expected_return_pct >= 0 ? "+" : ""}${fmt(it.expected_return_pct, 1)}%</span>` : "";
+    const paperBtn = it.price != null
+        ? `<button class="idea-paper-btn paper-btn" data-ticker="${esc(it.ticker)}" data-market="${esc(IDEAS_DATA.market || MARKET.key)}" data-side="long" data-price="${it.live_price != null ? it.live_price : it.price}" data-stop="${it.stop_price != null ? it.stop_price : ""}" data-target="${it.target_price != null ? it.target_price : ""}" data-source="best-odds" title="Paper-trade ${esc(it.ticker)}">📝</button>`
+        : "";
+    return `<div class="basket-item best-odds-item" data-ticker="${esc(it.ticker)}" title="Click to deep-dive ${esc(it.ticker)}">
+        <div class="bi-rank">${it.rank}</div>
+        <div class="bo-win" title="Best-available win probability${srcTxt ? ` (${esc(srcTxt)})` : ""}.">
+            <span class="bo-win-pct" style="color:${winColor(wp)};">${wp != null ? fmt(wp, 0) + "%" : "—"}</span>
+            <span class="bo-win-lbl">win ${check}</span>
+        </div>
+        <div class="bi-main">
+            <div class="bi-top"><span class="bi-ticker">${esc(it.ticker)}</span>${hz}${conf}</div>
+            <div class="bi-plan mono small">Buy ${buy} · <span class="pos">Tgt ${tgt}</span> · <span class="neg">Stop ${stop}</span>${rr}</div>
+            <div class="bi-why muted small">${srcTxt ? esc(srcTxt) + " odds" : ""}${srcTxt && exp ? " · " : ""}${exp}</div>
+        </div>
+        <div class="bi-actions">${paperBtn}</div>
+    </div>`;
+}
+
+function bestWinRange(items) {
+    const w = items.map((it) => it.win_prob).filter((x) => x != null);
+    if (!w.length) return "—";
+    return `${fmt(Math.max(...w), 0)}–${fmt(Math.min(...w), 0)}%`;
+}
+
+function renderBestOddsBoard(b) {
+    if (!b || !b.enabled || !(b.items || []).length) return "";
+    const s = b.summary || {};
+    const n = b.items.length;
+    const avgTile = basketStat("Avg win rate", s.avg_win_pct != null ? `${fmt(s.avg_win_pct, 0)}%` : "—", "",
+        "Average best-available win probability across the picks.");
+    const backedTile = basketStat("Model-backed", `${s.backed_count || 0}/${n}`, "",
+        "How many picks' win rates are learned/calibrated from realized outcomes (✓) vs the raw in-sample backtest rate. Prefer the backed ones.");
+    const rrTile = basketStat("Avg reward:risk", s.avg_reward_risk != null ? `${fmt(s.avg_reward_risk, 2)}:1` : "—", "",
+        "Average reward-to-risk across the picks — a high win rate at poor R:R can still lose money.");
+    const rangeTile = basketStat("Win range", bestWinRange(b.items), "", "Highest to lowest win probability among the picks.");
+    const src = s.win_prob_sources || {};
+    const srcParts = Object.keys(src).map((k) => `${src[k]} ${WIN_SRC_LABEL[k] || k}`).join(" · ");
+    const foot = `Ranked purely by each setup's best-available win rate${srcParts ? ` (${esc(srcParts)})` : ""}. ${esc(b.note || "")}`;
+    return `<div class="card basket-card best-odds-card">
+        <div class="basket-head">
+            <div class="basket-title">
+                <h3>🏆 Best Odds <span class="pill">Top ${n}</span></h3>
+                <span class="muted small">The open setups <b>most likely to win</b>, ranked by win probability — pick one and go. For a diversified book to hold, use the full horizon board below.</span>
+            </div>
+            <div class="basket-actions">
+                <button id="best-odds-paper-btn" class="btn btn-ghost btn-s" title="Open a paper trade for every pick — see the Paper tab.">📝 Paper all</button>
+            </div>
+        </div>
+        <div class="basket-metrics">${avgTile}${backedTile}${rrTile}${rangeTile}</div>
+        <div class="basket-items best-odds-items">${b.items.map(bestOddsRow).join("")}</div>
+        <div class="basket-foot muted small">${foot}</div>
+    </div>`;
+}
+
+// Paper-trade every Best-Odds pick (fires the per-row paper buttons; scoped so it never touches other cards).
+async function paperTradeBestOdds(e) {
+    const btn = e.currentTarget;
+    const rows = Array.from(document.querySelectorAll(".best-odds-items .paper-btn:not(.paper-done)"));
+    if (!rows.length) { toast("No picks to paper-trade."); return; }
+    btn.disabled = true; btn.innerHTML = "…";
+    for (const b of rows) { await paperTradeIdea(b); }        // sequential: reuses the single-idea handler
+    toast(`📝 Papered ${rows.length} pick${rows.length === 1 ? "" : "s"} — see the Paper tab.`);
+    btn.innerHTML = "✓ papered all";
+}
+
 // ── Coattail Basket: the daily basket filtered to names the smart money is buying too ──
 // Read-only sibling of Today's Basket — reuses the same row/stat renderers. Only shows when at least
 // one current idea has smart-money backing (13F/gurus, COT commercials, HL top traders, NSE bulk buyers).
@@ -1772,6 +1866,33 @@ function renderCoattailCard(b) {
             <div class="basket-title">
                 <h3>🤝 Coattail Basket <span class="pill">${b.items.length} trade${b.items.length === 1 ? "" : "s"}</span></h3>
                 <span class="muted small">Today's basket, kept to names the <b>smart money is accumulating</b> — SEC&nbsp;13F&nbsp;&amp;&nbsp;gurus, CFTC commercials, Hyperliquid top traders, or NSE bulk buyers. Point-in-time confirmation, not part of the backtest.</span>
+            </div>
+        </div>
+        <div class="basket-metrics">${expTile}${investedTile}${backedTile}</div>
+        <div class="basket-items">${b.items.map((it, i) => basketItemRow(it, i)).join("")}</div>
+        <div class="basket-foot muted small">${esc(b.note || "")}</div>
+    </div>`;
+}
+
+// ── Coattail SHORT sleeve: the sell-side mirror — SHORT ideas the smart money is DISTRIBUTING ──
+// Read-only sibling of the Coattail Basket. Only shows when at least one current short has smart-money
+// backing (crypto whales net-short via Hyperliquid). Empty on long-only markets / risk-on tides.
+function renderCoattailShortCard(b) {
+    if (!b || !b.enabled || !(b.items || []).length) return "";
+    const s = b.summary || {};
+    const exp = s.expected_return_pct;
+    const backed = s.smart_money_backed != null ? s.smart_money_backed : b.items.length;
+    const expTile = basketStat("Expected return", `${exp != null && exp >= 0 ? "+" : ""}${fmt(exp, 1)}%`,
+        exp != null && exp >= 0 ? "pos" : "neg", "Alloc-weighted expected return on capital for the short book — an estimate from measured edge.");
+    const investedTile = basketStat("Invested", `${fmt(s.total_alloc_pct, 0)}%`, "",
+        `${fmt(s.total_alloc_pct, 0)}% deployed short, ${fmt(s.cash_pct, 0)}% cash.`);
+    const backedTile = basketStat("Whale-short names", `${backed}`, "",
+        "How many current shorts the smart money is net-short — the pool this sleeve is drawn from.");
+    return `<div class="card basket-card coattail-card coattail-short-card">
+        <div class="basket-head">
+            <div class="basket-title">
+                <h3>🐋↓ Coattail Shorts <span class="pill pill-sell">${b.items.length} short${b.items.length === 1 ? "" : "s"}</span></h3>
+                <span class="muted small">The sell-side mirror — SHORT ideas the <b>smart money is distributing</b> (crypto whales net-short via Hyperliquid top traders). Point-in-time confirmation, not part of the backtest. Sized inverted (a risk-off tide is a tailwind for shorts).</span>
             </div>
         </div>
         <div class="basket-metrics">${expTile}${investedTile}${backedTile}</div>
@@ -2049,7 +2170,7 @@ function renderTradeIdeasTab() {
         box.innerHTML = `<div class="card"><p class="muted">No <b>${esc(mkt().label || MARKET.key)}</b> trade ideas yet — run a backtest for this market in the <b>Strategy Lab</b> tab first. It scans every strategy's current buy signals, which this tab groups by time horizon.</p></div>`;
         return;
     }
-    box.innerHTML = renderBasketCard(IDEAS_DATA.basket) + renderCoattailCard(IDEAS_DATA.coattail_basket) + cryptoRiskBanner(IDEAS_DATA.risk_note) + regimeBanner(IDEAS_DATA.regime) + pillarsBanner(IDEAS_DATA.pillars) + rankingBanner(IDEAS_DATA.ranking) + calibrationBanner(IDEAS_DATA.calibration, IDEAS_DATA.fusion) + horizons.map((h) => renderHorizonColumn(buckets[h])).join("");
+    box.innerHTML = marketConditionsSection(IDEAS_DATA.regime, IDEAS_DATA.fear_greed) + renderBestOddsBoard(IDEAS_DATA.best_odds) + renderCoattailCard(IDEAS_DATA.coattail_basket) + renderCoattailShortCard(IDEAS_DATA.coattail_short_basket) + cryptoRiskBanner(IDEAS_DATA.risk_note) + pillarsBanner(IDEAS_DATA.pillars) + rankingBanner(IDEAS_DATA.ranking) + calibrationBanner(IDEAS_DATA.calibration, IDEAS_DATA.fusion) + horizons.map((h) => renderHorizonColumn(buckets[h])).join("");
     updateIdeasRunInfo();
 
     box.querySelectorAll(".idea-row, .basket-item[data-ticker]").forEach((row) =>
@@ -2062,6 +2183,8 @@ function renderTradeIdeasTab() {
     if (trackBtn) trackBtn.addEventListener("click", trackBasket);
     const paperAllBtn = box.querySelector("#basket-paper-btn");
     if (paperAllBtn) paperAllBtn.addEventListener("click", paperTradeBasket);
+    const boPaperBtn = box.querySelector("#best-odds-paper-btn");
+    if (boPaperBtn) boPaperBtn.addEventListener("click", paperTradeBestOdds);
     const deployBtn = box.querySelector("#basket-deploy-btn");
     if (deployBtn) deployBtn.addEventListener("click", deployBasket);
     const btBtn = box.querySelector("#basket-bt-btn");
@@ -2070,27 +2193,80 @@ function renderTradeIdeasTab() {
 
 // Regime badge: the market's risk-on/off tide (benchmark 200-DMA + a vol/macro factor). Mirrors the
 // crypto Fear & Greed pill. Regime-aligned longs rank first; risk-off trims position size.
-function regimeBadge(reg) {
+// ── Market Conditions: the header the daily board trades with ──────────────
+// Pairs the Fear & Greed *mood* (a 0–100 gauge) with the risk-on/off *direction* (the regime tide),
+// at the very top of the Trade Ideas board. Both come straight off the /ideas payload; either can be
+// absent (gate off / old payload) and the section still renders whatever it has.
+
+// Fear/greed accent — fear = red, greed = green (consistent with the regime's risk-on = green).
+function fngColor(v) {
+    if (v == null) return "#8a8f98";
+    if (v <= 24) return "#e5484d";   // extreme fear
+    if (v <= 44) return "#f5a524";   // fear
+    if (v <= 55) return "#8a8f98";   // neutral
+    if (v <= 74) return "#46a758";   // greed
+    return "#30a46c";                // extreme greed
+}
+
+const FNG_SOURCE_LABEL = { cnn: "CNN", crypto: "alternative.me", derived: "derived" };
+
+function fearGreedGauge(fng) {
+    if (!fng || fng.value == null) return "";
+    const v = Math.max(0, Math.min(100, fng.value));
+    const color = fngColor(v);
+    const srcTag = FNG_SOURCE_LABEL[fng.source];
+    const srcTitle = fng.source === "cnn" ? "CNN Fear & Greed Index (unofficial keyless feed)"
+        : fng.source === "crypto" ? "alternative.me crypto Fear & Greed feed"
+        : fng.source === "derived" ? "Derived market mood — benchmark momentum + inverted volatility percentile. Not an official index."
+        : "";
+    const src = srcTag ? `<span class="fng-source" title="${esc(srcTitle)}">${esc(srcTag)}</span>` : "";
+    const stale = fng.stale ? `<span class="fng-stale muted small" title="Live feed unavailable — showing a neutral 50."> · feed unavailable</span>` : "";
+    const facts = (fng.factors || []).length ? `<div class="fng-factors muted small">${esc(fng.factors.join(" · "))}</div>` : "";
+    return `<div class="mc-cell fng-gauge">
+        <div class="mc-head-row"><span class="mc-label">${esc(fng.label || "Fear & Greed")}</span>${src}</div>
+        <div class="fng-value" style="color:${color};">${v}<span class="fng-class">${esc(fng.classification || "")}</span></div>
+        <div class="fng-meter"><div class="fng-marker" style="left:${v}%;"></div></div>
+        <div class="fng-scale muted small"><span>Fear</span><span>Neutral</span><span>Greed</span></div>
+        ${facts}${stale}
+    </div>`;
+}
+
+function marketDirectionCell(reg) {
     if (!reg) return "";
     const s = reg.state || "neutral";
     const color = s === "risk-on" ? "#30a46c" : s === "risk-off" ? "#e5484d" : "#8a8f98";
-    const bench = reg.benchmark && reg.benchmark.trend
-        ? `${esc(reg.benchmark.label || "")} ${esc(reg.benchmark.detail || "")}` : "";
+    const trend = reg.benchmark && reg.benchmark.trend;
+    const arrow = trend === "up" ? "▲" : trend === "down" ? "▼" : "—";
+    const tilt = reg.tilt != null ? `tilt ${reg.tilt > 0 ? "+" : ""}${reg.tilt}` : "";
+    const benchLine = reg.benchmark && (reg.benchmark.label || reg.benchmark.detail)
+        ? `${esc(reg.benchmark.label || "")} ${esc(reg.benchmark.detail || "")}`.trim() : "";
     const vol = reg.volatility
-        ? `${esc(reg.volatility.label)} ${reg.volatility.value} (${esc(reg.volatility.level || "")})` : "";
-    const factors = [bench, vol].filter(Boolean).join(" · ");
-    const stale = reg.stale ? " — live feed unavailable, treated as neutral" : "";
-    const tilt = reg.tilt != null ? ` · tilt ${reg.tilt > 0 ? "+" : ""}${reg.tilt}` : "";
-    return `<span class="pill" style="border-color:${color}66;" title="Market regime: ${esc(s)}${tilt}${stale}. Regime-aligned longs rank first; in risk-off the book is sized down.${factors ? " " + esc(factors) : ""}">
-        <span style="color:${color};">●</span> Regime: ${esc(s)}${factors ? ` · ${esc(factors)}` : ""}</span>`;
+        ? `<span class="pill pill-muted" title="Volatility index level">${esc(reg.volatility.label)} ${reg.volatility.value} (${esc(reg.volatility.level || "")})</span>` : "";
+    // Extra factors beyond the benchmark line + vol chip already shown (credit / rates / dollar, etc.).
+    const benchLabel = (reg.benchmark && reg.benchmark.label) || "";
+    const volLabel = (reg.volatility && reg.volatility.label) || "";
+    const extras = (reg.factors || [])
+        .filter((f) => (!benchLabel || !String(f).includes(benchLabel)) && (!volLabel || !String(f).includes(volLabel)))
+        .slice(0, 3).map((f) => `<span class="pill pill-muted">${esc(f)}</span>`).join(" ");
+    const stale = reg.stale ? `<span class="fng-stale muted small"> · live feed unavailable, treated as neutral</span>` : "";
+    return `<div class="mc-cell mc-dir">
+        <div class="mc-head-row"><span class="mc-label">Market direction</span></div>
+        <div class="mc-dir-headline"><span class="mc-arrow" style="color:${color};">${arrow}</span>
+            <span class="mc-state" style="color:${color};">${esc(s)}</span>
+            <span class="muted small">${esc(tilt)}</span></div>
+        ${benchLine ? `<div class="mc-dir-detail muted small">${benchLine}</div>` : ""}
+        <div class="mc-factors">${vol} ${extras}</div>${stale}
+    </div>`;
 }
 
-function regimeBanner(reg) {
-    if (!reg) return "";   // gate disabled → no banner
-    return `<div class="card" style="margin-bottom:12px;"><div class="row gap-s" style="flex-wrap:wrap; align-items:center;">
-        ${regimeBadge(reg)}
-        <span class="muted small">Trading with the market tide — regime-aligned longs rank first; risk-off trims position size.</span>
-    </div></div>`;
+function marketConditionsSection(reg, fng) {
+    const gauge = fearGreedGauge(fng);
+    const dir = marketDirectionCell(reg);
+    if (!gauge && !dir) return "";   // nothing to show (both gates off / empty payload)
+    return `<div class="card market-conditions">
+        <div class="mc-grid">${gauge}${dir}</div>
+        <div class="mc-foot muted small">The tide the board trades with — regime-aligned longs rank first and risk-off trims position size; Fear &amp; Greed is a mood gauge (context, not a ranking input).</div>
+    </div>`;
 }
 
 // Composite-ranking disclosure: the soft-factor weights layered on the base conviction×regime score
@@ -2163,6 +2339,19 @@ function calibrationBanner(cal, fusion) {
 }
 
 // The "signals as of … · priced live …" status line + disclaimer. Split out so a live
+// Honesty disclosure: the realistic round-trip cost the backtest was priced at, the crypto short
+// funding drag, and the survivorship haircut applied to advertised win-rates — so the numbers read as
+// deliberately conservative, not optimistic.
+function costDisclosure(cd) {
+    if (!cd) return "";
+    const bits = [];
+    if (cd.cost_bps != null) bits.push(`priced ${fmt(cd.cost_bps, 0)}bps`);
+    if (cd.funding_bps_per_day) bits.push(`shorts +${fmt(cd.funding_bps_per_day, 0)}bps/day funding`);
+    if (cd.survivorship_haircut_pp) bits.push(`win rates −${fmt(cd.survivorship_haircut_pp, 0)}pp (survivorship)`);
+    if (!bits.length) return "";
+    return ` <span class="idea-gate small" title="Costs & honesty adjustments applied to the board: realistic per-market round-trip cost, per-day funding/borrow on crypto shorts, and a documented survivorship haircut on advertised win-rates (the backtest universe is today's index members over history). Deliberately conservative.">⚖️ ${esc(bits.join(" · "))}</span>`;
+}
+
 // re-price can refresh the timestamp on its own, without rebuilding the board.
 function updateIdeasRunInfo() {
     if (IDEAS_DATA.run_at) {
@@ -2173,7 +2362,8 @@ function updateIdeasRunInfo() {
             esc(`Signals as of ${IDEAS_DATA.signals_as_of ?? IDEAS_DATA.as_of ?? "?"}${sigAt ? ` (refreshed ${sigAt})` : ""} · `
                 + `${IDEAS_DATA.index}, ${IDEAS_DATA.years}y backtest · ranked by conviction`
                 + (liveAt ? ` · priced live ${liveAt}` : ""))
-            + " " + freshnessBadge(freshIso, "prices");
+            + " " + freshnessBadge(freshIso, "prices")
+            + costDisclosure(IDEAS_DATA.cost_disclosure);
     }
     $("#ideas-disclaimer").textContent = IDEAS_DATA.disclaimer || "";
 }
@@ -2182,20 +2372,31 @@ function renderHorizonColumn(b) {
     if (!b) return "";
     const accent = HORIZON_ACCENT[b.horizon] || "var(--accent)";
     const cands = b.candidates || [];
+    // Crypto trades both ways: split the column into a LONG section (as before) and, when present, a
+    // bearish SHORT subgroup below it. Non-crypto markets only ever have longs → identical to before.
+    const longs = cands.filter((c) => (c.side || "long") !== "short");
+    const shorts = cands.filter((c) => c.side === "short");
     // Multi-pillar tiering: actionable ideas (clear the confluence bar) render as full cards; the thinner
     // watchlist collapses into a disclosure. Backend orders candidates actionable-first. Tiering off (no
     // `tier` field) → everything is "actionable" and the column renders exactly as before.
-    const tiered = cands.some((c) => c.tier);
-    const actionable = tiered ? cands.filter((c) => c.tier === "actionable") : cands;
-    const watch = tiered ? cands.filter((c) => c.tier === "watch") : [];
-    const rows = actionable.length
-        ? actionable.map((c, i) => renderIdeaRow(c, i, accent, b.horizon)).join("")
-        : `<p class="muted small" style="padding:10px 12px;">${tiered ? "No high-confluence ideas here right now — see the watchlist below." : "No current buy signals in this horizon."}</p>`;
-    const watchBlock = watch.length
-        ? `<details class="ideas-watchlist"><summary class="small" title="Lower-confluence ideas — only the technical setup (or one confirming family) fired. Kept for context, not surfaced as a call to act.">Watchlist <b>${watch.length}</b> · fewer confirming signals</summary><div class="ideas-list">${watch.map((c, i) => renderIdeaRow(c, actionable.length + i, accent, b.horizon)).join("")}</div></details>`
+    const tiered = longs.some((c) => c.tier);
+    const L = renderIdeaSection(longs, accent, b.horizon,
+        tiered ? "No high-confluence ideas here right now — see the watchlist below."
+               : "No current buy signals in this horizon.");
+    const actionable = L.actionable, watch = L.watch, rows = L.rows, watchBlock = L.watchBlock;
+    // Bearish setups get their own numbering, a red accent, and a labelled subgroup (crypto only).
+    const S = shorts.length ? renderIdeaSection(shorts, "var(--neg)", b.horizon,
+        "No high-confluence shorts right now — see the watchlist below.") : null;
+    // Note when the shorts are speculative (surfaced by a bearish regime, no proven backtest edge).
+    const specShorts = shorts.filter((c) => c.speculative).length;
+    const shortsNote = specShorts
+        ? ` <span class="pill pill-warn" title="These shorts appear only because the market tide is bearish. No crypto short strategy clears the backtest risk gate (they lose over a 10-year sample), so they're shown as lower-conviction 'potential' — ranked by bearish agreement, never sized as a proven edge.">⚠ ${specShorts} speculative</span>`
         : "";
-    const shown = cands.length;
-    const moreNote = b.total_candidates > shown ? `<span class="muted small"> · ${b.total_candidates} total</span>` : "";
+    const shortsBlock = S
+        ? `<div class="ideas-shorts"><div class="ideas-shorts-head small" title="Bearish setups — profit if the price falls (stop above entry, target below). Crypto trades both ways.">↓ Shorts <b>${shorts.length}</b>${shortsNote}</div><div class="ideas-list">${S.rows}</div>${S.watchBlock}</div>`
+        : "";
+    const shown = longs.length;
+    const moreNote = b.total_candidates > cands.length ? `<span class="muted small"> · ${b.total_candidates} total</span>` : "";
     // Quality gate: candidates whose soft factors (bearish news + lagging sector, earnings risk, …)
     // dragged them below the min-multiplier floor were filtered out rather than padded onto the board.
     const cut = b.quality_cut || 0;
@@ -2209,10 +2410,13 @@ function renderHorizonColumn(b) {
         ? `<span class="idea-gate small" title="Correlation de-dup: ${collapsed} idea${collapsed === 1 ? "" : "s"} that move${collapsed === 1 ? "s" : ""} in lockstep with a higher-ranked pick ${collapsed === 1 ? "was" : "were"} collapsed — the shown ideas are independent setups, not the same bet under multiple tickers.">🔗 ${collapsed} collapsed</span>`
         : "";
     const notes = [gateNote, dedupNote].filter(Boolean).join(" · ");
+    // Short note: crypto also has a bearish subgroup below — surface its count so "0 actionable" longs
+    // don't read as "nothing here" when shorts are the regime-aligned trade.
+    const shortNote = shorts.length ? ` · <b style="color:var(--neg)">${shorts.length}</b> short${shorts.length === 1 ? "" : "s"} ↓` : "";
     // Count line: when tiered, lead with the actionable count (the "take these" set) and note the watch tail.
     const countLine = tiered
-        ? `<b style="color:${accent}">${actionable.length}</b> actionable${watch.length ? ` · <b>${watch.length}</b> on watch` : ""}${moreNote} · from ${b.strategy_count} strategies${notes ? " · " + notes : ""}`
-        : `<b style="color:${accent}">${shown}</b> ${shown === 1 ? "idea" : "ideas"}${moreNote} · from ${b.strategy_count} strategies${notes ? " · " + notes : ""}`;
+        ? `<b style="color:${accent}">${actionable.length}</b> actionable${watch.length ? ` · <b>${watch.length}</b> on watch` : ""}${shortNote}${moreNote} · from ${b.strategy_count} strategies${notes ? " · " + notes : ""}`
+        : `<b style="color:${accent}">${shown}</b> ${shown === 1 ? "idea" : "ideas"}${shortNote}${moreNote} · from ${b.strategy_count} strategies${notes ? " · " + notes : ""}`;
     return `
     <div class="ideas-col card" data-horizon="${esc(b.horizon)}" style="border-top: 3px solid ${accent};">
         <div class="ideas-col-head">
@@ -2223,7 +2427,23 @@ function renderHorizonColumn(b) {
         <p class="small">${countLine}</p>
         <div class="ideas-list">${rows}</div>
         ${watchBlock}
+        ${shortsBlock}
     </div>`;
+}
+
+// Split a candidate list into actionable rows + a collapsed watchlist — shared by the LONG section
+// and the crypto SHORT subgroup of a horizon column. `accent` colours the row numbers.
+function renderIdeaSection(cands, accent, horizon, emptyMsg) {
+    const tiered = cands.some((c) => c.tier);
+    const actionable = tiered ? cands.filter((c) => c.tier === "actionable") : cands;
+    const watch = tiered ? cands.filter((c) => c.tier === "watch") : [];
+    const rows = actionable.length
+        ? actionable.map((c, i) => renderIdeaRow(c, i, accent, horizon)).join("")
+        : `<p class="muted small" style="padding:10px 12px;">${emptyMsg}</p>`;
+    const watchBlock = watch.length
+        ? `<details class="ideas-watchlist"><summary class="small" title="Lower-confluence ideas — only the technical setup (or one confirming family) fired. Kept for context, not surfaced as a call to act.">Watchlist <b>${watch.length}</b> · fewer confirming signals</summary><div class="ideas-list">${watch.map((c, i) => renderIdeaRow(c, actionable.length + i, accent, horizon)).join("")}</div></details>`
+        : "";
+    return { actionable, watch, rows, watchBlock };
 }
 
 const ZONE_LABEL = {
@@ -2236,6 +2456,26 @@ const ZONE_LABEL = {
 function ideaTopInner(c) {
     const rr = c.risk_reward != null
         ? `<span class="idea-rr mono" title="Reward-to-risk: upside ÷ downside">${fmt(c.risk_reward, 2)}:1</span>`
+        : "";
+
+    // Direction: crypto trades both ways. A SHORT badge marks bearish ideas (profit if price falls);
+    // longs need no badge (the default). Only crypto ever produces shorts.
+    const sideBadge = c.side === "short"
+        ? `<span class="pill pill-sell idea-side-pill" title="Short idea — profit if the price falls (stop above entry, target below)">SHORT</span>`
+        : "";
+    // Speculative: a short surfaced only because the market tide is bearish — no backing strategy clears
+    // the backtest risk gate, so it's shown as potential, never a proven edge. Always watchlist-tier.
+    const specBadge = c.speculative
+        ? `<span class="pill pill-warn idea-spec-pill" title="Speculative — surfaced because the market is bearish, but no strategy backing it clears the backtest risk gate (crypto shorts have no proven edge over 10y). Treat as a lower-conviction 'potential' idea, not a validated signal.">⚠ speculative</span>`
+        : "";
+    // Sell-side flag: the smart money is DISTRIBUTING (trimming / net-short) this name. On a LONG it's an
+    // AVOID warning (argues against the idea — already lowers its rank); on a crypto SHORT it's a CONFIRMING
+    // tailwind (the pros are selling too). Surfaces what is otherwise a silent rank multiplier.
+    const smd = c.smart_money_distributing;
+    const distBadge = smd
+        ? (smd.stance === "confirm"
+            ? `<span class="pill pill-sell idea-dist-pill" title="${esc(smd.detail || smd.label)} — the smart money is net-short/selling this too, confirming the short (already lifts its rank). Point-in-time, not part of the backtest.">${esc(smd.label)} ✓</span>`
+            : `<span class="pill pill-warn idea-dist-pill" title="${esc(smd.detail || smd.label)} — the smart money is trimming/net-short this name, which argues AGAINST a long. This already lowers the idea's rank; shown so the sell signal isn't silent. Point-in-time, not part of the backtest.">⚠ ${esc(smd.label)}</span>`)
         : "";
 
     // Freshly generated ideas get a NEW tag; carried-over (still-open) ideas get a HELD tag.
@@ -2296,7 +2536,7 @@ function ideaTopInner(c) {
         // Market-native smart money (metals COT commercials; crypto flows/whales; India bulk deals).
         // Direction colours the chip; the source's own `detail` explains it. Not part of the backtest.
         const sm = c.smart_money, fam = sm.family, dir = sm.direction;
-        const icon = { cot: "🏦", flow: "🐋", whale: "🐋", bulk_deal: "🇮🇳", ace: "🇮🇳" }[fam] || "🧠";
+        const icon = { cot: "🏦", flow: "🐋", whale: "🐋", bulk_deal: "🇮🇳", ace: "🇮🇳", congress: "🏛" }[fam] || "🧠";
         const cls = dir === "accumulate" ? "pos" : dir === "distribute" ? "neg" : "";
         const arrow = dir === "accumulate" ? " ▲" : dir === "distribute" ? " ▼" : "";
         const title = `${sm.detail || (sm.label || "Smart money") + " — " + (dir || "neutral")}. Live smart-money confirmation — point-in-time, distinct from the backtested signal.`;
@@ -2305,6 +2545,9 @@ function ideaTopInner(c) {
 
     return `
                 <span class="idea-ticker mono b">${esc(c.ticker)}</span>
+                ${sideBadge}
+                ${specBadge}
+                ${distBadge}
                 ${pillarChip(c)}
                 ${newBadge}
                 ${heldBadge}
@@ -2327,7 +2570,7 @@ function ideaLiveLevelsHtml(c) {
             <details class="idea-live">
                 <summary class="small muted">Live levels — enter from ${priceFmt(c.live_price)}</summary>
                 <div class="idea-levels idea-levels-live">
-                    <div class="idea-lvl"><span class="lvl-label">Buy</span><span class="lvl-val mono">${ll.buy_low != null ? `${priceFmt(ll.buy_low)} – ${priceFmt(ll.buy_high)}` : "—"}</span></div>
+                    <div class="idea-lvl"><span class="lvl-label">${c.side === "short" ? "Sell" : "Buy"}</span><span class="lvl-val mono">${ll.buy_low != null ? `${priceFmt(ll.buy_low)} – ${priceFmt(ll.buy_high)}` : "—"}</span></div>
                     <div class="idea-lvl"><span class="lvl-label">Target</span><span class="lvl-val mono pos">${ll.target_price != null ? priceFmt(ll.target_price) : "—"}</span></div>
                     <div class="idea-lvl"><span class="lvl-label">Stop</span><span class="lvl-val mono neg">${ll.stop_price != null ? priceFmt(ll.stop_price) : "—"}</span></div>
                     ${ll.risk_reward != null ? `<div class="idea-lvl"><span class="lvl-label">R:R</span><span class="lvl-val mono">${fmt(ll.risk_reward, 2)}:1</span></div>` : ""}
@@ -2375,16 +2618,19 @@ function renderIdeaRow(c, i, accent, horizon) {
         ? `<span class="idea-strat" title="This idea vs the market regime${trimmed ? ` — size trimmed to ×${c.regime_size_factor} in risk-off` : ""}">${c.regime_fit === "tailwind" ? "🟢 tailwind" : "🔴 headwind"}${trimmed ? ` ×${c.regime_size_factor}` : ""}</span>`
         : "";
 
+    const isShort = c.side === "short";
     const stopPct = c.stop_pct != null ? fmt(c.stop_pct * 100, 1) : null;
     const tgtPct = c.target_pct != null ? fmt(c.target_pct * 100, 1) : null;
     const stopTitle = c.stop_source === "strategy"
         ? "Stop from the flagging strategies' own risk rules"
         : "Stop = horizon default (no strategy-defined stop)";
     const tgtTitle = c.target_source === "strategy"
-        ? "Upside = average fixed target of the flagging strategies"
-        : "Upside = horizon default (trend-followers ride beyond a fixed target)";
+        ? `${isShort ? "Downside" : "Upside"} = average fixed target of the flagging strategies`
+        : `${isShort ? "Downside" : "Upside"} = horizon default (trend-followers ride beyond a fixed target)`;
+    // A short's entry zone is a "sell to open" band; a long's is an accumulation band.
+    const entryLabel = isShort ? "Sell" : "Buy";
 
-    // Buy zone: prefer the explicit accumulation band, fall back to the last close.
+    // Entry zone: prefer the explicit band, fall back to the last close.
     const buy = (c.buy_low != null && c.buy_high != null)
         ? `${priceFmt(c.buy_low)} – ${priceFmt(c.buy_high)}`
         : (c.price != null ? `~${priceFmt(c.price)}` : "—");
@@ -2396,14 +2642,15 @@ function renderIdeaRow(c, i, accent, horizon) {
         : "—";
 
     // Paper-trade plan: fill at the live price with the live-recomputed levels when we have a
-    // quote (matches the card's "Live levels — enter from here"), else the generated plan
-    // anchored to the signal. All daily ideas are long buy signals.
+    // quote (matches the card's "Live levels — enter from here"), else the generated plan anchored
+    // to the signal. Most daily ideas are long; crypto also produces shorts (data-side drives the
+    // paper account's P&L sign — the backend open_idea already handles both).
     const pLive = c.live_price != null && c.live_levels;
     const pPrice = c.live_price != null ? c.live_price : c.price;
     const pStop = pLive ? c.live_levels.stop_price : c.stop_price;
     const pTgt = pLive ? c.live_levels.target_price : c.target_price;
     const paperBtn = pPrice != null
-        ? `<button class="idea-paper-btn paper-btn" data-ticker="${esc(c.ticker)}" data-market="${esc(IDEAS_DATA.market || MARKET.key)}" data-side="long" data-price="${pPrice}" data-stop="${pStop != null ? pStop : ""}" data-target="${pTgt != null ? pTgt : ""}" data-alloc="${c.alloc_pct != null ? c.alloc_pct : ""}" data-source="idea-${esc(horizon || "")}" title="Paper trade ${esc(c.ticker)} at ${priceFmt(pPrice)}${pStop != null ? ` · stop ${priceFmt(pStop)}` : ""}${pTgt != null ? ` · target ${priceFmt(pTgt)}` : ""}">📝 Paper</button>`
+        ? `<button class="idea-paper-btn paper-btn" data-ticker="${esc(c.ticker)}" data-market="${esc(IDEAS_DATA.market || MARKET.key)}" data-side="${esc(c.side || "long")}" data-price="${pPrice}" data-stop="${pStop != null ? pStop : ""}" data-target="${pTgt != null ? pTgt : ""}" data-alloc="${c.alloc_pct != null ? c.alloc_pct : ""}" data-source="idea-${esc(horizon || "")}" title="Paper trade ${esc(c.ticker)} ${isShort ? "short" : "long"} at ${priceFmt(pPrice)}${pStop != null ? ` · stop ${priceFmt(pStop)}` : ""}${pTgt != null ? ` · target ${priceFmt(pTgt)}` : ""}">📝 Paper</button>`
         : "";
 
     return `
@@ -2413,7 +2660,7 @@ function renderIdeaRow(c, i, accent, horizon) {
         <div class="idea-main">
             <div class="idea-top">${ideaTopInner(c)}</div>
             <div class="idea-levels" title="The trade plan as generated (anchored to the signal price)">
-                <div class="idea-lvl"><span class="lvl-label">Buy</span><span class="lvl-val mono">${buy}</span></div>
+                <div class="idea-lvl"><span class="lvl-label">${entryLabel}</span><span class="lvl-val mono">${buy}</span></div>
                 <div class="idea-lvl" title="${tgtTitle}"><span class="lvl-label">Target</span><span class="lvl-val mono pos">${target}</span></div>
                 <div class="idea-lvl" title="${stopTitle}"><span class="lvl-label">Stop</span><span class="lvl-val mono neg">${stop}</span></div>
                 ${c.risk_pct != null && c.alloc_pct != null ? `<div class="idea-lvl" title="Risk ${c.risk_pct}% of equity if stopped → ${c.alloc_pct}% position (${esc(c.size_note || "")}, ¼-Kelly capped)"><span class="lvl-label">Size</span><span class="lvl-val mono"><b>${c.risk_pct}%</b> → ${c.alloc_pct}%</span></div>` : ""}
@@ -3130,6 +3377,33 @@ const EXIT_META = {
     time: { label: "Expired", cls: "muted", icon: "⌛" },
 };
 
+// Rank efficiency — the north-star: does the board's RANK actually predict realized return? Shows the
+// Spearman rank-IC + the mean realized return of the best-ranked quintile vs the worst. This is the
+// scoreboard every ranking change (weights, meta-labeling, gates) has to move.
+function rankEfficiencyCard(re) {
+    if (!re) return "";
+    if (!re.active) {
+        return `<div class="factor-card muted small">🎯 <b>Rank efficiency</b> — populates once <b>${re.min_samples || 8}</b> ranked ideas <b>close</b> (measures whether higher-ranked ideas realized higher returns). ${re.n ? `${re.n} so far.` : ""}</div>`;
+    }
+    const icCls = re.ic > 0.05 ? "pos" : re.ic < -0.05 ? "neg" : "muted";
+    const spCls = re.spread_pct >= 0 ? "pos" : "neg";
+    const verdict = re.ic > 0.05 && re.spread_pct > 0 ? "the ranking is predictive"
+        : re.ic < -0.05 ? "⚠ ranking is inverted — higher ranks did worse"
+        : "no clear rank edge yet";
+    return `
+    <div class="factor-card">
+        <div class="small"><span>🎯 <b>Rank efficiency</b></span>
+            <span class="muted"> — does entry rank predict return? (${re.n} closed)</span></div>
+        <div class="scoreboard" style="margin-top:6px;">
+            <div class="score-chip"><span class="score-chip-val ${icCls}">${re.ic >= 0 ? "+" : ""}${fmt(re.ic, 2)}</span><span class="score-chip-lbl">Rank IC</span></div>
+            <div class="score-chip"><span class="score-chip-val pos">${fmt(re.top_quintile_return_pct)}%</span><span class="score-chip-lbl">Top quintile</span></div>
+            <div class="score-chip"><span class="score-chip-val neg">${fmt(re.bottom_quintile_return_pct)}%</span><span class="score-chip-lbl">Bottom quintile</span></div>
+            <div class="score-chip"><span class="score-chip-val ${spCls}">${re.spread_pct >= 0 ? "+" : ""}${fmt(re.spread_pct)}%</span><span class="score-chip-lbl">Spread</span></div>
+        </div>
+        <p class="muted small" style="margin:6px 0 0;">Spearman IC of entry rank vs realized return, + top-vs-bottom-quintile mean return — ${verdict}. The board's report card: adopt a ranking change only if it moves these.</p>
+    </div>`;
+}
+
 // Factor scorecard: does each soft factor actually earn its weight? For every factor we compare the
 // realized win-rate of closed ideas where it was SUPPORTIVE at entry vs where it was ADVERSE — the
 // signed "lift". Populated from the ledger (TRACKED_DATA.attribution); the gate/de-dup aren't shown
@@ -3199,6 +3473,7 @@ function renderTracker() {
         </div>
         ${TRACKED_DATA.priced_at ? `<p class="muted small" style="margin-top:8px;">Priced ${new Date(TRACKED_DATA.priced_at).toLocaleString()} · win rate = wins ÷ (wins + losses) on <b>closed</b> trades; open ideas move to Past trades once they hit a target, stop, or time-stop.</p>` : ""}
         ${disciplineScorecard(ADHERENCE_DATA)}
+        ${rankEfficiencyCard(TRACKED_DATA.rank_efficiency)}
         ${factorScorecard(TRACKED_DATA.attribution)}`;
 
     // Idea-book equity curve (cumulative realized P&L).
@@ -3266,6 +3541,16 @@ function ddBadge(t) {
     return ` <span class="dd-badge ${meta.cls}" title="${esc(title)}">${meta.icon} ${meta.txt}</span>`;
 }
 
+// Sell-side EXIT nudge on an open position: the smart money has turned AGAINST it since entry (the pros
+// now distributing a long you hold / accumulating a short you hold). Read-only — a "consider trimming"
+// flag, never an auto-close. Empty unless the signal is against the position.
+function smExitBadge(t) {
+    const x = t.smart_money_exit;
+    if (!x) return "";
+    const title = `${x.detail ? esc(x.detail) + " — " : ""}${esc(x.message || "Smart money has turned against this position.")} Point-in-time smart-money read, not part of the backtest.`;
+    return ` <span class="dd-badge dd-beyond" title="${title}">${esc(x.label || "🚩 smart money exiting")}</span>`;
+}
+
 // "You" cell: log what you actually did with this idea (I'm-in / I'm-out) — the capture that feeds the
 // discipline scorecard. State-driven from the record's user_action.
 function actionButtons(t) {
@@ -3283,13 +3568,13 @@ function renderTrackedTable(ideas) {
         const ret = t.return_pct != null ? `${t.return_pct >= 0 ? "+" : ""}${fmt(t.return_pct)}%` : "—";
         const retCls = t.return_pct == null ? "muted" : (t.return_pct >= 0 ? "pos" : "neg");
         return `<tr class="trk-row" data-ticker="${esc(t.ticker)}" title="Analyze ${esc(t.ticker)}">
-            <td class="mono b">${esc(t.ticker)}</td>
+            <td class="mono b">${esc(t.ticker)}${sideTag(t.side)}</td>
             <td><span class="pill pill-muted">${esc(t.horizon)}</span></td>
             <td class="mono">${priceFmt(t.entry_price)}</td>
             <td class="mono neg">${priceFmt(t.stop_price)}</td>
             <td class="mono">${priceFmt(t.current_price)}</td>
             <td class="mono ${retCls}">${ret}</td>
-            <td class="small ${st.cls}">${st.icon} ${st.label}${ddBadge(t)}</td>
+            <td class="small ${st.cls}">${st.icon} ${st.label}${ddBadge(t)}${smExitBadge(t)}</td>
             <td>${actionButtons(t)}</td>
             <td><button class="trk-ai-btn" data-ticker="${esc(t.ticker)}" data-horizon="${esc(t.horizon || "")}" title="AI read of this position">🧠</button></td>
         </tr>`;
@@ -3307,7 +3592,7 @@ function renderPastTradesTable(closed) {
         const ret = r != null ? `${r >= 0 ? "+" : ""}${fmt(r)}%` : "—";
         const retCls = r == null ? "muted" : (r >= 0 ? "pos" : "neg");
         return `<tr class="trk-row" data-ticker="${esc(t.ticker)}" title="Analyze ${esc(t.ticker)}">
-            <td class="mono b">${esc(t.ticker)}</td>
+            <td class="mono b">${esc(t.ticker)}${sideTag(t.side)}</td>
             <td><span class="pill pill-muted">${esc(t.horizon)}</span></td>
             <td class="mono">${priceFmt(t.entry_price)}</td>
             <td class="mono">${priceFmt(t.exit_price)}</td>
@@ -3787,6 +4072,8 @@ let BOT_DATA = null;
 
 const botPrice = (v) => (v == null ? "—" : "$" + pfmt(v));   // bot is crypto/USD
 const sidePill = (side) => `<span class="pill ${side === "short" ? "pill-sell" : "pill-buy"}">${side === "short" ? "SHORT" : "LONG"}</span>`;
+// Compact SHORT-only tag for tables/cards — longs render nothing (long is the default; avoids noise).
+const sideTag = (side) => side === "short" ? ` <span class="pill pill-sell idea-side-pill">SHORT</span>` : "";
 const convPill = (n) => `<span class="pill ${n >= 3 ? "pill-buy" : n >= 2 ? "pill-hold" : "pill-low"}">${n}×</span>`;
 // A synthetic "bot" (kind:"ideas") that aggregates the whole signal-bot family by conviction.
 const IDEAS_BOT = {
