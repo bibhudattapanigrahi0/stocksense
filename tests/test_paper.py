@@ -37,6 +37,17 @@ def test_open_invalid_inputs(args):
         paper.open_position(paper.new_account("IN"), *args)
 
 
+@pytest.mark.parametrize("alloc", [0.0, None])
+def test_open_with_unsized_alloc_falls_back_to_default(alloc):
+    # Regression: a watch-tier / speculative idea (e.g. a crypto short) carries alloc_pct=0.0; the paper
+    # button forwarded it, so open_position computed qty=0 and raised "qty must be positive" — surfacing
+    # as an error toast. A non-positive alloc must fall back to the default size, not error.
+    acct = paper.new_account("CRYPTO", 100_000.0)
+    pos = paper.open_position(acct, "PYTH", "short", 0.04, alloc_pct=alloc, stop=0.048, target=0.024)
+    assert pos["side"] == "short" and pos["qty"] > 0
+    assert round(pos["notional"], 2) == round(100_000.0 * paper.DEFAULT_ALLOC_PCT / 100.0, 2)  # 10% default
+
+
 def test_open_zero_qty_rejected():
     with pytest.raises(ValueError):
         paper.open_position(paper.new_account("IN"), "X", "long", 10.0, qty=0)

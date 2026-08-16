@@ -59,7 +59,10 @@ def open_position(acct: dict, ticker: str, side: str, price: float, *, qty: Opti
     if side not in ("long", "short"):
         raise ValueError("side must be 'long' or 'short'")
     if qty is None:
-        ap = float(alloc_pct if alloc_pct is not None else DEFAULT_ALLOC_PCT)
+        # A non-positive alloc_pct means "unsized" — e.g. a watch-tier / speculative idea the sizer gave
+        # 0% weight, or a blank field on the manual form. The user explicitly chose to paper this, so fall
+        # back to the default size rather than computing qty=0 (which would raise "qty must be positive").
+        ap = float(alloc_pct) if (alloc_pct is not None and float(alloc_pct) > 0) else DEFAULT_ALLOC_PCT
         qty = (book_equity(acct) * ap / 100.0) / price
     qty = round(float(qty), 6)
     if qty <= 0:
