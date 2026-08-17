@@ -960,11 +960,14 @@ def _partition_tracked(market: str) -> tuple[dict, dict]:
     return closed_exit, open_by_h
 
 
-def _carried_candidate(t: dict) -> dict:
+def _carried_candidate(t: dict, wr_map: Optional[dict] = None) -> dict:
     """A still-open tracked idea rendered as a board candidate (its stored, signal-anchored plan),
     so it persists on the board — ranked among fresh ideas by conviction/win-rate — until it
-    closes. `carried=True` marks it as a held (not freshly re-signalled) idea."""
+    closes. `carried=True` marks it as a held (not freshly re-signalled) idea. `wr_map` (strategy
+    name → backtest win-rate) lets a carried idea (which stores only names) carry an edge-weighted
+    conviction on the same scale as fresh ideas."""
     sp, tp = t.get("stop_pct"), t.get("target_pct")
+    strategies = [{"name": n} for n in (t.get("strategies") or [])]
     return {
         "ticker": t["ticker"],
         "side": t.get("side", "long"),
@@ -987,7 +990,8 @@ def _carried_candidate(t: dict) -> dict:
         "age_days": _days_since(t.get("signal_date")),
         "is_new": False,
         "carried": True,
-        "strategies": [{"name": n} for n in (t.get("strategies") or [])],
+        "strategies": strategies,
+        "weighted_conviction": _weighted_conviction(strategies, wr_map),
     }
 
 
@@ -1032,6 +1036,46 @@ def _cohort_demote_reason(market: Optional[str], horizon: Optional[str]) -> Opti
     if horizon in settings.cohort_demote_horizons:
         reasons.append(f"{horizon} horizon")
     return " + ".join(reasons) if reasons else None
+
+
+def _conviction_edge_weight(win_rate: Optional[float]) -> float:
+    """A strategy's vote weight toward RANKING conviction, from its backtest win-rate: clipped-linear,
+    0 at/below the floor rising to 1 at 100%. A low-win-rate strategy (equity momentum ~43%) contributes
+    a fractional vote so it stops inflating a high-win-rate mean-reversion cluster's conviction. A missing
+    win-rate is a neutral 0.5 (can't judge). See settings.conviction_edge_floor_pct."""
+    if win_rate is None:
+        return 0.5
+    floor = settings.conviction_edge_floor_pct
+    if win_rate <= floor:
+        return 0.0
+    return min(1.0, (win_rate - floor) / (100.0 - floor))
+
+
+def _weighted_conviction(strategies: Optional[list], wr_map: Optional[dict] = None) -> float:
+    """Edge-weighted conviction: the sum of each backing strategy's vote weight (_conviction_edge_weight
+    of its backtest win-rate). Reads win_rate from the strategy dict, falling back to `wr_map` (name →
+    backtest win-rate) for carried ideas that store only names — so fresh and held ideas rank on one scale."""
+    total = 0.0
+    for s in strategies or []:
+        if isinstance(s, dict):
+            wr = s.get("win_rate")
+            if wr is None and wr_map is not None:
+                wr = wr_map.get(s.get("name"))
+        else:
+            wr = wr_map.get(s) if wr_map is not None else None
+        total += _conviction_edge_weight(wr)
+    return round(total, 3)
+
+
+def _ranking_conviction(c: dict, market: str) -> float:
+    """The conviction the base ranking score uses. Equity markets in settings.conviction_edge_markets
+    (when conviction_edge_weighting is on) rank on the EDGE-WEIGHTED conviction, so a momentum-contaminated
+    cluster no longer outranks a clean high-win-rate one at the same raw count; every other case keeps raw
+    conviction (prior ordering). Crypto is exempt — it trends, and _regime_rank_key handles its gated path."""
+    if (settings.conviction_edge_weighting and market != "CRYPTO"
+            and market in settings.conviction_edge_markets):
+        return c.get("weighted_conviction", c["conviction"])
+    return c["conviction"]
 
 
 def _rank_win_prob(c: dict) -> Optional[float]:
@@ -1245,6 +1289,9 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
         return None
 
     max_per_bucket = max(1, min(int(max_per_bucket), 10))
+    # Strategy name → backtest win-rate, so both fresh and carried ideas carry an edge-weighted
+    # conviction on one scale (see _weighted_conviction / settings.conviction_edge_weighting).
+    wr_map = {s["name"]: (s.get("metrics") or {}).get("win_rate") for s in latest["strategies"]}
     idea_market = (latest.get("market") or market or "IN").upper()
     # Calibrate advertised win-rates against realized ledger outcomes (isotonic). The curve (if any)
     # feeds each candidate a `calibrated_win_pct` that the sizer prefers over the raw backtest rate.
@@ -1383,6 +1430,9 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
                 # Conviction that survives the risk gate — the credible agreement (crypto drops votes
                 # from near-wipeout strategies; equals `conviction` on equities). Ranking/gating use this.
                 "eligible_conviction": agg["_n_eligible"],
+                # Edge-weighted conviction — each vote scaled by its backtest win-rate, so a momentum-
+                # contaminated cluster ranks below a clean high-win-rate one at the same raw count.
+                "weighted_conviction": _weighted_conviction(agg["strategies"], wr_map),
                 "avg_win_rate": avg_wr,
                 "avg_sharpe": avg_sh,
                 "avg_max_drawdown": avg_dd,
@@ -1402,7 +1452,7 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
         # never close (they're purged separately); dropping them here keeps the board clean meanwhile.
         for t in open_tracked.get(h, []):
             if (t.get("side", "long"), t["ticker"]) not in fresh_keys and (t.get("entry_price") or 0) > 0:
-                cands.append(_carried_candidate(t))
+                cands.append(_carried_candidate(t, wr_map))
         # Crypto board gate (long risk gate + bearish-regime speculative-short surfacing). See
         # _crypto_idea_gate. Non-crypto markets skip it entirely (long-only, ungated).
         if idea_market == "CRYPTO":
@@ -1430,7 +1480,10 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
                 return (conv * (1 + settings.regime_rank_weight * t * cyc),
                         c["avg_sharpe"] or 0, c["avg_win_rate"] or 0,
                         c["avg_max_drawdown"] if c.get("avg_max_drawdown") is not None else -999)
-            return (c["conviction"] * (1 + settings.regime_rank_weight * t * cyc),
+            # Equity markets rank on EDGE-WEIGHTED conviction (each vote scaled by its backtest win-rate)
+            # so a momentum-contaminated cluster no longer outranks a clean high-win-rate one at the same
+            # raw count — raw conviction was an actively harmful ranker (IC -0.31 US). See _ranking_conviction.
+            return (_ranking_conviction(c, idea_market) * (1 + settings.regime_rank_weight * t * cyc),
                     c["avg_win_rate"] or 0, c["avg_sharpe"] or 0)
 
         # Rank, pool and cap each DIRECTION independently, so a horizon surfaces up to max_per_bucket

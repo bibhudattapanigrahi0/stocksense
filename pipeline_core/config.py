@@ -231,6 +231,19 @@ class Settings(BaseSettings):
     cohort_demote_markets: tuple = ("CRYPTO",)          # markets whose daily board is a demoted cohort
     cohort_demote_horizons: tuple = ("medium", "long")  # horizons demoted across every market
 
+    # Edge-weighted conviction — the board's primary rank key was raw strategy COUNT, which for equities
+    # is an actively harmful ranker (closed-ledger Spearman IC vs return: US -0.31, IN -0.02): it sums
+    # CONTRADICTORY families (a stock that's both "oversold" and "breaking out" counts as high-agreement),
+    # and low-win-rate momentum/breakout strategies (~43% backtest win vs ~63% mean-reversion) inflate
+    # conviction on extended stocks that then fail (2+ momentum strategies → 36% realized win). Instead of
+    # a raw count, weight each strategy's vote by its BACKTEST win-rate (the hit-rate metric the board
+    # optimizes) — validated to flip ranking IC to +0.09 (US) / +0.31 (IN). Crypto is EXEMPT (it trends —
+    # momentum is its edge there — and is already handled by its risk gate + cohort demote). Off ⇒ rank on
+    # raw conviction (prior behaviour). Raw `conviction` is untouched for the card + technical pillar.
+    conviction_edge_weighting: bool = True
+    conviction_edge_floor_pct: float = 45.0   # a strategy's vote is 0 at/below this backtest win-rate, ramping to 1 at 100%
+    conviction_edge_markets: tuple = ("US", "IN", "METALS")   # equity markets the weighting applies to (crypto exempt)
+
     # Daily-idea composite ranking — soft accuracy factors layered on conviction × regime, each a
     # bounded ± multiplier (see pipeline_core/backtest/idea_ranking.py). 0 disables a factor; all-zero
     # reproduces the pre-factor board. Applied live (a re-rank pool is enriched, re-scored, then capped).

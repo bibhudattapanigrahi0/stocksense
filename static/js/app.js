@@ -2686,7 +2686,7 @@ function renderIdeaRow(c, i, accent, horizon) {
             <div class="idea-live-slot">${ideaLiveLevelsHtml(c)}</div>
             <div class="idea-strats">${pills}${more}${regimeTag}</div>
         </div>
-        <div class="idea-conv" title="${c.conviction} strateg${c.conviction === 1 ? "y" : "ies"} agree · avg win rate ${fmt(c.avg_win_rate)}%${c.calibrated_win_pct != null ? ` · calibrated to ${fmt(c.calibrated_win_pct)}%` : ""}">
+        <div class="idea-conv" title="${c.conviction} strateg${c.conviction === 1 ? "y" : "ies"} agree · avg win rate ${fmt(c.avg_win_rate)}%${c.calibrated_win_pct != null ? ` · calibrated to ${fmt(c.calibrated_win_pct)}%` : ""}${c.weighted_conviction != null && c.weighted_conviction < c.conviction - 0.05 ? ` · edge-weighted to ${fmt(c.weighted_conviction, 1)}× for ranking (each vote scaled by its backtest win-rate, so low-win-rate momentum signals don't inflate the count)` : ""}">
             <span class="conv-num" style="color:${accent}">${c.conviction}×</span>
             <span class="muted small" title="${c.calibrated_win_pct != null ? `Calibrated to realized outcomes (advertised ${fmt(c.avg_win_rate)}%)` : "Average backtest win rate"}">${fmt(c.calibrated_win_pct ?? c.avg_win_rate)}% win${c.calibrated_win_pct != null ? " ✓" : ""}</span>
             <button class="idea-ai-btn" data-ticker="${esc(c.ticker)}" data-horizon="${esc(horizon || "")}" title="AI analyst read of this idea (thesis + news sentiment + verdict)">🧠 AI</button>
