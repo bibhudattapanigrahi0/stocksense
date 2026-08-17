@@ -992,26 +992,105 @@ def _carried_candidate(t: dict) -> dict:
 
 
 def _size_bucket(shown: list, tilt: float) -> dict:
-    """Size a bucket's ideas as one ¼-Kelly book, applying the regime risk-off haircut: when the
-    tide is against longs (tilt<0) the book's risk budget is trimmed by a soft factor (never below
-    regime_size_floor of base) and each idea is tagged with it; risk-on/neutral sizes normally."""
-    if tilt < 0:
-        size_factor = max(settings.regime_size_floor, 1 + settings.regime_size_weight * tilt)
+    """Size a bucket's ideas as one ¼-Kelly book, applying two independent haircuts to the book's risk
+    budget: the regime risk-off haircut (tilt<0 trims longs, never below regime_size_floor) and a
+    cohort-demotion haircut (a persistently under-performing market/horizon rides at cohort_size_factor).
+    Each idea is tagged with the factors applied; a risk-on, non-demoted book sizes normally (unchanged)."""
+    regime_factor = (max(settings.regime_size_floor, 1 + settings.regime_size_weight * tilt)
+                     if tilt < 0 else 1.0)
+    demote_reason = next((c.get("demote_reason") for c in shown if c.get("demote_reason")), None)
+    cohort_factor = settings.cohort_size_factor if demote_reason else 1.0
+    size_factor = regime_factor * cohort_factor
+    if size_factor < 1.0:
         bucket_sizing = sizing.size_book(
             shown, max_book_risk_pct=settings.sizing_max_book_risk_pct * size_factor)
-        for c in shown:
-            c["regime_size_factor"] = round(size_factor, 3)
-        bucket_sizing["regime_size_factor"] = round(size_factor, 3)
     else:
         bucket_sizing = sizing.size_book(shown)
+    for c in shown:
+        if regime_factor < 1.0:
+            c["regime_size_factor"] = round(regime_factor, 3)
+        if cohort_factor < 1.0:
+            c["cohort_size_factor"] = round(cohort_factor, 3)
+    if regime_factor < 1.0:
+        bucket_sizing["regime_size_factor"] = round(regime_factor, 3)
+    if cohort_factor < 1.0:
+        bucket_sizing["cohort_size_factor"] = round(cohort_factor, 3)
+        bucket_sizing["cohort_demote_reason"] = demote_reason
     return bucket_sizing
+
+
+def _cohort_demote_reason(market: Optional[str], horizon: Optional[str]) -> Optional[str]:
+    """A reason string if this (market, horizon) is a soft-demoted cohort — one the closed ledger shows
+    persistently under-performing its advertised odds (crypto daily: 34.6% realized win carried by a few
+    tail winners; medium/long horizons: broadly net-losing) — else None. Demoted cohorts keep showing
+    but get a win-prob haircut + smaller size. See settings.cohort_demote_*."""
+    if not settings.cohort_demote_enabled:
+        return None
+    reasons = []
+    if str(market or "").upper() in {m.upper() for m in settings.cohort_demote_markets}:
+        reasons.append(f"{str(market).lower()} daily")
+    if horizon in settings.cohort_demote_horizons:
+        reasons.append(f"{horizon} horizon")
+    return " + ".join(reasons) if reasons else None
+
+
+def _rank_win_prob(c: dict) -> Optional[float]:
+    """The win probability used for RANKING and the edge gate: the calibrated/fusion-preferred estimate
+    (sizing._win_prob — model > calibrated > advertised) when rank_use_calibrated is on, else the raw
+    advertised rate. A demoted-cohort idea (c['demote_reason'], tagged by _recompose_bucket) is haircut
+    by cohort_haircut_pp so more of them fail the edge floor. A fraction in [0, 1], or None if no win-rate."""
+    if settings.rank_use_calibrated:
+        p = sizing._win_prob(c)
+    else:
+        wr = c.get("avg_win_rate")
+        p = wr / 100.0 if wr is not None else None
+    if p is None:
+        return None
+    if c.get("demote_reason"):
+        p = max(0.0, p - settings.cohort_haircut_pp / 100.0)
+    return p
+
+
+def _breakeven_win_prob(c: dict) -> Optional[float]:
+    """The geometric breakeven win rate implied by an idea's own risk/reward: risking `stop_dist` to
+    make `target_dist` breaks even at stop_dist / (stop_dist + target_dist). Uses the stored prices when
+    present, else the advertised stop_pct/target_pct. None if the geometry is missing."""
+    entry, stop = c.get("entry_price"), c.get("stop_price")
+    target = c.get("target_price") or _effective_target(c)
+    if entry and stop is not None and target is not None:
+        stop_dist, target_dist = abs(entry - stop), abs(target - entry)
+    else:
+        sp, tp = c.get("stop_pct"), c.get("target_pct")
+        if not sp or not tp:
+            return None
+        stop_dist, target_dist = sp, tp
+    denom = stop_dist + target_dist
+    return stop_dist / denom if denom > 0 else None
+
+
+def _edge_slack(c: dict) -> float:
+    """Win probability MINUS breakeven — how much room an idea clears its own risk/reward by. Used both
+    to gate (must exceed the margin) and to rank the least-bad when a gate would otherwise empty."""
+    wp, be = _rank_win_prob(c), _breakeven_win_prob(c)
+    return (wp - be) if (wp is not None and be is not None) else -9.0
+
+
+def _passes_edge_floor(c: dict) -> bool:
+    """True unless the idea's (calibrated) win probability sits below its own breakeven plus the required
+    margin. Ideas that carry no win-prob or no geometry pass — the floor never judges what it can't."""
+    wp, be = _rank_win_prob(c), _breakeven_win_prob(c)
+    if wp is None or be is None:
+        return True
+    return wp >= be + settings.idea_min_edge_margin_pp / 100.0
 
 
 def _rank_pool(pool: list, max_per_bucket: int,
                clusters: Optional[dict], pillar_ctx: Optional[dict]) -> tuple:
-    """Rank ONE direction's candidate pool by the composite score → quality gate → correlation de-dup
-    → cap → optional pillar tiering. Returns (shown, quality_cut, dedup_info). Mutates candidate
-    fields (rank_multiplier/rank_score/pillars/tier) but no bucket. The regime tilt is already baked
+    """Rank ONE direction's candidate pool by the composite score → quality gate → edge floor →
+    correlation de-dup → cap → optional pillar tiering. Returns (shown, quality_cut, edge_cut,
+    dedup_info). Mutates candidate fields (rank_multiplier/rank_score/pillars/tier) but no bucket.
+    Ranking uses the calibrated win probability (_rank_win_prob); the edge floor drops ideas whose
+    win-prob can't clear their own breakeven. The regime tilt is already baked
     into each idea's `_base_score` (side-appropriate sign) and sizing is applied by the caller, so no
     tilt is needed here. A SHORT's directional soft factors are inverted (a bullish tilt is a headwind
     for it); for long candidates the inversion is a no-op, so behaviour is unchanged."""
@@ -1026,10 +1105,25 @@ def _rank_pool(pool: list, max_per_bucket: int,
         mult = idea_ranking.composite_multiplier(factors)
         c["rank_multiplier"] = round(mult, 4)
         c["rank_score"] = round(c.get("_base_score", c.get("conviction", 0)) * mult, 6)
-    pool.sort(key=lambda c: (c["rank_score"], c.get("avg_win_rate") or 0, c.get("avg_sharpe") or 0),
+    pool.sort(key=lambda c: (c["rank_score"], _rank_win_prob(c) or 0, c.get("avg_sharpe") or 0),
               reverse=True)
     floor = settings.rank_min_multiplier
     survivors = [c for c in pool if c["rank_multiplier"] >= floor]
+    quality_cut = len(pool) - len(survivors)
+    # EDGE FLOOR — drop ideas whose (calibrated) win probability is below their own geometric breakeven
+    # plus the required margin: an idea that can't clear its own risk/reward is the coin-flip the ledger
+    # showed realizing ~32% win (net-negative). Never empties a bucket: if every survivor fails, keep the
+    # least-bad few by edge slack, each flagged `below_edge`, so a thin book degrades gracefully (mirrors
+    # the crypto gate's never-empty rule) rather than showing an empty column.
+    passed = [c for c in survivors if _passes_edge_floor(c)]
+    edge_cut = len(survivors) - len(passed)
+    if passed:
+        survivors = passed
+    elif survivors:
+        survivors.sort(key=_edge_slack, reverse=True)
+        survivors = survivors[:max(1, min(settings.edge_floor_min_keep, len(survivors)))]
+        for c in survivors:
+            c["below_edge"] = True
     # Correlation de-dup on the rank-sorted survivors (best-ranked idea per correlated cluster kept),
     # BEFORE the cap so independent names are promoted over correlated ones. Empty clusters → no-op.
     deduped, dd = dedup.dedup_book(survivors, clusters or {})
@@ -1055,11 +1149,12 @@ def _rank_pool(pool: list, max_per_bucket: int,
         shown.sort(key=lambda c: 0 if c.get("tier") == "actionable" else 1)
     for c in pool:
         c.pop("_base_score", None)
-    return shown, len(pool) - len(survivors), dd
+    return shown, quality_cut, edge_cut, dd
 
 
 def _recompose_bucket(bucket: dict, tilt: float, max_per_bucket: int,
-                      clusters: Optional[dict] = None, pillar_ctx: Optional[dict] = None) -> None:
+                      clusters: Optional[dict] = None, pillar_ctx: Optional[dict] = None,
+                      market: Optional[str] = None) -> None:
     """Re-rank a bucket's candidate POOL (shown + reserve) by the composite score — each idea's base
     conviction×regime score scaled by whatever soft factors (earnings/news/sector/quality) live
     enrichment has attached — then apply the QUALITY GATE, collapse CORRELATED duplicates, and keep
@@ -1085,15 +1180,24 @@ def _recompose_bucket(bucket: dict, tilt: float, max_per_bucket: int,
     With no factors attached every multiplier is 1.0 and with no clusters nothing is collapsed, so the
     order is exactly the base one (regression-safe)."""
     pool = bucket.get("candidates", []) + bucket.pop("_reserve", [])
+    # Cohort soft-demote: tag every candidate in a persistently under-performing (market, horizon) so
+    # the edge floor (via _rank_win_prob's haircut) and sizing (_size_bucket) both discount it uniformly.
+    demote_reason = _cohort_demote_reason(market, bucket.get("horizon"))
+    for c in pool:
+        if demote_reason:
+            c["demoted"], c["demote_reason"] = True, demote_reason
+        else:                                          # clear any stale tag on re-rank (config toggled off)
+            c.pop("demoted", None); c.pop("demote_reason", None)
     by_side: dict[str, list] = {}
     for c in pool:
         by_side.setdefault(c.get("side", "long"), []).append(c)
 
     if "short" not in by_side:
         # Long-only (every non-crypto market, and crypto with shorts off) — behaviour unchanged.
-        shown, cut, dd = _rank_pool(pool, max_per_bucket, clusters, pillar_ctx)
+        shown, cut, edge_cut, dd = _rank_pool(pool, max_per_bucket, clusters, pillar_ctx)
         bucket["candidates"] = shown
-        bucket["quality_cut"] = cut                       # conflicted ideas the gate removed
+        bucket["quality_cut"] = cut                       # conflicted ideas the multiplier gate removed
+        bucket["edge_cut"] = edge_cut                     # ideas the breakeven edge floor removed
         bucket["dedup"] = dd                              # {kept, dropped, collapsed_clusters}
         if pillar_ctx is not None:
             bucket["actionable_count"] = sum(1 for c in shown if c.get("tier") == "actionable")
@@ -1102,14 +1206,15 @@ def _recompose_bucket(bucket: dict, tilt: float, max_per_bucket: int,
         return
 
     # Mixed long+short (crypto): rank each side independently, then concatenate (longs first).
-    combined, cut_total = [], 0
+    combined, cut_total, edge_cut_total = [], 0, 0
     dd_total = {"kept": 0, "dropped": 0, "collapsed_clusters": 0}
     for _side in ("long", "short"):
         if _side not in by_side:
             continue
-        shown, cut, dd = _rank_pool(by_side[_side], max_per_bucket, clusters, pillar_ctx)
+        shown, cut, edge_cut, dd = _rank_pool(by_side[_side], max_per_bucket, clusters, pillar_ctx)
         combined += shown
         cut_total += cut
+        edge_cut_total += edge_cut
         dd_total["kept"] += dd.get("kept", 0)
         dd_total["dropped"] += dd.get("dropped", 0)
         dd_total["collapsed_clusters"] += dd.get("collapsed_clusters", 0)
@@ -1120,6 +1225,7 @@ def _recompose_bucket(bucket: dict, tilt: float, max_per_bucket: int,
     short_shown = [c for c in combined if c.get("side") == "short"]
     bucket["candidates"] = combined
     bucket["quality_cut"] = cut_total
+    bucket["edge_cut"] = edge_cut_total
     bucket["dedup"] = dd_total
     bucket["sizing"] = _size_bucket(long_shown, tilt)
     bucket["short_sizing"] = _size_bucket(short_shown, -tilt) if short_shown else None
@@ -1600,7 +1706,7 @@ async def enrich_ideas_live(ideas: Optional[dict], market: str = "IN") -> Option
         # Composite re-rank the enriched pool (base conviction×regime × the soft factors), collapse
         # correlated duplicates, keep the top max_per_bucket, tier by pillar confluence, re-size. With
         # every factor neutral and no clusters this reproduces the base top-N (tiering is additive).
-        _recompose_bucket(ideas["buckets"][h], tilt, max_per_bucket, clusters, pillar_ctx)
+        _recompose_bucket(ideas["buckets"][h], tilt, max_per_bucket, clusters, pillar_ctx, mk)
 
     # Distil the enriched board into ONE curated cross-horizon basket. Read-only: it merges against the
     # last committed basket (hysteresis) but does NOT write here, so intra-day auto-refreshes stay stable
@@ -1651,6 +1757,29 @@ def _save_tracked(items: list) -> None:
     tmp = TRACKED_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(items), encoding="utf-8")
     tmp.replace(TRACKED_FILE)
+
+
+def backfill_ledger_costs() -> dict:
+    """One-time, idempotent migration: rewrite already-closed tracked ideas that were recorded GROSS
+    (before ledger costs landed) to NET, preserving the raw move as `gross_return_pct`. Records already
+    carrying `_cost_adjusted` are skipped, so this is safe to re-run. Returns {adjusted, total}."""
+    items = _load_tracked()
+    n = 0
+    for it in items:
+        if not it.get("closed") or it.get("_cost_adjusted"):
+            continue
+        gross = it.get("realized_return_pct")
+        if gross is None:
+            continue
+        cost = _roundtrip_cost_pct(it, it.get("bars_held") or 0)
+        it["gross_return_pct"] = gross
+        it["realized_return_pct"] = round(gross - cost, 2)
+        it["cost_pct"] = round(cost, 3)
+        it["_cost_adjusted"] = True
+        n += 1
+    if n:
+        _save_tracked(items)
+    return {"adjusted": n, "total": len(items)}
 
 
 async def snapshot_current_ideas(max_per_bucket: int = 10, market: str = "IN") -> dict:
@@ -2078,19 +2207,40 @@ def _current_price(ticker: str, market: str = "IN") -> Optional[float]:
 HORIZON_MAX_BARS = {"short": 15, "medium": 40, "long": 120}
 
 
+def _roundtrip_cost_pct(idea: dict, bars_held: int) -> float:
+    """Realistic round-trip trading cost as a percent of notional — the same the backtest engine
+    prices in (config.market_cost_bps) plus, for a crypto SHORT, perpetual funding paid per day held.
+    Returns 0.0 when ledger costs are off, so realized collapses to the raw gross move (prior behaviour)."""
+    if not settings.ledger_costs_enabled:
+        return 0.0
+    from pipeline_core.config import market_cost_bps
+    market = idea.get("market") or "IN"
+    cost = market_cost_bps(market) / 100.0                       # bps → percent, round trip
+    if str(market).upper() == "CRYPTO" and idea.get("side") == "short":
+        cost += settings.crypto_funding_bps_per_day * max(0, bars_held or 0) / 100.0
+    return cost
+
+
 def _closed_outcome(idea: dict, reason: str, exit_price: float, exit_date: str, bars_held: int) -> dict:
     """The lifecycle fields written onto a tracked idea when it closes. A SHORT realizes the inverse
-    price move (it profits when the exit is below entry)."""
+    price move (it profits when the exit is below entry). `realized_return_pct` is NET of realistic
+    round-trip cost (config.market_cost_bps + crypto-short funding); the raw move is kept as
+    `gross_return_pct` for transparency. See settings.ledger_costs_enabled."""
     entry = idea.get("entry_price")
     sign = -1 if idea.get("side") == "short" else 1
-    realized = round(sign * (exit_price - entry) / entry * 100, 2) if entry else None
+    gross = round(sign * (exit_price - entry) / entry * 100, 2) if entry else None
+    cost = _roundtrip_cost_pct(idea, bars_held)
+    realized = round(gross - cost, 2) if gross is not None else None
     return {
         "closed": True,
         "exit_reason": reason,                 # "stop" | "target" | "time"
         "exit_price": round_price(exit_price),
         "exit_date": exit_date,
-        "realized_return_pct": realized,
+        "realized_return_pct": realized,       # NET of round-trip cost
+        "gross_return_pct": gross,             # raw price move, pre-cost
+        "cost_pct": round(cost, 3),
         "bars_held": bars_held,
+        "_cost_adjusted": True,
     }
 
 

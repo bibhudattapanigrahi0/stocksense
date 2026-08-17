@@ -205,6 +205,32 @@ class Settings(BaseSettings):
     # universe lands; applied to the win-prob the ranking/sizing read + disclosed in the UI. 0 = off.
     survivorship_haircut_pp: float = 4.0
 
+    # ── Trade-ideas edge repair (measured from the closed-idea ledger) ─────────────────────────────
+    # The live tracker recorded realized returns as a GROSS price move — unlike the backtest engine,
+    # which prices in `market_cost_bps`. Subtract the same round-trip cost (+ crypto-short funding per
+    # day held) when an idea closes, so the ledger, its win-rate, PF, calibration curve, attribution and
+    # equity are all NET-honest. Off ⇒ realized == gross (prior behaviour). Both figures are stored.
+    ledger_costs_enabled: bool = True
+    # Breakeven edge floor — an idea must carry a win probability at least this many points above its
+    # own geometric breakeven (stop_dist / (stop_dist + target_dist)) to be shown. The closed ledger
+    # showed sub-50%-advertised ideas realizing ~32% win (net-negative); this drops them before the
+    # board. 0 ⇒ require only >= breakeven; a bucket that would empty keeps the least-bad few (flagged).
+    idea_min_edge_margin_pp: float = 3.0
+    edge_floor_min_keep: int = 3             # if the edge floor would empty a bucket, keep this many least-bad (flagged)
+    # Rank on the CALIBRATED win probability (isotonic/fusion-preferred via sizing._win_prob) rather than
+    # the raw advertised rate. The ledger showed the raw rate overconfident mid-band (advertised 40–50%
+    # → 33% actual) and underconfident up top (60–70% → 75%). False ⇒ sort on raw avg_win_rate (prior).
+    rank_use_calibrated: bool = True
+    # Cohort soft-demote — cohorts that persistently underperform their advertised odds (crypto daily:
+    # 34.6% realized win carried by a few tail winners; medium/long horizons: broadly net-losing) are
+    # kept on the board but (a) win-prob haircut by `cohort_haircut_pp` so more of them fail the edge
+    # floor, and (b) sized at `cohort_size_factor` of book risk, and labelled. False ⇒ no demotion.
+    cohort_demote_enabled: bool = True
+    cohort_haircut_pp: float = 8.0            # pp shaved off a demoted cohort's win-prob (adds to survivorship)
+    cohort_size_factor: float = 0.5          # book-risk multiplier for a demoted cohort (stacks with regime)
+    cohort_demote_markets: tuple = ("CRYPTO",)          # markets whose daily board is a demoted cohort
+    cohort_demote_horizons: tuple = ("medium", "long")  # horizons demoted across every market
+
     # Daily-idea composite ranking — soft accuracy factors layered on conviction × regime, each a
     # bounded ± multiplier (see pipeline_core/backtest/idea_ranking.py). 0 disables a factor; all-zero
     # reproduces the pre-factor board. Applied live (a re-rank pool is enriched, re-scored, then capped).

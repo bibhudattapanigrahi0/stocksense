@@ -116,13 +116,15 @@ def _hist(closes, start="2026-06-01"):
 def test_short_closes_on_target_when_price_falls():
     out = runner._evaluate_idea_path(_short_idea(), _hist([100, 96, 91, 88, 92]))
     assert out["closed"] and out["exit_reason"] == "target"
-    assert out["exit_price"] == 90.0 and out["realized_return_pct"] == 10.0   # (100-90)/100
+    assert out["exit_price"] == 90.0 and out["gross_return_pct"] == 10.0   # (100-90)/100
+    assert out["realized_return_pct"] == 9.35    # net: 35 bps + 3d × 10 bps short funding
 
 
 def test_short_closes_on_stop_when_price_rises():
     out = runner._evaluate_idea_path(_short_idea(), _hist([100, 108, 116, 112]))
     assert out["closed"] and out["exit_reason"] == "stop"
-    assert out["exit_price"] == 115.0 and out["realized_return_pct"] == -15.0  # (100-115)/100
+    assert out["exit_price"] == 115.0 and out["gross_return_pct"] == -15.0  # (100-115)/100
+    assert out["realized_return_pct"] == -15.55  # net: 35 bps + 2d × 10 bps short funding
 
 
 def test_short_effective_target_is_below_entry():
@@ -133,7 +135,8 @@ def test_long_tracker_path_still_correct():
     long_idea = dict(ticker="BTC", market="CRYPTO", horizon="medium", entry_price=100.0,
                      stop_price=95.0, target_price=110.0, signal_date="2026-06-01")
     out = runner._evaluate_idea_path(long_idea, _hist([100, 102, 105, 111, 108]))
-    assert out["exit_reason"] == "target" and out["realized_return_pct"] == 10.0
+    assert out["exit_reason"] == "target" and out["gross_return_pct"] == 10.0
+    assert out["realized_return_pct"] == 9.65    # net of crypto 35 bps (long pays no funding)
 
 
 # ── Board: horizon_ideas pools both directions for crypto ───────────

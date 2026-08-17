@@ -2403,13 +2403,19 @@ function renderHorizonColumn(b) {
     const gateNote = cut > 0
         ? `<span class="idea-gate small" title="Quality gate: ${cut} candidate${cut === 1 ? "" : "s"} fighting multiple headwinds (e.g. bearish news + a lagging sector, or near-term earnings risk) ${cut === 1 ? "was" : "were"} filtered out rather than shown — fewer, cleaner setups instead of a padded board.">🛡️ ${cut} filtered</span>`
         : "";
+    // Edge floor: candidates whose (calibrated) win probability couldn't clear their own risk/reward
+    // breakeven were dropped — the coin-flips the closed ledger showed realizing ~32% win.
+    const edgeCut = b.edge_cut || 0;
+    const edgeNote = edgeCut > 0
+        ? `<span class="idea-gate small" title="Edge floor: ${edgeCut} candidate${edgeCut === 1 ? "" : "s"} whose win probability sat below its own risk/reward breakeven ${edgeCut === 1 ? "was" : "were"} dropped — the closed ledger showed such sub-breakeven setups realizing ~32% win (net-negative after costs).">🎯 ${edgeCut} below edge</span>`
+        : "";
     // Correlation de-dup: ideas that move in lockstep with a higher-ranked pick were collapsed, so the
     // shown names are independent bets — not one crowded trade wearing several tickers.
     const collapsed = (b.dedup && b.dedup.dropped) || 0;
     const dedupNote = collapsed > 0
         ? `<span class="idea-gate small" title="Correlation de-dup: ${collapsed} idea${collapsed === 1 ? "" : "s"} that move${collapsed === 1 ? "s" : ""} in lockstep with a higher-ranked pick ${collapsed === 1 ? "was" : "were"} collapsed — the shown ideas are independent setups, not the same bet under multiple tickers.">🔗 ${collapsed} collapsed</span>`
         : "";
-    const notes = [gateNote, dedupNote].filter(Boolean).join(" · ");
+    const notes = [gateNote, edgeNote, dedupNote].filter(Boolean).join(" · ");
     // Short note: crypto also has a bearish subgroup below — surface its count so "0 actionable" longs
     // don't read as "nothing here" when shorts are the regime-aligned trade.
     const shortNote = shorts.length ? ` · <b style="color:var(--neg)">${shorts.length}</b> short${shorts.length === 1 ? "" : "s"} ↓` : "";
@@ -2481,6 +2487,15 @@ function ideaTopInner(c) {
     // Freshly generated ideas get a NEW tag; carried-over (still-open) ideas get a HELD tag.
     const newBadge = c.is_new ? `<span class="idea-new" title="Freshly generated in the latest run">NEW</span>` : "";
     const heldBadge = c.carried ? `<span class="idea-held" title="Open idea carried over — stays on the board until it hits its target, stop, or time-stop">held</span>` : "";
+    // Soft-demote: a cohort the closed ledger shows persistently under-performing (crypto daily,
+    // medium/long horizons) — win-rate haircut + smaller size, kept but flagged so the odds read honestly.
+    const demoteBadge = c.demote_reason
+        ? `<span class="idea-held" title="Demoted cohort (${esc(c.demote_reason)}): the closed ledger shows this cohort under-performing its advertised odds, so its win-rate is haircut and it's sized at ×${c.cohort_size_factor != null ? c.cohort_size_factor : 0.5}. Kept on the board, but the odds are marked down.">demoted</span>`
+        : "";
+    // Edge floor: a below-breakeven idea that survived only because its bucket would otherwise be empty.
+    const belowEdgeBadge = c.below_edge
+        ? `<span class="idea-held" title="Below edge: this idea's win probability sits under its own risk/reward breakeven. It shows only because the bucket would otherwise be empty — treat with caution.">below edge</span>`
+        : "";
     const age = c.age_days != null
         ? `<span class="idea-age muted small" title="Days since this setup was generated${c.latest_signal_date ? ` (signal ${esc(c.latest_signal_date)})` : ""}">${c.age_days === 0 ? "today" : c.age_days + "d ago"}</span>`
         : "";
@@ -2551,6 +2566,8 @@ function ideaTopInner(c) {
                 ${pillarChip(c)}
                 ${newBadge}
                 ${heldBadge}
+                ${demoteBadge}
+                ${belowEdgeBadge}
                 ${earn}
                 ${news}
                 ${secChip}

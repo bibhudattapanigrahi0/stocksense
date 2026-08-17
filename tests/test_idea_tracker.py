@@ -30,13 +30,17 @@ def _idea(**over):
 def test_path_hits_target():
     out = runner._evaluate_idea_path(_idea(), _hist([100, 102, 105, 111, 108]))
     assert out["closed"] and out["exit_reason"] == "target"
-    assert out["exit_price"] == 110.0 and out["realized_return_pct"] == 10.0
+    assert out["exit_price"] == 110.0
+    assert out["gross_return_pct"] == 10.0                    # raw +10% price move
+    assert out["realized_return_pct"] == 9.65                 # net of crypto 35 bps round-trip cost
 
 
 def test_path_hits_stop():
     out = runner._evaluate_idea_path(_idea(), _hist([100, 98, 95, 97]))
     assert out["closed"] and out["exit_reason"] == "stop"
-    assert out["exit_price"] == 95.0 and out["realized_return_pct"] == -5.0
+    assert out["exit_price"] == 95.0
+    assert out["gross_return_pct"] == -5.0
+    assert out["realized_return_pct"] == -5.35               # loss widened by the 35 bps cost
 
 
 def test_path_expires_on_time():
@@ -55,7 +59,8 @@ def test_legacy_idea_without_target_still_closes_on_target():
               "entry_price": 100.0, "stop_price": 94.0, "signal_date": "2026-06-01"}
     assert runner._effective_target(legacy) == 110.0          # short default +10%
     out = runner._evaluate_idea_path(legacy, _hist([100, 104, 108, 112, 109]))
-    assert out["exit_reason"] == "target" and out["realized_return_pct"] == 10.0
+    assert out["exit_reason"] == "target" and out["gross_return_pct"] == 10.0
+    assert out["realized_return_pct"] == 9.75                 # market None → IN default 25 bps
     # A winner that hasn't reached the target stays open.
     assert runner._evaluate_idea_path(legacy, _hist([100, 101, 102, 103])) is None
 
@@ -109,7 +114,7 @@ def test_status_closes_and_persists(tmp_tracked, monkeypatch):
     assert [c["ticker"] for c in res["closed"]] == ["WIN"]
     assert [o["ticker"] for o in res["open"]] == ["OPEN"]
     assert res["closed_scoreboard"]["wins"] == 1 and res["closed_scoreboard"]["win_rate"] == 100.0
-    assert res["equity_curve"] and res["equity_curve"][-1][1] == 10.0
+    assert res["equity_curve"] and res["equity_curve"][-1][1] == 9.65   # +10% target, net crypto cost
 
     # The closure is persisted (idempotent) — a second pass keeps WIN closed without re-eval.
     stored = {t["ticker"]: t for t in runner._load_tracked()}

@@ -119,6 +119,14 @@ async def _lifespan(_app: FastAPI):
     # Touch the store first so the schema + one-time per-user migration run before the
     # background loop (or any request) reads or writes it.
     await run_store.get_owner()
+    # One-time, idempotent: rewrite any pre-cost closed tracked ideas to NET of realistic round-trip
+    # cost (records already carrying `_cost_adjusted` are skipped), so the ledger's realized win-rate,
+    # PF, calibration curve and equity are cost-honest from first boot. See runner.backfill_ledger_costs.
+    try:
+        from pipeline_core.backtest import runner as _runner
+        _runner.backfill_ledger_costs()
+    except Exception:
+        logging.getLogger("stocksense").warning("ledger cost backfill skipped", exc_info=True)
     task = asyncio.create_task(_auto_refresh_loop()) if settings.auto_refresh_enabled else None
     try:
         yield
