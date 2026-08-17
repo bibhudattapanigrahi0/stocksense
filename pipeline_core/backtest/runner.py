@@ -1023,6 +1023,25 @@ def _size_bucket(shown: list, tilt: float) -> dict:
     return bucket_sizing
 
 
+def _oversold_state(frame) -> Optional[dict]:
+    """Current oversold read for an equity long from its recent daily closes: RSI(14) and price vs the
+    50-DMA. Returns {rsi, vs_sma50_pct, oversold} or None with too little history. `oversold` is True when
+    the stock is genuinely pulled back (RSI below the floor OR below its 50-DMA) — the setups the closed
+    ledger shows winning ~75% vs ~26% for extended entries. See settings.equity_oversold_gate_enabled."""
+    if frame is None or getattr(frame, "empty", True) or len(frame) < 50:
+        return None
+    c = frame["Close"].astype(float)
+    diff = c.diff()
+    up = diff.clip(lower=0).rolling(14).mean().iloc[-1]
+    dn = (-diff.clip(upper=0)).rolling(14).mean().iloc[-1]
+    rsi = 100.0 if not dn else 100.0 - 100.0 / (1.0 + up / dn)
+    px = float(c.iloc[-1])
+    sma50 = float(c.rolling(50).mean().iloc[-1])
+    vs = (px / sma50 - 1.0) * 100.0 if sma50 else 0.0
+    oversold = (rsi < settings.oversold_rsi_max) or (vs < 0)
+    return {"rsi": round(rsi, 1), "vs_sma50_pct": round(vs, 1), "oversold": bool(oversold)}
+
+
 def _cohort_demote_reason(market: Optional[str], horizon: Optional[str]) -> Optional[str]:
     """A reason string if this (market, horizon) is a soft-demoted cohort — one the closed ledger shows
     persistently under-performing its advertised odds (crypto daily: 34.6% realized win carried by a few
@@ -1224,12 +1243,17 @@ def _recompose_bucket(bucket: dict, tilt: float, max_per_bucket: int,
     With no factors attached every multiplier is 1.0 and with no clusters nothing is collapsed, so the
     order is exactly the base one (regression-safe)."""
     pool = bucket.get("candidates", []) + bucket.pop("_reserve", [])
-    # Cohort soft-demote: tag every candidate in a persistently under-performing (market, horizon) so
-    # the edge floor (via _rank_win_prob's haircut) and sizing (_size_bucket) both discount it uniformly.
-    demote_reason = _cohort_demote_reason(market, bucket.get("horizon"))
+    # Soft-demote tagging → the edge floor (via _rank_win_prob's haircut), sizing (_size_bucket) and the UI
+    # badge all discount a demoted idea uniformly. Two reasons stack: (1) a persistently under-performing
+    # (market, horizon) cohort; (2) an EXTENDED equity long (not oversold at entry — the closed ledger's
+    # ~26%-win cohort, flagged `not_oversold` during enrich). A clean, oversold idea carries neither.
+    cohort = _cohort_demote_reason(market, bucket.get("horizon"))
     for c in pool:
-        if demote_reason:
-            c["demoted"], c["demote_reason"] = True, demote_reason
+        reasons = [cohort] if cohort else []
+        if c.get("not_oversold"):
+            reasons.append("entered extended")
+        if reasons:
+            c["demoted"], c["demote_reason"] = True, " + ".join(reasons)
         else:                                          # clear any stale tag on re-rank (config toggled off)
             c.pop("demoted", None); c.pop("demote_reason", None)
     by_side: dict[str, list] = {}
@@ -1638,6 +1662,7 @@ async def enrich_ideas_live(ideas: Optional[dict], market: str = "IN") -> Option
     want_quality = is_equity and settings.rank_w_quality > 0
     want_info = want_sector or want_quality               # one get_stock_info fetch feeds both
     want_dedup = settings.dedup_daily_enabled             # daily correlation de-dup (needs price history)
+    want_entry_state = is_equity and settings.equity_oversold_gate_enabled  # oversold read for the entry gate
 
     # Multi-pillar confluence — how many independent families CAN confirm an idea in this market (data
     # sources switched on). Clamps the actionable bar (idea_ranking.pillar_tier) so thin-pillar markets
@@ -1677,8 +1702,9 @@ async def enrich_ideas_live(ideas: Optional[dict], market: str = "IN") -> Option
             dte = await asyncio.to_thread(earnings_svc.days_to_earnings, tk, mk) if want_earnings else None
             news = await market_sentiment.news_sentiment(tk, None, mk) if want_news else None
             info = await asyncio.to_thread(get_stock_info, tk, mk) if want_info else None
-            # 6mo of daily closes for the correlation de-dup (cached; often warm from the backtest run).
-            hist = await aget_price_history(tk, "6mo", "1d", mk) if want_dedup else None
+            # 6mo of daily closes for the correlation de-dup + the oversold entry gate (cached; often
+            # warm from the backtest run). One fetch feeds both.
+            hist = await aget_price_history(tk, "6mo", "1d", mk) if (want_dedup or want_entry_state) else None
             return tk, quote, own, dte, news, info, hist
 
     fetched = await asyncio.gather(*(_enrich(t) for t in tickers)) if tickers else []
@@ -1739,6 +1765,17 @@ async def enrich_ideas_live(ideas: Optional[dict], market: str = "IN") -> Option
                 qs = idea_ranking.quality_score(info)
                 c["quality_score"] = qs
                 c["quality_factor"] = idea_ranking.quality_factor(qs)
+            # Equity oversold entry gate: flag an EXTENDED (not pulled-back) long — the closed ledger shows
+            # those realizing ~26% win vs ~75% for genuinely oversold entries. Longs only (a short wants the
+            # opposite); the flag is folded into the demote reason in _recompose_bucket (win-prob haircut →
+            # edge floor + smaller size). None when history is thin, so the gate never fires blind.
+            if want_entry_state and c.get("side", "long") != "short":
+                ov = _oversold_state(frames_by_sym.get(c["ticker"]))
+                if ov is not None:
+                    c["entry_rsi"] = ov["rsi"]
+                    c["entry_vs_sma50"] = ov["vs_sma50_pct"]
+                    c["oversold"] = ov["oversold"]
+                    c["not_oversold"] = not ov["oversold"]
             live = quotes.get(c["ticker"])
             c["live_price"] = live
             if live is None:

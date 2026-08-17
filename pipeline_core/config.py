@@ -244,6 +244,16 @@ class Settings(BaseSettings):
     conviction_edge_floor_pct: float = 45.0   # a strategy's vote is 0 at/below this backtest win-rate, ramping to 1 at 100%
     conviction_edge_markets: tuple = ("US", "IN", "METALS")   # equity markets the weighting applies to (crypto exempt)
 
+    # Equity oversold entry gate — the equity book is oversold MEAN-REVERSION; the closed ledger shows a
+    # long entered when the stock is NOT pulled back (RSI ≥ ~50 / above its 50-DMA) realizes ~26% win /
+    # -2.0% (vs ~75% / +5.3% for genuinely oversold entries). Re-simulation confirmed wider stops / trailing
+    # targets DON'T help (whipsaw stop-outs are real losses) — the lever is entry QUALITY. An equity long
+    # that is EXTENDED at entry is soft-demoted (win-prob haircut → edge floor + smaller size + flag), same
+    # machinery as the cohort demote. Needs the recent-history fetch enrichment already does for de-dup.
+    # Off ⇒ no gate (prior board). Equity-only; crypto trends, so "oversold" isn't its quality signal.
+    equity_oversold_gate_enabled: bool = True
+    oversold_rsi_max: float = 48.0            # RSI at/above this AND price ≥ 50-DMA ⇒ "extended" (demoted)
+
     # Daily-idea composite ranking — soft accuracy factors layered on conviction × regime, each a
     # bounded ± multiplier (see pipeline_core/backtest/idea_ranking.py). 0 disables a factor; all-zero
     # reproduces the pre-factor board. Applied live (a re-rank pool is enriched, re-scored, then capped).

@@ -2489,8 +2489,13 @@ function ideaTopInner(c) {
     const heldBadge = c.carried ? `<span class="idea-held" title="Open idea carried over — stays on the board until it hits its target, stop, or time-stop">held</span>` : "";
     // Soft-demote: a cohort the closed ledger shows persistently under-performing (crypto daily,
     // medium/long horizons) — win-rate haircut + smaller size, kept but flagged so the odds read honestly.
+    // "entered extended" carries the entry RSI so the why is legible: a mean-reversion long that wasn't
+    // actually pulled back (high RSI / above its 50-DMA) — the closed ledger's ~34%-win cohort.
+    const extNote = c.entry_rsi != null && /extended/.test(c.demote_reason || "")
+        ? ` Entry RSI ${fmt(c.entry_rsi, 0)}${c.entry_vs_sma50 != null ? `, ${c.entry_vs_sma50 >= 0 ? "+" : ""}${fmt(c.entry_vs_sma50, 0)}% vs its 50-DMA` : ""} — not oversold, so this mean-reversion long realized ~34% win historically vs ~74% for genuinely pulled-back entries.`
+        : "";
     const demoteBadge = c.demote_reason
-        ? `<span class="idea-held" title="Demoted cohort (${esc(c.demote_reason)}): the closed ledger shows this cohort under-performing its advertised odds, so its win-rate is haircut and it's sized at ×${c.cohort_size_factor != null ? c.cohort_size_factor : 0.5}. Kept on the board, but the odds are marked down.">demoted</span>`
+        ? `<span class="idea-held" title="Demoted cohort (${esc(c.demote_reason)}): the closed ledger shows this cohort under-performing its advertised odds, so its win-rate is haircut and it's sized at ×${c.cohort_size_factor != null ? c.cohort_size_factor : 0.5}. Kept on the board, but the odds are marked down.${extNote}">demoted</span>`
         : "";
     // Edge floor: a below-breakeven idea that survived only because its bucket would otherwise be empty.
     const belowEdgeBadge = c.below_edge
