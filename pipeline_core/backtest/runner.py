@@ -1944,6 +1944,14 @@ async def snapshot_current_ideas(max_per_bucket: int = 10, market: str = "IN") -
                 # "Normal drawdown" band captured at entry so a held idea can be checked within/beyond it.
                 "typical_drawdown_pct": c.get("typical_drawdown_pct"),
                 "deep_drawdown_pct": c.get("deep_drawdown_pct"),
+                # Edge-repair entry state — the "entry side" for validating the ranking/gate changes once
+                # this idea closes: the edge-weighted conviction that ranked it, plus the oversold read
+                # (RSI / vs-50-DMA) and demote reason that gated it. Neutral/None offline or gate-off.
+                "weighted_conviction": c.get("weighted_conviction"),
+                "entry_rsi": c.get("entry_rsi"),
+                "entry_vs_sma50": c.get("entry_vs_sma50"),
+                "oversold": c.get("oversold"),
+                "demote_reason": c.get("demote_reason"),
                 "strategies": [s["name"] for s in c["strategies"]],
                 "signal_date": c["latest_signal_date"] or as_of,
                 "tracked_at": now,
