@@ -243,6 +243,13 @@ class Settings(BaseSettings):
     conviction_edge_weighting: bool = True
     conviction_edge_floor_pct: float = 45.0   # a strategy's vote is 0 at/below this backtest win-rate, ramping to 1 at 100%
     conviction_edge_markets: tuple = ("US", "IN", "METALS")   # equity markets the weighting applies to (crypto exempt)
+    # Zero-edge SURFACING floor (equity) — don't even SHOW an idea whose edge-weighted conviction is ~0,
+    # i.e. NO backing strategy clears the win-rate floor (e.g. an overbought Breakout-only long at RSI 85:
+    # two Breakout strategies, both ~43% backtest win → weighted_conviction 0.0). These are pure clutter —
+    # the demote only down-ranks them. Applied in _rank_pool like the breakeven edge floor (never empties a
+    # bucket; least-bad kept, flagged). Crypto exempt (momentum is its edge). 0 disables. A single genuine
+    # mean-reversion strategy (~63% win) scores ~0.33, so this only bites the true no-edge ideas.
+    min_weighted_conviction: float = 0.15
 
     # Equity oversold entry gate — the equity book is oversold MEAN-REVERSION; the closed ledger shows a
     # long entered when the stock is NOT pulled back (RSI ≥ ~50 / above its 50-DMA) realizes ~26% win /

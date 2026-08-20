@@ -2409,13 +2409,19 @@ function renderHorizonColumn(b) {
     const edgeNote = edgeCut > 0
         ? `<span class="idea-gate small" title="Edge floor: ${edgeCut} candidate${edgeCut === 1 ? "" : "s"} whose win probability sat below its own risk/reward breakeven ${edgeCut === 1 ? "was" : "were"} dropped — the closed ledger showed such sub-breakeven setups realizing ~32% win (net-negative after costs).">🎯 ${edgeCut} below edge</span>`
         : "";
+    // Zero-edge conviction floor: ideas where NO backing strategy clears the win-rate floor (e.g. an
+    // overbought Breakout-only long) are removed outright — this can leave a horizon empty, honestly.
+    const convCut = b.conv_cut || 0;
+    const convNote = convCut > 0
+        ? `<span class="idea-gate small" title="Zero-edge filter: ${convCut} candidate${convCut === 1 ? "" : "s"} whose backing strategies have no proven edge (none clears the backtest win-rate floor — e.g. an overbought breakout-only long) ${convCut === 1 ? "was" : "were"} removed. An empty horizon here means no quality setup today, not a glitch.">🚫 ${convCut} no-edge</span>`
+        : "";
     // Correlation de-dup: ideas that move in lockstep with a higher-ranked pick were collapsed, so the
     // shown names are independent bets — not one crowded trade wearing several tickers.
     const collapsed = (b.dedup && b.dedup.dropped) || 0;
     const dedupNote = collapsed > 0
         ? `<span class="idea-gate small" title="Correlation de-dup: ${collapsed} idea${collapsed === 1 ? "" : "s"} that move${collapsed === 1 ? "s" : ""} in lockstep with a higher-ranked pick ${collapsed === 1 ? "was" : "were"} collapsed — the shown ideas are independent setups, not the same bet under multiple tickers.">🔗 ${collapsed} collapsed</span>`
         : "";
-    const notes = [gateNote, edgeNote, dedupNote].filter(Boolean).join(" · ");
+    const notes = [gateNote, edgeNote, convNote, dedupNote].filter(Boolean).join(" · ");
     // Short note: crypto also has a bearish subgroup below — surface its count so "0 actionable" longs
     // don't read as "nothing here" when shorts are the regime-aligned trade.
     const shortNote = shorts.length ? ` · <b style="color:var(--neg)">${shorts.length}</b> short${shorts.length === 1 ? "" : "s"} ↓` : "";

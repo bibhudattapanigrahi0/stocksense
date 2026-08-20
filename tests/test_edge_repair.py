@@ -65,14 +65,14 @@ def test_breakeven_and_edge_floor():
 
 def test_rank_pool_drops_below_edge_and_reports_cut():
     pool = [_cand(ticker="GOOD", avg_win_rate=65), _cand(ticker="BAD", avg_win_rate=30)]
-    shown, quality_cut, edge_cut, _ = runner._rank_pool(pool, 10, None, None)
+    shown, quality_cut, edge_cut, _conv, _ = runner._rank_pool(pool, 10, None, None)
     assert [c["ticker"] for c in shown] == ["GOOD"]
     assert edge_cut == 1 and quality_cut == 0
 
 
 def test_edge_floor_never_empties_a_bucket():
     pool = [_cand(ticker=t, avg_win_rate=25) for t in ("A", "B", "C", "D")]   # all below edge
-    shown, _, edge_cut, _ = runner._rank_pool(pool, 10, None, None)
+    shown, _, edge_cut, _conv, _ = runner._rank_pool(pool, 10, None, None)
     assert 1 <= len(shown) <= settings.edge_floor_min_keep                     # least-bad kept, flagged
     assert all(c.get("below_edge") for c in shown) and edge_cut == len(pool)
 
@@ -80,8 +80,38 @@ def test_edge_floor_never_empties_a_bucket():
 def test_edge_floor_toggle_off_keeps_everything(monkeypatch):
     monkeypatch.setattr(settings, "idea_min_edge_margin_pp", -100.0)           # floor can't reject
     pool = [_cand(ticker="GOOD", avg_win_rate=65), _cand(ticker="BAD", avg_win_rate=30)]
-    shown, _, edge_cut, _ = runner._rank_pool(pool, 10, None, None)
+    shown, _, edge_cut, _conv, _ = runner._rank_pool(pool, 10, None, None)
     assert {c["ticker"] for c in shown} == {"GOOD", "BAD"} and edge_cut == 0
+
+
+# ── Zero-edge conviction floor (equity) ─────────────────────────────
+
+def test_conv_floor_drops_zero_edge_equity_idea():
+    pool = [_cand(ticker="GOOD", avg_win_rate=65, weighted_conviction=0.8),
+            _cand(ticker="NOEDGE", avg_win_rate=52, weighted_conviction=0.0)]  # no strategy clears the floor
+    shown, _q, _edge, conv_cut, _dd = runner._rank_pool(pool, 10, None, None, "US")
+    assert [c["ticker"] for c in shown] == ["GOOD"] and conv_cut == 1
+
+def test_conv_floor_can_empty_a_bucket():
+    pool = [_cand(ticker=t, avg_win_rate=52, weighted_conviction=0.0) for t in ("A", "B", "C")]
+    shown, _q, _edge, conv_cut, _dd = runner._rank_pool(pool, 10, None, None, "US")
+    assert shown == [] and conv_cut == 3          # all zero-edge → honest empty bucket, NOT padded
+
+def test_conv_floor_exempts_crypto():
+    pool = [_cand(ticker="X", weighted_conviction=0.0)]
+    shown, _q, _edge, conv_cut, _dd = runner._rank_pool(pool, 10, None, None, "CRYPTO")
+    assert conv_cut == 0 and len(shown) == 1      # crypto trends — momentum is its edge, not gated
+
+def test_conv_floor_toggle_off(monkeypatch):
+    monkeypatch.setattr(settings, "min_weighted_conviction", 0.0)
+    pool = [_cand(ticker="X", weighted_conviction=0.0)]
+    shown, _q, _edge, conv_cut, _dd = runner._rank_pool(pool, 10, None, None, "US")
+    assert conv_cut == 0 and len(shown) == 1
+
+def test_conv_floor_keeps_idea_missing_the_field():
+    pool = [_cand(ticker="X", avg_win_rate=65)]    # no weighted_conviction → can't judge → kept
+    shown, _q, _edge, conv_cut, _dd = runner._rank_pool(pool, 10, None, None, "US")
+    assert conv_cut == 0 and len(shown) == 1
 
 
 # ── Fix 3: calibrated ranking ───────────────────────────────────────

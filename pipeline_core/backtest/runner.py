@@ -1148,10 +1148,11 @@ def _passes_edge_floor(c: dict) -> bool:
 
 
 def _rank_pool(pool: list, max_per_bucket: int,
-               clusters: Optional[dict], pillar_ctx: Optional[dict]) -> tuple:
+               clusters: Optional[dict], pillar_ctx: Optional[dict], market: Optional[str] = None) -> tuple:
     """Rank ONE direction's candidate pool by the composite score → quality gate → edge floor →
-    correlation de-dup → cap → optional pillar tiering. Returns (shown, quality_cut, edge_cut,
-    dedup_info). Mutates candidate fields (rank_multiplier/rank_score/pillars/tier) but no bucket.
+    zero-edge conviction floor → correlation de-dup → cap → optional pillar tiering. Returns
+    (shown, quality_cut, edge_cut, conv_cut, dedup_info). Mutates candidate fields
+    (rank_multiplier/rank_score/pillars/tier) but no bucket.
     Ranking uses the calibrated win probability (_rank_win_prob); the edge floor drops ideas whose
     win-prob can't clear their own breakeven. The regime tilt is already baked
     into each idea's `_base_score` (side-appropriate sign) and sizing is applied by the caller, so no
@@ -1178,6 +1179,25 @@ def _rank_pool(pool: list, max_per_bucket: int,
     # showed realizing ~32% win (net-negative). Never empties a bucket: if every survivor fails, keep the
     # least-bad few by edge slack, each flagged `below_edge`, so a thin book degrades gracefully (mirrors
     # the crypto gate's never-empty rule) rather than showing an empty column.
+    # ZERO-EDGE CONVICTION FLOOR (equity) — a HARD filter: an idea whose edge-weighted conviction is ~0 has
+    # NO backing strategy that clears the win-rate floor (e.g. an overbought Breakout-only long at RSI 85),
+    # so it's removed outright. Unlike the breakeven floor below, this one MAY leave a bucket empty — an
+    # honest empty column beats padding it with pure-noise garbage. Crypto exempt; a missing field is kept.
+    eq_conv_floor = (market and settings.conviction_edge_weighting
+                     and market in settings.conviction_edge_markets
+                     and settings.min_weighted_conviction > 0)
+
+    def _low_conv(c):
+        wc = c.get("weighted_conviction")
+        return bool(eq_conv_floor) and wc is not None and wc < settings.min_weighted_conviction
+
+    with_edge = [c for c in survivors if not _low_conv(c)]
+    conv_cut = len(survivors) - len(with_edge)
+    survivors = with_edge
+    # BREAKEVEN EDGE FLOOR — drop ideas whose (calibrated) win probability is below their own risk/reward
+    # breakeven plus the margin (the coin-flips the ledger showed realizing ~32% win). Unlike the conv floor
+    # this never empties a bucket: if every survivor fails, keep the least-bad few by edge slack, flagged
+    # `below_edge`, so an edge-bearing but thin book degrades gracefully rather than showing an empty column.
     passed = [c for c in survivors if _passes_edge_floor(c)]
     edge_cut = len(survivors) - len(passed)
     if passed:
@@ -1212,7 +1232,7 @@ def _rank_pool(pool: list, max_per_bucket: int,
         shown.sort(key=lambda c: 0 if c.get("tier") == "actionable" else 1)
     for c in pool:
         c.pop("_base_score", None)
-    return shown, quality_cut, edge_cut, dd
+    return shown, quality_cut, edge_cut, conv_cut, dd
 
 
 def _recompose_bucket(bucket: dict, tilt: float, max_per_bucket: int,
@@ -1262,10 +1282,11 @@ def _recompose_bucket(bucket: dict, tilt: float, max_per_bucket: int,
 
     if "short" not in by_side:
         # Long-only (every non-crypto market, and crypto with shorts off) — behaviour unchanged.
-        shown, cut, edge_cut, dd = _rank_pool(pool, max_per_bucket, clusters, pillar_ctx)
+        shown, cut, edge_cut, conv_cut, dd = _rank_pool(pool, max_per_bucket, clusters, pillar_ctx, market)
         bucket["candidates"] = shown
         bucket["quality_cut"] = cut                       # conflicted ideas the multiplier gate removed
         bucket["edge_cut"] = edge_cut                     # ideas the breakeven edge floor removed
+        bucket["conv_cut"] = conv_cut                     # zero-edge ideas (no strategy clears the win-rate floor)
         bucket["dedup"] = dd                              # {kept, dropped, collapsed_clusters}
         if pillar_ctx is not None:
             bucket["actionable_count"] = sum(1 for c in shown if c.get("tier") == "actionable")
@@ -1274,15 +1295,16 @@ def _recompose_bucket(bucket: dict, tilt: float, max_per_bucket: int,
         return
 
     # Mixed long+short (crypto): rank each side independently, then concatenate (longs first).
-    combined, cut_total, edge_cut_total = [], 0, 0
+    combined, cut_total, edge_cut_total, conv_cut_total = [], 0, 0, 0
     dd_total = {"kept": 0, "dropped": 0, "collapsed_clusters": 0}
     for _side in ("long", "short"):
         if _side not in by_side:
             continue
-        shown, cut, edge_cut, dd = _rank_pool(by_side[_side], max_per_bucket, clusters, pillar_ctx)
+        shown, cut, edge_cut, conv_cut, dd = _rank_pool(by_side[_side], max_per_bucket, clusters, pillar_ctx, market)
         combined += shown
         cut_total += cut
         edge_cut_total += edge_cut
+        conv_cut_total += conv_cut
         dd_total["kept"] += dd.get("kept", 0)
         dd_total["dropped"] += dd.get("dropped", 0)
         dd_total["collapsed_clusters"] += dd.get("collapsed_clusters", 0)
@@ -1294,6 +1316,7 @@ def _recompose_bucket(bucket: dict, tilt: float, max_per_bucket: int,
     bucket["candidates"] = combined
     bucket["quality_cut"] = cut_total
     bucket["edge_cut"] = edge_cut_total
+    bucket["conv_cut"] = conv_cut_total
     bucket["dedup"] = dd_total
     bucket["sizing"] = _size_bucket(long_shown, tilt)
     bucket["short_sizing"] = _size_bucket(short_shown, -tilt) if short_shown else None
