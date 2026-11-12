@@ -268,6 +268,15 @@ class Settings(BaseSettings):
     realized_gate_pf_ceiling: float = 0.8     # demote only strategies whose realized profit factor is below this (gross losses > 1.25× gross gains) — a materiality margin, not a bare net-loss
     realized_gate_haircut_pp: float = 20.0    # pp shaved off a live-losing strategy's effective win-rate; 20 pushes a 61% backtest loser below the 45 floor → vote 0. Larger = harder demote.
     realized_gate_markets: tuple = ("US", "IN", "METALS", "CRYPTO")   # markets whose daily board consults the realized ledger
+    # Realized-edge RESCUE — the mirror of the demote: a strategy PROVEN live-profitable (realized profit
+    # factor ≥ realized_gate_pf_rescue over ≥ realized_gate_min_samples closed trades) is re-admitted past
+    # the crypto BACKTEST risk gate (_strategy_risk_ok dd/Sharpe floors), because a live edge on the real
+    # tape outranks a drawdown from a different-regime backtest. The ledger shows crypto momentum double-
+    # suppressed yet winning big — EMA 9/21 (26% backtest win + dd gate) at live PF 10 / +34% avg, and
+    # Keltner / RSI-Momentum / Donchian at PF 4–5.5 — exactly the strategies the gate holds down. Equity
+    # strategies always pass the risk gate, so this is crypto-only in effect. Off ⇒ prior board exactly.
+    realized_rescue_enabled: bool = True
+    realized_gate_pf_rescue: float = 1.5      # realized profit factor at/above which a live-proven strategy is re-admitted past the backtest risk gate
 
     # Equity oversold entry gate — the equity book is oversold MEAN-REVERSION; the closed ledger shows a
     # long entered when the stock is NOT pulled back (RSI ≥ ~50 / above its 50-DMA) realizes ~26% win /

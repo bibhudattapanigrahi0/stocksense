@@ -1079,6 +1079,22 @@ def _strategy_demote_map(market: Optional[str]) -> dict:
     return idea_ranking.strategy_demote_map(closed)
 
 
+def _strategy_rescue_map(market: Optional[str]) -> set:
+    """Set of strategy names PROVEN live-profitable in THIS market's closed ledger, to RE-ADMIT past the
+    crypto backtest risk gate (_strategy_risk_ok). Mirror of _strategy_demote_map — the lift side of the
+    realized-edge gate. Empty when the rescue is off or the market is out of scope. See
+    idea_ranking.strategy_rescue_map and settings.realized_rescue_*."""
+    if not settings.realized_rescue_enabled:
+        return set()
+    if str(market or "").upper() not in {m.upper() for m in settings.realized_gate_markets}:
+        return set()
+    mk = (market or "IN").upper()
+    closed = [t for t in _load_tracked()
+              if (t.get("market") or "IN").upper() == mk and t.get("closed")
+              and t.get("realized_return_pct") is not None]
+    return idea_ranking.strategy_rescue_map(closed)
+
+
 def _strategy_demote_reason(strategies: Optional[list], demote_map: Optional[dict]) -> Optional[str]:
     """A short reason if this idea is backed by a realized-demoted strategy (proven net-negative live),
     else None. Drives the UI flag and the crypto speculative-short drop. Matches on strategy NAME, so a
@@ -1395,6 +1411,9 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
     # dropped from speculative crypto shorts. {} when the gate is off ⇒ the exact prior board. See
     # settings.realized_strategy_gate_* and idea_ranking.strategy_demote_map.
     demote_map = _strategy_demote_map(idea_market)
+    # …and the mirror: strategies PROVEN live-profitable are re-admitted past the crypto backtest risk
+    # gate (a live edge outranks a different-regime drawdown). Equity always passes the gate → crypto-only.
+    rescue_map = _strategy_rescue_map(idea_market)
     # Calibrate advertised win-rates against realized ledger outcomes (isotonic). The curve (if any)
     # feeds each candidate a `calibrated_win_pct` that the sizer prefers over the raw backtest rate.
     cal = calibration.build_from_ledger(idea_market)
@@ -1428,7 +1447,7 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
         wr, shp, exp = m.get("win_rate"), m.get("sharpe"), m.get("expectancy_pct")
         dd = m.get("max_drawdown_pct")
         dip, deep = m.get("typical_dip_pct"), m.get("deep_dip_pct")   # winners' "normal drawdown" band
-        eligible = _strategy_risk_ok(dd, shp, idea_market)   # crypto risk gate (equities always pass)
+        eligible = _strategy_risk_ok(dd, shp, idea_market) or (s["name"] in rescue_map)  # risk gate OR proven live
         strat_by_horizon[h].append({
             "id": s["id"], "name": s["name"], "category": s["category"],
             "win_rate": wr, "max_holding_days": sdef.max_holding_days,

@@ -179,3 +179,70 @@ def test_demote_map_loader_respects_market_scope(monkeypatch):
     monkeypatch.setattr(runner, "_load_tracked", lambda: led)
     monkeypatch.setattr(settings, "realized_gate_markets", ("US", "IN"))
     assert runner._strategy_demote_map("CRYPTO") == {}           # CRYPTO out of scope ⇒ no map
+
+
+# ── strategy_rescue_map (the LIFT / re-admit side) ──────────────────
+
+def test_rescue_map_admits_proven_live_winners():
+    rm = ir.strategy_rescue_map(LEDGER, min_samples=4, pf_floor=1.5)
+    assert rm == {"WINNER", "HIGHPAY"}                           # PF 6.0 and 2.0 clear 1.5
+    for out in ("LOSER", "MODLOSER", "BREAKEVEN", "ALLWIN"):
+        assert out not in rm                                     # losers, breakeven, undefined-PF stay out
+
+
+def test_rescue_respects_min_samples():
+    assert ir.strategy_rescue_map(LEDGER, min_samples=12, pf_floor=1.5) == set()
+
+
+def test_rescue_empty_when_off(monkeypatch):
+    monkeypatch.setattr(settings, "realized_rescue_enabled", False)
+    assert ir.strategy_rescue_map(LEDGER, min_samples=4) == set()
+
+
+def test_demote_and_rescue_are_disjoint():
+    # PF < 0.8 (demote) and PF >= 1.5 (rescue) cannot overlap — a strategy is never both.
+    dm = ir.strategy_demote_map(LEDGER, min_samples=4)
+    rm = ir.strategy_rescue_map(LEDGER, min_samples=4)
+    assert not (set(dm) & rm)
+
+
+# ── crypto: re-admit a gated-but-live-winning strategy to eligibility ──
+
+def _gated_crypto_latest(name="EMA 9/21 Crossover"):
+    """A crypto long strategy that FAILS the backtest risk gate (dd −99%, Sharpe 0.1) yet fires a buy —
+    exactly the momentum profile the ledger shows winning big live. id resolves to a real long StrategyDef."""
+    return {"run_at": "2026-06-01T00:00:00+00:00", "market": "CRYPTO", "index": "Top 30",
+            "benchmark_label": "Bitcoin", "years": 2, "disclaimer": "",
+            "strategies": [{"id": "crypto-momentum-regime", "name": name, "category": "Momentum",
+                "metrics": {"win_rate": 30.0, "sharpe": 0.1, "expectancy_pct": 1.0, "max_drawdown_pct": -99.0},
+                "signals": {"buy": [{"ticker": "BTC-USD", "price": 100.0, "signal_date": "2026-06-01"}],
+                            "sell": [], "holding": []}}]}
+
+
+def _winning_ledger(name="EMA 9/21 Crossover"):
+    """13 closed CRYPTO trades for `name`, PF ~22 → a proven live winner (clears min_samples 12 + pf 1.5)."""
+    return [{"closed": True, "market": "CRYPTO", "realized_return_pct": r, "strategies": [{"name": name}]}
+            for r in [20.0] * 10 + [-3.0] * 3]
+
+
+def _btc_eligible_conviction(ideas):
+    for h in ideas["horizons"]:
+        for c in ideas["buckets"][h]["candidates"]:
+            if c["ticker"] == "BTC-USD" and c.get("side", "long") != "short":
+                return c.get("eligible_conviction")
+    return None
+
+
+def test_rescue_readmits_a_gated_live_winner_to_crypto_eligibility(monkeypatch):
+    monkeypatch.setattr(runner, "_load_tracked", lambda: _winning_ledger())
+    monkeypatch.setattr(runner, "load_latest", lambda market="IN": _gated_crypto_latest())
+    ideas = runner.horizon_ideas(market="CRYPTO")
+    assert _btc_eligible_conviction(ideas) == 1        # risk gate failed, but proven live ⇒ re-admitted
+
+
+def test_rescue_off_leaves_the_gated_winner_ineligible(monkeypatch):
+    monkeypatch.setattr(runner, "_load_tracked", lambda: _winning_ledger())
+    monkeypatch.setattr(runner, "load_latest", lambda market="IN": _gated_crypto_latest())
+    monkeypatch.setattr(settings, "realized_rescue_enabled", False)
+    ideas = runner.horizon_ideas(market="CRYPTO")
+    assert _btc_eligible_conviction(ideas) == 0        # risk gate stands ⇒ not counted (prior behaviour)

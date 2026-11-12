@@ -427,6 +427,26 @@ def strategy_demote_map(closed: list, *, min_samples: Optional[int] = None,
             if s["n"] >= thr and s["profit_factor"] is not None and s["profit_factor"] < ceil}
 
 
+def strategy_rescue_map(closed: list, *, min_samples: Optional[int] = None,
+                        pf_floor: Optional[float] = None) -> set:
+    """Strategies PROVEN live-profitable → a set of names to RE-ADMIT past a backtest risk gate.
+
+    The mirror of ``strategy_demote_map``: a strategy with at least ``min_samples`` closed trades AND a
+    realized ``profit_factor`` at or above ``pf_floor`` (default 1.5 — gross gains ≥ 1.5× gross losses)
+    has earned its place on live evidence, even if its BACKTEST risk metrics would gate it out. Runner
+    uses it to re-admit a live-winning crypto momentum strategy — whose 10y-bull backtest carries a
+    −96%…−100% drawdown and a sub-floor win-rate — to a coin's eligible conviction, because a live edge
+    on the real tape outranks a drawdown from a different-regime backtest. Equity strategies always pass
+    the risk gate, so this only bites crypto. Empty when the rescue is off or nothing clears both bars."""
+    if not settings.realized_rescue_enabled:
+        return set()
+    thr = settings.realized_gate_min_samples if min_samples is None else min_samples
+    floor = settings.realized_gate_pf_rescue if pf_floor is None else pf_floor
+    edge = strategy_realized_edge(closed)
+    return {name for name, s in edge.items()
+            if s["n"] >= thr and s["profit_factor"] is not None and s["profit_factor"] >= floor}
+
+
 # ── Rank efficiency (the north-star: does the ranking predict realized return?) ──
 # Conviction / factors / calibration all try to ORDER the board well. This measures whether that
 # ordering actually works: the Spearman rank-IC between an idea's entry rank and its realized return,
