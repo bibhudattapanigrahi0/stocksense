@@ -251,6 +251,24 @@ class Settings(BaseSettings):
     # mean-reversion strategy (~63% win) scores ~0.33, so this only bites the true no-edge ideas.
     min_weighted_conviction: float = 0.15
 
+    # Realized-edge STRATEGY gate — the measure→apply loop for strategies (idea_ranking.strategy_demote_map).
+    # Every other edge-weight keys off BACKTEST win-rate, which is blind to a strategy that backtests well
+    # but loses LIVE: the closed ledger shows RSI Oversold Reversal at 61% backtest / 19% realized / −3.65%
+    # avg, 63-Day ROC Momentum at 49% / 25% / −2.97%, and a crypto breakdown-short at 0/13 / −30.9%. A
+    # strategy that loses money live by a MATERIAL margin (realized profit_factor < realized_gate_pf_ceiling)
+    # over ≥ realized_gate_min_samples closed trades is soft-demoted: its effective win-rate is shaved before
+    # the edge-weight ramp (runner._weighted_conviction) so its vote shrinks and sole-driver ideas fall below
+    # min_weighted_conviction; crypto shorts route through the speculative-surface filter (_crypto_idea_gate).
+    # PROFIT FACTOR (not win-rate, not a bare avg<0) is the trigger so a low-win / high-payoff momentum
+    # strategy whose few big winners pay for many small losers (EMA 9/21 in crypto: 81% win / +33% avg) is
+    # KEPT, and the 0.8 margin spares a near-breakeven diversifier (PF ~0.9, avg ~−0.2% over a big sample)
+    # that a bare avg<0 rule would wrongly sink. Demote-only (never lifts a vote); off ⇒ empty map ⇒ prior board.
+    realized_strategy_gate_enabled: bool = True
+    realized_gate_min_samples: int = 12       # closed live trades before judging a strategy (don't over-read a handful)
+    realized_gate_pf_ceiling: float = 0.8     # demote only strategies whose realized profit factor is below this (gross losses > 1.25× gross gains) — a materiality margin, not a bare net-loss
+    realized_gate_haircut_pp: float = 20.0    # pp shaved off a live-losing strategy's effective win-rate; 20 pushes a 61% backtest loser below the 45 floor → vote 0. Larger = harder demote.
+    realized_gate_markets: tuple = ("US", "IN", "METALS", "CRYPTO")   # markets whose daily board consults the realized ledger
+
     # Equity oversold entry gate — the equity book is oversold MEAN-REVERSION; the closed ledger shows a
     # long entered when the stock is NOT pulled back (RSI ≥ ~50 / above its 50-DMA) realizes ~26% win /
     # -2.0% (vs ~75% / +5.3% for genuinely oversold entries). Re-simulation confirmed wider stops / trailing

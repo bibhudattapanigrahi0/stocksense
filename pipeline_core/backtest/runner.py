@@ -895,7 +895,7 @@ def _strategy_risk_ok(max_drawdown_pct, sharpe, market: str) -> bool:
     return True
 
 
-def _crypto_idea_gate(cands: list, tilt: float) -> list:
+def _crypto_idea_gate(cands: list, tilt: float, demote_map: Optional[dict] = None) -> list:
     """The crypto board gate, applied to one horizon's candidate pool.
 
     LONGS survive only if a non-catastrophic strategy backs them (``eligible_conviction`` ≥ 1) or the
@@ -917,6 +917,9 @@ def _crypto_idea_gate(cands: list, tilt: float) -> list:
     kept_shorts = [c for c in shorts if _eligible(c)]                 # proven shorts (cleared the gate)
     unproven = [c for c in shorts if not _eligible(c)]
     if unproven and settings.crypto_shorts_regime_surface and tilt <= settings.crypto_shorts_regime_tilt:
+        if demote_map:                                               # a short PROVEN net-negative live never surfaces, even speculatively
+            unproven = [c for c in unproven
+                        if not _strategy_demote_reason(c.get("strategies"), demote_map)]
         unproven.sort(key=lambda c: (c.get("conviction", 0), c.get("avg_sharpe") or -9,
                       c.get("avg_max_drawdown") if c.get("avg_max_drawdown") is not None else -999),
                       reverse=True)
@@ -960,15 +963,16 @@ def _partition_tracked(market: str) -> tuple[dict, dict]:
     return closed_exit, open_by_h
 
 
-def _carried_candidate(t: dict, wr_map: Optional[dict] = None) -> dict:
+def _carried_candidate(t: dict, wr_map: Optional[dict] = None, demote_map: Optional[dict] = None) -> dict:
     """A still-open tracked idea rendered as a board candidate (its stored, signal-anchored plan),
     so it persists on the board — ranked among fresh ideas by conviction/win-rate — until it
     closes. `carried=True` marks it as a held (not freshly re-signalled) idea. `wr_map` (strategy
     name → backtest win-rate) lets a carried idea (which stores only names) carry an edge-weighted
-    conviction on the same scale as fresh ideas."""
+    conviction on the same scale as fresh ideas. `demote_map` rides the realized-edge gate onto a
+    held idea too, so a position whose strategies have since proven live-losing is down-ranked/flagged."""
     sp, tp = t.get("stop_pct"), t.get("target_pct")
     strategies = [{"name": n} for n in (t.get("strategies") or [])]
-    return {
+    cand = {
         "ticker": t["ticker"],
         "side": t.get("side", "long"),
         "price": t.get("entry_price"),
@@ -991,8 +995,10 @@ def _carried_candidate(t: dict, wr_map: Optional[dict] = None) -> dict:
         "is_new": False,
         "carried": True,
         "strategies": strategies,
-        "weighted_conviction": _weighted_conviction(strategies, wr_map),
+        "weighted_conviction": _weighted_conviction(strategies, wr_map, demote_map),
     }
+    _tag_realized_demote(cand, demote_map)
+    return cand
 
 
 def _size_bucket(shown: list, tilt: float) -> dict:
@@ -1057,6 +1063,42 @@ def _cohort_demote_reason(market: Optional[str], horizon: Optional[str]) -> Opti
     return " + ".join(reasons) if reasons else None
 
 
+def _strategy_demote_map(market: Optional[str]) -> dict:
+    """Realized-edge demote map (strategy name → win-rate haircut pp) from THIS market's closed ledger,
+    or {} when the gate is off or the market is out of scope. The map feeds _weighted_conviction (equity
+    down-rank) and _crypto_idea_gate (drop a live-losing speculative short). See
+    idea_ranking.strategy_demote_map and settings.realized_strategy_gate_*."""
+    if not settings.realized_strategy_gate_enabled:
+        return {}
+    if str(market or "").upper() not in {m.upper() for m in settings.realized_gate_markets}:
+        return {}
+    mk = (market or "IN").upper()
+    closed = [t for t in _load_tracked()
+              if (t.get("market") or "IN").upper() == mk and t.get("closed")
+              and t.get("realized_return_pct") is not None]
+    return idea_ranking.strategy_demote_map(closed)
+
+
+def _strategy_demote_reason(strategies: Optional[list], demote_map: Optional[dict]) -> Optional[str]:
+    """A short reason if this idea is backed by a realized-demoted strategy (proven net-negative live),
+    else None. Drives the UI flag and the crypto speculative-short drop. Matches on strategy NAME, so a
+    strategy renamed since its trades were logged simply re-accumulates a fresh live sample (no false hit)."""
+    if not demote_map or not strategies:
+        return None
+    names = [s.get("name") if isinstance(s, dict) else s for s in strategies]
+    hit = sorted({n for n in names if n in demote_map})
+    return "weak live edge: " + ", ".join(hit) if hit else None
+
+
+def _tag_realized_demote(cand: dict, demote_map: Optional[dict]) -> None:
+    """Flag a candidate whose edge leans on a realized-demoted strategy — transparency only; the
+    functional down-rank is the win-rate haircut already folded into its weighted_conviction."""
+    reason = _strategy_demote_reason(cand.get("strategies"), demote_map)
+    if reason:
+        cand["realized_demoted"] = True
+        cand["realized_demote_reason"] = reason
+
+
 def _conviction_edge_weight(win_rate: Optional[float]) -> float:
     """A strategy's vote weight toward RANKING conviction, from its backtest win-rate: clipped-linear,
     0 at/below the floor rising to 1 at 100%. A low-win-rate strategy (equity momentum ~43%) contributes
@@ -1070,18 +1112,26 @@ def _conviction_edge_weight(win_rate: Optional[float]) -> float:
     return min(1.0, (win_rate - floor) / (100.0 - floor))
 
 
-def _weighted_conviction(strategies: Optional[list], wr_map: Optional[dict] = None) -> float:
+def _weighted_conviction(strategies: Optional[list], wr_map: Optional[dict] = None,
+                         demote_map: Optional[dict] = None) -> float:
     """Edge-weighted conviction: the sum of each backing strategy's vote weight (_conviction_edge_weight
     of its backtest win-rate). Reads win_rate from the strategy dict, falling back to `wr_map` (name →
-    backtest win-rate) for carried ideas that store only names — so fresh and held ideas rank on one scale."""
+    backtest win-rate) for carried ideas that store only names — so fresh and held ideas rank on one scale.
+    `demote_map` (strategy name → win-rate haircut pp, from the realized-edge gate) shaves a strategy
+    PROVEN net-negative live before the ramp, shrinking/zeroing its vote — see
+    idea_ranking.strategy_demote_map. None/empty ⇒ the exact prior behaviour."""
     total = 0.0
     for s in strategies or []:
         if isinstance(s, dict):
+            name = s.get("name")
             wr = s.get("win_rate")
             if wr is None and wr_map is not None:
-                wr = wr_map.get(s.get("name"))
+                wr = wr_map.get(name)
         else:
+            name = s
             wr = wr_map.get(s) if wr_map is not None else None
+        if wr is not None and demote_map:
+            wr = max(0.0, wr - demote_map.get(name, 0.0))
         total += _conviction_edge_weight(wr)
     return round(total, 3)
 
@@ -1340,6 +1390,11 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
     # conviction on one scale (see _weighted_conviction / settings.conviction_edge_weighting).
     wr_map = {s["name"]: (s.get("metrics") or {}).get("win_rate") for s in latest["strategies"]}
     idea_market = (latest.get("market") or market or "IN").upper()
+    # Realized-edge gate: strategies PROVEN net-negative in THIS market's closed ledger get their
+    # effective win-rate shaved (equity: down-rank via weighted_conviction / zero-edge floor) or are
+    # dropped from speculative crypto shorts. {} when the gate is off ⇒ the exact prior board. See
+    # settings.realized_strategy_gate_* and idea_ranking.strategy_demote_map.
+    demote_map = _strategy_demote_map(idea_market)
     # Calibrate advertised win-rates against realized ledger outcomes (isotonic). The curve (if any)
     # feeds each candidate a `calibrated_win_pct` that the sizer prefers over the raw backtest rate.
     cal = calibration.build_from_ledger(idea_market)
@@ -1460,7 +1515,7 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
             buy_low, buy_high = _idea_buy_range(h, agg["price"])
             rr = round(target_pct / stop_pct, 2) if stop_pct else None
             age_days = _days_since(latest_sig)
-            cands.append({
+            cand = {
                 "ticker": agg["ticker"],
                 "side": side,
                 "price": agg["price"],
@@ -1479,7 +1534,7 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
                 "eligible_conviction": agg["_n_eligible"],
                 # Edge-weighted conviction — each vote scaled by its backtest win-rate, so a momentum-
                 # contaminated cluster ranks below a clean high-win-rate one at the same raw count.
-                "weighted_conviction": _weighted_conviction(agg["strategies"], wr_map),
+                "weighted_conviction": _weighted_conviction(agg["strategies"], wr_map, demote_map),
                 "avg_win_rate": avg_wr,
                 "avg_sharpe": avg_sh,
                 "avg_max_drawdown": avg_dd,
@@ -1492,18 +1547,20 @@ def horizon_ideas(max_per_bucket: int = 10, market: str = "IN") -> Optional[dict
                 "strategies": sorted(
                     agg["strategies"], key=lambda x: (x["win_rate"] or 0), reverse=True
                 ),
-            })
+            }
+            _tag_realized_demote(cand, demote_map)
+            cands.append(cand)
         # Carry over still-open tracked ideas not re-signalled this scan, so a good setup persists
         # on the board (ranked by win rate alongside fresh ones) until it actually closes. Skip any
         # with a non-positive entry price — legacy broken records that render as $0.00 cards and can
         # never close (they're purged separately); dropping them here keeps the board clean meanwhile.
         for t in open_tracked.get(h, []):
             if (t.get("side", "long"), t["ticker"]) not in fresh_keys and (t.get("entry_price") or 0) > 0:
-                cands.append(_carried_candidate(t, wr_map))
+                cands.append(_carried_candidate(t, wr_map, demote_map))
         # Crypto board gate (long risk gate + bearish-regime speculative-short surfacing). See
         # _crypto_idea_gate. Non-crypto markets skip it entirely (long-only, ungated).
         if idea_market == "CRYPTO":
-            cands = _crypto_idea_gate(cands, tilt)
+            cands = _crypto_idea_gate(cands, tilt, demote_map)
 
         # Rank by conviction, then win rate (a not-closed idea with a higher win rate outranks a
         # fresh lower-win-rate one and stays within the cap), then Sharpe. The market regime softly

@@ -367,6 +367,66 @@ def factor_attribution(closed: list, *, min_samples: Optional[int] = None,
     return {"sample": len(withf), "baseline": baseline, "factors": factors, "min_samples": thr}
 
 
+# ── Per-strategy realized edge — the measure→apply loop for STRATEGIES ──
+# conviction_edge_weight() (runner) gates each strategy's vote by its BACKTEST win-rate, which is
+# blind to a strategy that backtests well but loses LIVE — the closed ledger shows RSI Oversold
+# Reversal at 61% backtest / 19% realized / −3.65% avg, and a crypto breakdown-short at 0/13 / −30.9%.
+# These measure each strategy's realized record from the ledger and demote the ones with negative
+# realized EXPECTANCY — the lens that correctly sinks a true loser while KEEPING a low-win-rate /
+# high-payoff winner (EMA 9/21: 35% backtest win but +16% avg realized). See
+# settings.realized_strategy_gate_* and runner._weighted_conviction / _crypto_idea_gate.
+
+def strategy_realized_edge(closed: list) -> dict:
+    """Realized {n, win_rate, avg_return, profit_factor} per strategy over CLOSED tracked ideas.
+
+    Each closed idea's ``realized_return_pct`` is attributed to EVERY backing strategy it names (an
+    idea surfaced by four strategies counts once toward each — the same per-strategy attribution the
+    board's ranking implies). Pure: reads only ``strategies`` + ``realized_return_pct`` already on the
+    ledger, so it is network-free and trivially unit-testable."""
+    by_strat: dict[str, list] = {}
+    for c in closed:
+        r = c.get("realized_return_pct")
+        if r is None:
+            continue
+        for s in (c.get("strategies") or []):
+            name = s.get("name") if isinstance(s, dict) else s
+            if name:
+                by_strat.setdefault(name, []).append(r)
+    out: dict[str, dict] = {}
+    for name, rets in by_strat.items():
+        stats = _cohort_stats(rets)
+        gains = sum(r for r in rets if r > 0)
+        drops = sum(r for r in rets if r < 0)
+        stats["profit_factor"] = round(gains / abs(drops), 2) if drops else None
+        out[name] = stats
+    return out
+
+
+def strategy_demote_map(closed: list, *, min_samples: Optional[int] = None,
+                        haircut_pp: Optional[float] = None,
+                        pf_ceiling: Optional[float] = None) -> dict:
+    """Strategies PROVEN to lose money live, by a material margin → {name: win-rate haircut (pp)}.
+
+    A strategy is demoted when it has at least ``min_samples`` closed trades AND a realized
+    ``profit_factor`` below ``pf_ceiling`` (default 0.8 — gross losses exceed gross gains by >25%).
+    Profit factor is the trigger (not win-rate, not a bare avg<0) for two reasons: (1) it spares a
+    low-win-rate / high-payoff momentum strategy whose few big winners pay for many small losers
+    (EMA 9/21 in crypto: 81% … but even a 35%-win one with PF>1 is kept); (2) the 0.8 margin spares a
+    near-breakeven diversifier (PF ~0.9, avg ~−0.2% over a big sample) that a bare avg<0 rule would
+    wrongly sink. The haircut is subtracted from the strategy's effective win-rate before the edge-
+    weight ramp (runner._weighted_conviction), shrinking/zeroing its vote — a soft, reversible demote
+    (down-rank, never a hard delete). Returns {} when the gate is off or nothing clears both bars, so a
+    disabled gate reproduces the prior board exactly."""
+    if not settings.realized_strategy_gate_enabled:
+        return {}
+    thr = settings.realized_gate_min_samples if min_samples is None else min_samples
+    pp = settings.realized_gate_haircut_pp if haircut_pp is None else haircut_pp
+    ceil = settings.realized_gate_pf_ceiling if pf_ceiling is None else pf_ceiling
+    edge = strategy_realized_edge(closed)
+    return {name: pp for name, s in edge.items()
+            if s["n"] >= thr and s["profit_factor"] is not None and s["profit_factor"] < ceil}
+
+
 # ── Rank efficiency (the north-star: does the ranking predict realized return?) ──
 # Conviction / factors / calibration all try to ORDER the board well. This measures whether that
 # ordering actually works: the Spearman rank-IC between an idea's entry rank and its realized return,
