@@ -18,6 +18,9 @@ venv/
 # backtest results & reports. Fresh clones rebuild these by running the pipeline.
 data/
 
+# Runtime logs (launchd app/backtest output — may contain ledger/alert data)
+logs/
+
 # Local tool/editor state
 .claude/settings.local.json
 .ipynb_checkpoints/
